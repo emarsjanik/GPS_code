@@ -1,0 +1,26 @@
+{
+    "station_id": "USGS001",
+    "station_name": "USGS Woods Hole",
+    "agency": "USGS",
+    "observer": "USGS Woods Hole Coastal and Marine Science Center",
+    "receiver_model": "Unicore UM980",
+    "receiver_firmware": "R4.10Build11833",
+    "receiver_port": "/dev/USB_GPS",
+    "receiver_baud": 115200,
+    "receiver_timeout": 2.0,
+    "latitude": 41.8928336813,
+    "longitude": -69.9633123013,
+    "height": 21.774,
+    "marker_name": "USGS001",
+    "marker_number": "USGS001",
+    "rinex_version": "3.05",
+    "antenna": {
+        "model": "Unknown",
+        "serial": "",
+        "height": 0.0,
+        "east_offset": 0.0,
+        "north_offset": 0.0
+    },
+    "gnssrefl_orbit_source": "nav",
+    "record_raw_chunk_seconds": 600
+}

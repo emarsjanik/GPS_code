@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+gnssrefl_venv/
+venv/
+.venv/
+
+# GNSS generated data
+raw/
+rinex/
+products/
+logs/
+
+# Database
+database/*.db
+
+# Backup archives
+*.tar.gz
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+# Additional generated data (added during cleanup)
+archive/
+database/
