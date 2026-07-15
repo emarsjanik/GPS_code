@@ -92,21 +92,34 @@ What this does, and what it deliberately does NOT do
       are always None here; that's not a placeholder for a bug, it's
       genuinely out of scope for a single day's processing.
     * Fetching orbits over the internet by default is gnssrefl's own
-      behavior, not something this module adds. For a field station
-      that may not always have reliable connectivity, set
-      "gnssrefl_orbit_source": "nav" in station.json to use the
-      broadcast ephemeris (confirmed against real hardware: this
-      still requires a small internet download, from SOPAC, not
-      CDDIS -- it is NOT fully offline, just GPS-only and apparently
-      not gated behind CDDIS's EarthData Login requirement, unlike
-      the default multi-GNSS sp3 orbit fetch, which failed in
-      testing with "orbit file does not exist" against CDDIS both in
-      an initial short test and again on a full ~18-hour overnight
-      recording -- the CDDIS orbit product for the current day
-      appears not to be available quickly enough for same-day
-      processing on this connection). Leave it unset to let gnssrefl
-      fetch its own best-available multi-GNSS orbits when reliably
-      available.
+      behavior, not something this module adds. Leave "gnssrefl_orbit_source"
+      unset (the default, and the confirmed-correct choice for this
+      station) to use gnssrefl's own default multi-GNSS SP3 orbit
+      fetch from CDDIS.
+
+      IMPORTANT, confirmed against real hardware: "gnssrefl_orbit_source":
+      "nav" (GPS-only broadcast ephemeris) silently produces GPS-only
+      results, even with allfreq=True set on make_gnssir_input().
+      Without real orbit data for GLONASS/Galileo/BeiDou satellites,
+      rinex2snr() cannot include their observations in the SNR file at
+      all, regardless of what SNR data actually exists in the RINEX
+      file -- confirmed directly: switching from "nav" to the default
+      multi-GNSS orbit fetch took the same 5.5-hour recording from 20
+      tracks (GPS only) to 48 tracks (GPS + GLONASS + Galileo +
+      BeiDou), more than doubling data density with no change to the
+      underlying recording at all.
+
+      The earlier concern that motivated "nav" in the first place --
+      the default multi-GNSS fetch failing with "orbit file does not
+      exist" -- turned out to be a same-day publication-timing issue,
+      not a genuine CDDIS/EarthData Login authentication requirement:
+      reprocessing the exact same day's data a few days later, once
+      the rapid multi-GNSS orbit product had actually been published,
+      succeeded with no login or credentials involved. "nav" remains
+      available as a genuine fallback specifically for same-day/
+      real-time processing before that day's multi-GNSS orbit product
+      has been published yet, or for a station with no reliable
+      internet at all -- not as a general-purpose default.
 
 This module knows nothing about SQLite, the receiver, station.py, or
 pipeline decisions -- same boundaries as rinex_processor.py.
@@ -623,6 +636,15 @@ class GnssIrProcessor:
         elevation angles, reflector height range, and frequencies to
         use. Always uses this station's real coordinates from
         config, never gnssrefl's online coordinate lookup.
+
+        allfreq=True is confirmed necessary here, not optional:
+        make_gnssir_input()'s own default is allfreq=False, which
+        restricts analysis to GPS frequencies only. Confirmed against
+        a real results file that every one of 20 real retrievals came
+        from GPS alone, despite the underlying RINEX data containing
+        real, confirmed SNR observables from GLONASS, Galileo, QZSS,
+        and BeiDou as well -- meaning most of the station's actual
+        captured data was silently going unused for GNSS-IR analysis.
         """
 
         from gnssrefl.gnssir_input import make_gnssir_input
@@ -631,12 +653,18 @@ class GnssIrProcessor:
         longitude = getattr(self.cfg, "longitude", 0.0) or 0.0
         height = getattr(self.cfg, "height", 0.0) or 0.0
 
+        station_section = getattr(self.cfg, "station", {}) or {}
+        all_frequencies = bool(
+            station_section.get("gnssrefl_all_frequencies", True)
+        )
+
         try:
             make_gnssir_input(
                 station=self._station_code,
                 lat=latitude,
                 lon=longitude,
                 height=height,
+                allfreq=all_frequencies,
             )
         except (Exception, SystemExit) as exc:
             raise GnssIrProcessorError(

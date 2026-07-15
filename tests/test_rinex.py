@@ -22,6 +22,8 @@ process by default:
     garbage_output   -- exits 0, but writes obs/nav files with no RINEX header
     empty_output      -- exits 0, but writes zero-byte obs/nav files
     no_output          -- exits 0, but writes no files at all
+    bad_bytes           -- exits 0, writes valid output, but also emits a
+                            non-UTF-8 byte on stdout (regression test)
 
 Run with:
 
@@ -84,6 +86,22 @@ if mode == "garbage_output":
         f.write(INVALID_HEADER)
     with open(nav_path, "w") as f:
         f.write(INVALID_HEADER)
+    sys.exit(0)
+
+if mode == "bad_bytes":
+    # Regression: confirmed against a real overnight recording (built
+    # from 34 separately-started append-mode chunks) that convbin can
+    # write a non-UTF-8 byte to stdout while processing certain raw
+    # files. subprocess.run(..., text=True) with no errors= handling
+    # crashed on this with UnicodeDecodeError before our own code ever
+    # got to inspect convbin's exit code.
+    sys.stdout.buffer.write(b"scanning: 2026/07/09 \\x88 some binary garbage\\n")
+    with open(obs_path, "w") as f:
+        f.write(VALID_HEADER)
+        f.write("fake observation records\\n")
+    with open(nav_path, "w") as f:
+        f.write(VALID_HEADER)
+        f.write("fake navigation records\\n")
     sys.exit(0)
 
 # "success" (default)
@@ -469,6 +487,22 @@ class TestConvertFailureModes(RinexProcessorTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("RINEX header", result.message)
+
+    def test_non_utf8_bytes_from_convbin_do_not_crash_conversion(self) -> None:
+        # Regression: confirmed against a real overnight recording
+        # (built from 34 separately-started append-mode chunks) that
+        # convbin can write a non-UTF-8 byte to stdout while
+        # processing certain raw files. subprocess.run(...,
+        # text=True) with no errors= handling crashed with
+        # UnicodeDecodeError before convbin's actual exit code or
+        # output could even be inspected -- this cost a real,
+        # successful day of autonomous recording its GNSS-IR
+        # processing entirely.
+        os.environ["FAKE_CONVBIN_MODE"] = "bad_bytes"
+
+        result = self.processor.convert(self.raw_file)
+
+        self.assertTrue(result.success, msg=result.message)
 
     def test_convert_before_initialize_never_raises(self) -> None:
         fresh_processor = RinexProcessor(cfg=self.cfg)

@@ -113,6 +113,7 @@ from enum import Enum
 from pathlib import Path
 import logging
 import os
+import re
 import shutil
 import time
 import traceback
@@ -121,6 +122,39 @@ from rinex_processor import RinexProcessor
 from gnssrefl_processor import GnssIrProcessor
 from config import Config
 from database import Database, DatabaseError, ProcessingStatistics
+
+_FILENAME_DATE_PATTERN = re.compile(r"(\d{8})")
+
+
+def _date_from_filename(filename: str) -> str | None:
+    """
+    Extract a YYYYMMDD date embedded in a raw filename (e.g.
+    station_20260709.um980 -> "2026-07-09"), confirmed correct and
+    unambiguous regardless of the file's own modification time,
+    which can drift for reasons unrelated to which day's data the
+    file actually holds (a failed processing attempt touching the
+    file, a backup operation, being copied, etc. -- confirmed
+    against real backlog processing where every file's mtime had
+    drifted to reflect whenever it was last *retried*, not the day
+    it was actually recorded).
+
+    Returns None (letting the caller fall back to its previous
+    behavior) if no 8-digit date-like sequence is found, or if one
+    is found but doesn't parse as a real calendar date -- covering
+    ad-hoc/test filenames that were never meant to carry a date at
+    all (e.g. test_recording.um980).
+    """
+
+    match = _FILENAME_DATE_PATTERN.search(filename)
+    if not match:
+        return None
+
+    try:
+        parsed = datetime.strptime(match.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+    return parsed.isoformat()
 
 
 # The version of this module's interface/contract (the convert()/
@@ -487,9 +521,17 @@ class Pipeline:
 
         for path in scanned:
 
-            file_date = datetime.fromtimestamp(
-                path.stat().st_mtime, tz=timezone.utc
-            ).date()
+            # Same fix as _process_one_job(): derive the date from
+            # the filename first (stable, unambiguous), falling back
+            # to modification time only for filenames that don't
+            # carry a recognizable date.
+            parsed_date_str = _date_from_filename(path.name)
+            if parsed_date_str is not None:
+                file_date = date.fromisoformat(parsed_date_str)
+            else:
+                file_date = datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                ).date()
 
             try:
                 self.db.add_raw_file(
@@ -586,17 +628,25 @@ class Pipeline:
         raw_path = self.cfg.raw_dir / filename
 
         # The file's date is only needed for save_gnssir_product()'s
-        # `date` field. A file still in the queue hasn't reached
-        # _archive() yet, so it should still be sitting in raw_dir;
-        # fall back to "today" only in the unlikely case it's gone
-        # (e.g. removed out-of-band), rather than raising before
-        # we've even had a chance to log the failure properly.
-        if raw_path.exists():
-            file_date = datetime.fromtimestamp(
-                raw_path.stat().st_mtime, tz=timezone.utc
-            ).date().isoformat()
-        else:
-            file_date = datetime.now(timezone.utc).date().isoformat()
+        # `date` field. Confirmed necessary to derive this from the
+        # filename first, not modification time: mtime can drift for
+        # reasons unrelated to which day's data a file represents
+        # (repeated failed processing attempts touching the file,
+        # backups, copies) -- confirmed directly against a real
+        # backlog where every file's computed date had silently
+        # drifted forward by a day or more from repeated retries.
+        # Falls back to mtime (and finally "today") only for
+        # filenames that don't carry a recognizable date at all, e.g.
+        # ad-hoc test recordings.
+        file_date = _date_from_filename(filename)
+
+        if file_date is None:
+            if raw_path.exists():
+                file_date = datetime.fromtimestamp(
+                    raw_path.stat().st_mtime, tz=timezone.utc
+                ).date().isoformat()
+            else:
+                file_date = datetime.now(timezone.utc).date().isoformat()
 
         job = self._jobs.setdefault(
             filename,

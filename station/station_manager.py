@@ -150,6 +150,9 @@ class StationManager:
     _health_check_every_seconds: float = field(
         default=3600.0, init=False, repr=False
     )
+    _external_storage_path: Path | None = field(
+        default=None, init=False, repr=False
+    )
     _current_day: date | None = field(default=None, init=False, repr=False)
     _chunks_recorded_today: int = field(default=0, init=False, repr=False)
     _last_summary: PipelineSummary | None = field(
@@ -198,6 +201,11 @@ class StationManager:
         )
         self._health_check_every_seconds = float(
             station_section.get("health_check_interval_seconds", 3600.0)
+        )
+
+        external_storage = station_section.get("external_storage_path")
+        self._external_storage_path = (
+            Path(external_storage) if external_storage else None
         )
 
         if self.pipeline is not None:
@@ -259,6 +267,7 @@ class StationManager:
 
             self._run_pipeline_safely()
             self._health_check()
+            self._export_day_to_external_storage(self._current_day)
 
         self._running = False
         self._logger.info("StationManager main loop stopped")
@@ -462,6 +471,133 @@ class StationManager:
 
         except Exception as exc:
             self._logger.error("Health check failed (non-fatal): %s", exc)
+
+    def _export_day_to_external_storage(self, day: date) -> None:
+        """
+        Move the day's raw capture and the entire gnssrefl working
+        directory (products/, i.e. $REFL_CODE and everything under
+        it) to external storage, then let the next day's processing
+        recreate products/ from scratch as needed (initialize()
+        already handles missing directories/files gracefully -- this
+        just costs a small amount of redundant setup each day, e.g.
+        re-downloading the EGM96 file, in exchange for a clean daily
+        export).
+
+        Disabled by default -- only runs if "external_storage_path"
+        is set in station.json. Runs regardless of whether the day's
+        pipeline processing succeeded or failed, since the raw
+        capture should be preserved somewhere either way.
+
+        Never raises. Local files are only removed after a
+        confirmed-successful move (shutil.move()'s own behavior), so
+        a failure here (e.g. external storage temporarily unmounted)
+        never loses data -- it just leaves that day's files sitting
+        locally, to be picked up by the next successful export
+        attempt, or investigated by hand.
+        """
+
+        if self._external_storage_path is None:
+            return
+
+        assert self.cfg is not None
+
+        try:
+            if not self._external_storage_path.is_dir():
+                self._logger.error(
+                    "External storage path is not available (not "
+                    "mounted, or not a directory): %s -- skipping "
+                    "export for %s",
+                    self._external_storage_path,
+                    day,
+                )
+                return
+
+            raw_destination_dir = self._external_storage_path / "Raw"
+            products_destination_dir = self._external_storage_path / "Products"
+            raw_destination_dir.mkdir(parents=True, exist_ok=True)
+            products_destination_dir.mkdir(parents=True, exist_ok=True)
+
+            self._export_raw_file(day, raw_destination_dir)
+            self._export_products_directory(day, products_destination_dir)
+
+        except Exception as exc:
+            self._logger.error(
+                "Export to external storage failed (non-fatal) for %s: %s",
+                day,
+                exc,
+            )
+
+    def _export_raw_file(self, day: date, destination_dir: Path) -> None:
+        """
+        Find the day's raw file -- it may still be in raw/ (pipeline
+        processing failed or hasn't run) or already in archive/
+        (pipeline processing succeeded, pipeline.py's own archiving
+        already moved it there) -- and move whichever copy exists to
+        external storage. A no-op, not an error, if neither exists
+        (e.g. a day with zero successful recording chunks).
+        """
+
+        assert self.cfg is not None
+
+        raw_filename = self._raw_file_for_day(day).name
+        candidates = [
+            self.cfg.raw_dir / raw_filename,
+            getattr(self.cfg, "archive_dir", self.cfg.raw_dir) / raw_filename,
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                destination = destination_dir / raw_filename
+                shutil.move(str(candidate), str(destination))
+                self._logger.info(
+                    "Exported raw file to external storage: %s -> %s",
+                    candidate,
+                    destination,
+                )
+                return
+
+        self._logger.info(
+            "No raw file found for %s in raw/ or archive/ -- nothing to "
+            "export",
+            day,
+        )
+
+    def _export_products_directory(self, day: date, destination_dir: Path) -> None:
+        """
+        Move the entire products/ directory to external storage,
+        under a per-day folder name (so each day's export doesn't
+        overwrite the previous one) -- a no-op, not an error, if
+        products/ doesn't exist yet (e.g. the very first day, before
+        any processing has run at all).
+        """
+
+        assert self.cfg is not None
+
+        products_dir = Path(self.cfg.products_dir)
+
+        if not products_dir.exists():
+            self._logger.info(
+                "No products/ directory found for %s -- nothing to export",
+                day,
+            )
+            return
+
+        destination = destination_dir / f"{day:%Y%m%d}"
+
+        if destination.exists():
+            self._logger.error(
+                "Export destination already exists, refusing to overwrite: "
+                "%s -- leaving local products/ in place",
+                destination,
+            )
+            return
+
+        shutil.move(str(products_dir), str(destination))
+        self._logger.info(
+            "Exported products/ to external storage: %s -> %s",
+            products_dir,
+            destination,
+        )
 
     @staticmethod
     def _latest_name(record) -> str:

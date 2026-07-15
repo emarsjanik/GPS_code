@@ -317,7 +317,7 @@ class RinexProcessor:
                     convbin_version=self._convbin_version,
                 )
             )
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             elapsed = time.monotonic() - started
             message = f"Could not execute convbin: {exc}"
             self._logger.error(
@@ -454,9 +454,10 @@ class RinexProcessor:
                 [self._convbin_path],
                 capture_output=True,
                 text=True,
+                errors="ignore",
                 timeout=5,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
             return "unknown"
 
         output = (result.stdout or "") + (result.stderr or "")
@@ -604,6 +605,14 @@ class RinexProcessor:
             command,
             capture_output=True,
             text=True,
+            errors="ignore",  # confirmed necessary: convbin can write
+                               # non-UTF-8 bytes to stdout/stderr when
+                               # processing certain raw files (observed
+                               # on a real, 34-chunk append-built raw
+                               # file); without this, Python's own
+                               # UnicodeDecodeError crashes conversion
+                               # before convbin's actual exit code or
+                               # output can even be inspected.
             timeout=self.subprocess_timeout,
         )
 

@@ -242,6 +242,26 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.assertAlmostEqual(call["lon"], -69.9633123013)
         self.assertAlmostEqual(call["height"], 21.774)
 
+    def test_all_frequencies_enabled_by_default(self) -> None:
+        # Regression: confirmed against a real results file that
+        # every one of 20 real retrievals came from GPS alone,
+        # despite the RINEX data containing real SNR observables
+        # from GLONASS, Galileo, QZSS, and BeiDou too --
+        # make_gnssir_input()'s own default (allfreq=False) was
+        # silently restricting analysis to GPS only.
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertTrue(call["allfreq"])
+
+    def test_all_frequencies_configurable_to_false(self) -> None:
+        self.cfg.station["gnssrefl_all_frequencies"] = False
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertFalse(call["allfreq"])
+
     def test_station_code_derived_from_station_id_when_not_configured(self) -> None:
         self.processor.initialize()
 
