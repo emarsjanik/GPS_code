@@ -262,6 +262,102 @@ class TestInitialize(GnssIrProcessorTestCase):
         call = calls["make_gnssir_input"][0]
         self.assertFalse(call["allfreq"])
 
+    def test_fine_tuning_parameters_omitted_when_not_configured(self) -> None:
+        # Confirmed correct default behavior: none of these new
+        # parameters should be passed at all unless explicitly set,
+        # so gnssrefl's own internal defaults apply -- upgrading
+        # never silently changes behavior for an existing station.
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        for key in (
+            "e1", "e2", "h1", "h2", "azlist2",
+            "peak2noise", "ampl", "Hortho", "refraction", "delTmax", "ediff",
+        ):
+            self.assertNotIn(key, call)
+
+    def test_elevation_mask_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_elevation_min"] = 10.0
+        self.cfg.station["gnssrefl_elevation_max"] = 20.0
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertAlmostEqual(call["e1"], 10.0)
+        self.assertAlmostEqual(call["e2"], 20.0)
+
+    def test_reflector_height_range_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_reflector_height_min"] = 1.0
+        self.cfg.station["gnssrefl_reflector_height_max"] = 15.0
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertAlmostEqual(call["h1"], 1.0)
+        self.assertAlmostEqual(call["h2"], 15.0)
+
+    def test_azimuth_regions_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_azimuth_regions"] = [0, 150, 180, 360]
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertEqual(call["azlist2"], [0.0, 150.0, 180.0, 360.0])
+
+    def test_qc_thresholds_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_peak2noise"] = 3.2
+        self.cfg.station["gnssrefl_amplitude_min"] = 6.0
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertAlmostEqual(call["peak2noise"], 3.2)
+        self.assertAlmostEqual(call["ampl"], 6.0)
+
+    def test_orthometric_height_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_orthometric_height"] = 12.5
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertAlmostEqual(call["Hortho"], 12.5)
+
+    def test_refraction_model_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_refraction_model"] = 2
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertEqual(call["refraction"], 2)
+
+    def test_max_arc_minutes_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_max_arc_minutes"] = 20.0
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertAlmostEqual(call["delTmax"], 20.0)
+
+    def test_max_arc_minutes_omitted_when_not_configured(self) -> None:
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertNotIn("delTmax", call)
+
+    def test_elevation_span_tolerance_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_elevation_span_tolerance"] = 1.0
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertAlmostEqual(call["ediff"], 1.0)
+
+    def test_elevation_span_tolerance_omitted_when_not_configured(self) -> None:
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertNotIn("ediff", call)
+
     def test_station_code_derived_from_station_id_when_not_configured(self) -> None:
         self.processor.initialize()
 

@@ -645,6 +645,21 @@ class GnssIrProcessor:
         real, confirmed SNR observables from GLONASS, Galileo, QZSS,
         and BeiDou as well -- meaning most of the station's actual
         captured data was silently going unused for GNSS-IR analysis.
+
+        Fine-tuning parameters (elevation mask, reflector height
+        range, azimuth mask, QC thresholds, orthometric height
+        reference, refraction model, maximum arc length, arc
+        elevation-span tolerance) are real
+        make_gnssir_input() inputs that were never previously exposed
+        here at all -- confirmed via gnssrefl's own documentation. Each is only
+        passed through if explicitly set in station.json; left unset,
+        gnssrefl's own internal defaults apply exactly as before this
+        change, so upgrading never silently alters existing behavior.
+        This matters most for a *different* future site, where this
+        station's implicit defaults (tuned for Woods Hole) could be
+        wrong -- e.g. a site with a partially obstructed view needs
+        its own azimuth mask, or a site with a much taller antenna
+        needs a wider reflector height search range.
         """
 
         from gnssrefl.gnssir_input import make_gnssir_input
@@ -658,14 +673,88 @@ class GnssIrProcessor:
             station_section.get("gnssrefl_all_frequencies", True)
         )
 
+        kwargs = dict(
+            station=self._station_code,
+            lat=latitude,
+            lon=longitude,
+            height=height,
+            allfreq=all_frequencies,
+        )
+
+        # Elevation angle mask (gnssrefl's own params: e1, e2)
+        e1 = station_section.get("gnssrefl_elevation_min")
+        e2 = station_section.get("gnssrefl_elevation_max")
+        if e1 is not None:
+            kwargs["e1"] = float(e1)
+        if e2 is not None:
+            kwargs["e2"] = float(e2)
+
+        # Reflector height search range (gnssrefl's own params: h1, h2)
+        h1 = station_section.get("gnssrefl_reflector_height_min")
+        h2 = station_section.get("gnssrefl_reflector_height_max")
+        if h1 is not None:
+            kwargs["h1"] = float(h1)
+        if h2 is not None:
+            kwargs["h2"] = float(h2)
+
+        # Azimuth mask (gnssrefl's own param: azlist2 -- a list of
+        # region boundaries, e.g. [0, 360] or [0, 150, 180, 360])
+        azimuth_regions = station_section.get("gnssrefl_azimuth_regions")
+        if azimuth_regions:
+            kwargs["azlist2"] = [float(a) for a in azimuth_regions]
+
+        # Quality-control thresholds (gnssrefl's own params:
+        # peak2noise, ampl)
+        peak2noise = station_section.get("gnssrefl_peak2noise")
+        amplitude_min = station_section.get("gnssrefl_amplitude_min")
+        if peak2noise is not None:
+            kwargs["peak2noise"] = float(peak2noise)
+        if amplitude_min is not None:
+            kwargs["ampl"] = float(amplitude_min)
+
+        # Orthometric height reference (gnssrefl's own param: Hortho)
+        # -- needed to report real, absolute water level rather than
+        # just relative reflector height. Never set for this station;
+        # a real, meaningful value for a future site.
+        orthometric_height = station_section.get("gnssrefl_orthometric_height")
+        if orthometric_height is not None:
+            kwargs["Hortho"] = float(orthometric_height)
+
+        # Refraction model (gnssrefl's own param: refraction) -- 1 is
+        # the Bennett correction (gnssrefl's own default); matters
+        # more for very tall or very short sites.
+        refraction_model = station_section.get("gnssrefl_refraction_model")
+        if refraction_model is not None:
+            kwargs["refraction"] = int(refraction_model)
+
+        # Maximum arc length in minutes (gnssrefl's own param: delTmax)
+        # -- library default is 75 minutes, documented as too long for
+        # sites with a fast tidal rate of change: a single satellite
+        # arc's reflector height estimate gets blurred across
+        # whatever real water-level change happens during that whole
+        # window. Only passed through if explicitly configured, so
+        # gnssrefl's own default applies otherwise.
+        max_arc_minutes = station_section.get("gnssrefl_max_arc_minutes")
+        if max_arc_minutes is not None:
+            kwargs["delTmax"] = float(max_arc_minutes)
+
+        # Arc elevation-span quality control (gnssrefl's own param:
+        # ediff) -- requires every arc to span at least
+        # (e1+ediff) to (e2-ediff) degrees. Library default is 2,
+        # documented as too strict for a narrow elevation mask like
+        # ours (5-15 degrees is the documentation's own worked
+        # example for "you might want to make that a little
+        # stricter... an ediff of 1"). Confirmed directly against our
+        # own real pipeline output that this is actively rejecting
+        # real arcs at the default value. Only passed through if
+        # explicitly configured, so gnssrefl's own default applies
+        # otherwise.
+        elevation_span_tolerance = station_section.get("gnssrefl_elevation_span_tolerance")
+        if elevation_span_tolerance is not None:
+            kwargs["ediff"] = float(elevation_span_tolerance)
+
         try:
-            make_gnssir_input(
-                station=self._station_code,
-                lat=latitude,
-                lon=longitude,
-                height=height,
-                allfreq=all_frequencies,
-            )
+            make_gnssir_input(**kwargs)
         except (Exception, SystemExit) as exc:
             raise GnssIrProcessorError(
                 f"Could not set up gnssrefl analysis strategy for "

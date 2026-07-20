@@ -20,6 +20,7 @@ Run with:
 from __future__ import annotations
 
 import importlib.metadata
+import shutil
 import sys
 import tempfile
 import time
@@ -435,6 +436,261 @@ class TestHealthCheck(StationManagerTestCase):
 # ------------------------------------------------------------
 # run() / stop() / status() / shutdown() lifecycle
 # ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# External storage export
+# ------------------------------------------------------------
+
+class TestExternalStorageExport(StationManagerTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.external_root = Path(tempfile.mkdtemp())
+        self.cfg.station["external_storage_path"] = str(self.external_root)
+        self.manager.initialize()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.external_root, ignore_errors=True)
+        super().tearDown()
+
+    def test_disabled_by_default(self) -> None:
+        disabled_manager = station_manager.StationManager(
+            cfg=self.cfg, db=self.db, pipeline=self.fake_pipeline
+        )
+        # A fresh cfg without the config key set, matching real
+        # "not configured at all" behavior.
+        disabled_manager.cfg.station = dict(self.cfg.station)
+        del disabled_manager.cfg.station["external_storage_path"]
+        disabled_manager.initialize()
+
+        raw_file = self.cfg.raw_dir / "station_20260709.um980"
+        raw_file.write_bytes(b"fake raw data")
+
+        disabled_manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        # Nothing moved -- the raw file is still exactly where it was.
+        self.assertTrue(raw_file.exists())
+
+    def test_raw_file_exported_from_raw_dir(self) -> None:
+        raw_file = self.cfg.raw_dir / "station_20260709.um980"
+        raw_file.write_bytes(b"fake raw data")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Raw" / "station_20260709.um980"
+        self.assertTrue(exported.exists())
+        self.assertFalse(raw_file.exists())  # moved, not copied
+        self.assertEqual(exported.read_bytes(), b"fake raw data")
+
+    def test_raw_file_exported_from_archive_dir_when_already_processed(self) -> None:
+        # Simulates pipeline.py having already archived a
+        # successfully-processed raw file before export runs.
+        archived_file = self.cfg.archive_dir / "station_20260709.um980"
+        archived_file.write_bytes(b"already archived data")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Raw" / "station_20260709.um980"
+        self.assertTrue(exported.exists())
+        self.assertFalse(archived_file.exists())
+
+    def test_missing_raw_file_is_not_an_error(self) -> None:
+        try:
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+        except Exception as exc:  # pragma: no cover
+            self.fail(f"_export_day_to_external_storage() raised: {exc}")
+
+    def test_products_directory_exported_and_flattened(self) -> None:
+        # A file directly under refl_code/ with no recognized
+        # category in its path at all falls back to "other/",
+        # preserving its full original relative path rather than
+        # being silently dropped.
+        self.cfg.products_dir.mkdir(parents=True, exist_ok=True)
+        (self.cfg.products_dir / "refl_code").mkdir(parents=True, exist_ok=True)
+        (self.cfg.products_dir / "refl_code" / "marker.txt").write_text("real data")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = (
+            self.external_root / "Products" / "20260709"
+            / "other" / "refl_code" / "marker.txt"
+        )
+        self.assertTrue(exported.exists())
+        self.assertEqual(exported.read_text(), "real data")
+        self.assertFalse(self.cfg.products_dir.exists())  # moved, not copied
+
+    def test_flattening_removes_year_and_station_nesting(self) -> None:
+        # Confirmed against a real, live products/ directory: results
+        # normally nest as <year>/results/<station>/<file> --
+        # flattening should collapse the year layer while keeping the
+        # station code, so files from different station codes never
+        # collide under the same filename.
+        results_dir = (
+            self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
+        )
+        results_dir.mkdir(parents=True, exist_ok=True)
+        (results_dir / "190.txt").write_text("day 190 results")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = (
+            self.external_root / "Products" / "20260709"
+            / "results" / "usgs" / "190.txt"
+        )
+        self.assertTrue(exported.exists())
+        self.assertEqual(exported.read_text(), "day 190 results")
+
+    def test_multiple_station_codes_kept_separate_not_collided(self) -> None:
+        # Confirmed real scenario: if a station's own code was ever
+        # changed, gnssrefl's working directory can end up with
+        # results for more than one station code side by side. Both
+        # must be kept, not overwritten.
+        base = self.cfg.products_dir / "refl_code" / "2026" / "results"
+        (base / "usgs").mkdir(parents=True, exist_ok=True)
+        (base / "wh01").mkdir(parents=True, exist_ok=True)
+        (base / "usgs" / "197.txt").write_text("usgs results")
+        (base / "wh01" / "197.txt").write_text("wh01 results")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported_root = self.external_root / "Products" / "20260709" / "results"
+        self.assertEqual(
+            (exported_root / "usgs" / "197.txt").read_text(), "usgs results"
+        )
+        self.assertEqual(
+            (exported_root / "wh01" / "197.txt").read_text(), "wh01 results"
+        )
+
+    def test_failqc_subfolder_preserved(self) -> None:
+        failqc_dir = (
+            self.cfg.products_dir / "refl_code" / "2026" / "results"
+            / "usgs" / "failQC"
+        )
+        failqc_dir.mkdir(parents=True, exist_ok=True)
+        (failqc_dir / "bad_arc.txt").write_text("rejected arc")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = (
+            self.external_root / "Products" / "20260709"
+            / "results" / "usgs" / "failQC" / "bad_arc.txt"
+        )
+        self.assertTrue(exported.exists())
+
+    def test_non_station_specific_folders_kept_as_is(self) -> None:
+        # orbits/ and exe/ are shared, reusable resources, not
+        # per-station -- confirmed real structure has no station code
+        # under either, so flattening should leave their internal
+        # structure alone beyond the category name itself.
+        orbits_dir = self.cfg.products_dir / "refl_code" / "orbits" / "2026" / "sp3"
+        orbits_dir.mkdir(parents=True, exist_ok=True)
+        (orbits_dir / "orbit.sp3").write_text("orbit data")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = (
+            self.external_root / "Products" / "20260709"
+            / "orbits" / "2026" / "sp3" / "orbit.sp3"
+        )
+        self.assertTrue(exported.exists())
+
+    def test_unrecognized_future_category_not_silently_dropped(self) -> None:
+        # If gnssrefl ever adds a new category this code doesn't
+        # already know about, it must still be preserved (under
+        # other/, with its original relative path intact) rather than
+        # silently lost.
+        future_dir = (
+            self.cfg.products_dir / "refl_code" / "some_new_category" / "usgs"
+        )
+        future_dir.mkdir(parents=True, exist_ok=True)
+        (future_dir / "future.txt").write_text("future data")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = (
+            self.external_root / "Products" / "20260709"
+            / "other" / "refl_code" / "some_new_category" / "usgs" / "future.txt"
+        )
+        self.assertTrue(exported.exists())
+        self.assertEqual(exported.read_text(), "future data")
+
+    def test_missing_products_directory_is_not_an_error(self) -> None:
+        try:
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+        except Exception as exc:  # pragma: no cover
+            self.fail(f"_export_day_to_external_storage() raised: {exc}")
+
+    def test_unavailable_external_storage_does_not_crash_or_lose_data(self) -> None:
+        # Simulates the external mount being temporarily unavailable
+        # (e.g. unmounted) -- confirmed by pointing at a path that
+        # does not exist as a directory.
+        self.manager._external_storage_path = self.external_root / "not_mounted"
+
+        raw_file = self.cfg.raw_dir / "station_20260709.um980"
+        raw_file.write_bytes(b"fake raw data")
+
+        try:
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+        except Exception as exc:  # pragma: no cover
+            self.fail(f"_export_day_to_external_storage() raised: {exc}")
+
+        # Local data preserved -- nothing was lost.
+        self.assertTrue(raw_file.exists())
+
+    def test_existing_destination_is_not_overwritten(self) -> None:
+        self.cfg.products_dir.mkdir(parents=True, exist_ok=True)
+        (self.cfg.products_dir / "marker.txt").write_text("todays data")
+
+        collision_dir = self.external_root / "Products" / "20260709"
+        collision_dir.mkdir(parents=True, exist_ok=True)
+        (collision_dir / "old.txt").write_text("yesterdays data, still here")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        # The pre-existing export was not overwritten or deleted.
+        self.assertTrue((collision_dir / "old.txt").exists())
+        # And since we refused to overwrite, the local copy is
+        # preserved too, rather than silently lost.
+        self.assertTrue(self.cfg.products_dir.exists())
+
+    def test_run_pipeline_and_health_check_all_happen_before_export(self) -> None:
+        # Confirms the real ordering in run()'s daily cycle: pipeline
+        # runs, then health check, then export -- not export first,
+        # which could move data pipeline.py still needed. Recording
+        # itself is irrelevant to this test, so it's replaced with a
+        # no-op to reach the ordering-relevant calls immediately.
+        self.manager._today = lambda: date(2026, 7, 9)
+        self.manager._record_day = lambda day: None
+
+        raw_file = self.cfg.raw_dir / "station_20260709.um980"
+        raw_file.write_bytes(b"fake raw data")
+
+        call_order = []
+        original_pipeline = self.manager._run_pipeline_safely
+        original_health = self.manager._health_check
+        original_export = self.manager._export_day_to_external_storage
+
+        def track_pipeline():
+            call_order.append("pipeline")
+            original_pipeline()
+
+        def track_health():
+            call_order.append("health")
+            original_health()
+
+        def track_export(day):
+            call_order.append("export")
+            self.manager.stop()  # stop after first cycle for this test
+            original_export(day)
+
+        self.manager._run_pipeline_safely = track_pipeline
+        self.manager._health_check = track_health
+        self.manager._export_day_to_external_storage = track_export
+
+        self.manager.run()
+
+        self.assertEqual(call_order, ["pipeline", "health", "export"])
+
 
 class TestLifecycle(StationManagerTestCase):
 

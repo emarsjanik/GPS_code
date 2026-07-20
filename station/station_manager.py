@@ -562,13 +562,43 @@ class StationManager:
             day,
         )
 
+    # Recognized gnssrefl category names -- confirmed against the
+    # real, actual structure of a live products/ directory (not
+    # assumed): results, snr, and input each nest under a year and/or
+    # station code; Files and logs sit at slightly different depths;
+    # multiple station codes can appear side by side if the
+    # station's own code was ever changed, and every one of them
+    # needs to be kept, not just whichever is current now.
+    _KNOWN_EXPORT_CATEGORIES = (
+        "results", "snr", "Files", "logs", "input",
+        "phase", "rinex", "orbits", "exe",
+    )
+
     def _export_products_directory(self, day: date, destination_dir: Path) -> None:
         """
-        Move the entire products/ directory to external storage,
-        under a per-day folder name (so each day's export doesn't
-        overwrite the previous one) -- a no-op, not an error, if
-        products/ doesn't exist yet (e.g. the very first day, before
-        any processing has run at all).
+        Flatten and move the entire products/ directory to external
+        storage, under a per-day folder name (so each day's export
+        doesn't overwrite the previous one) -- a no-op, not an error,
+        if products/ doesn't exist yet (e.g. the very first day,
+        before any processing has run at all).
+
+        Confirmed necessary to flatten rather than move the whole
+        tree as-is: gnssrefl's own internal layout nests everything
+        several levels deep (a year, then a category, then a station
+        code, sometimes another year) purely for its own working
+        needs, not because any of that structure is meaningful once
+        archived. This walks every real file, identifies which known
+        category it belongs to from its actual path (not an assumed
+        fixed layout), and re-homes it under a flat
+        <category>/<station code>/... structure instead -- collapsing
+        the redundant year/refl_code nesting while still keeping
+        files from different station codes safely separated by
+        keeping the station code as one subfolder level, so nothing
+        from two different station codes can collide under the same
+        filename. Anything that doesn't match a known category is
+        kept under "other/" with its original relative path intact,
+        rather than silently dropped, in case gnssrefl ever adds a
+        new category this doesn't already know about.
         """
 
         assert self.cfg is not None
@@ -592,11 +622,44 @@ class StationManager:
             )
             return
 
-        shutil.move(str(products_dir), str(destination))
+        files_moved = 0
+
+        for root, _dirs, files in os.walk(products_dir):
+            if not files:
+                continue
+
+            root_path = Path(root)
+            relative_parts = root_path.relative_to(products_dir).parts
+
+            category = "other"
+            remainder_parts = relative_parts
+            for index, part in enumerate(relative_parts):
+                if part in self._KNOWN_EXPORT_CATEGORIES:
+                    category = part
+                    remainder_parts = relative_parts[index + 1:]
+                    break
+
+            dest_subdir = (
+                destination / category / Path(*remainder_parts)
+                if remainder_parts
+                else destination / category
+            )
+            dest_subdir.mkdir(parents=True, exist_ok=True)
+
+            for filename in files:
+                shutil.move(
+                    str(root_path / filename), str(dest_subdir / filename)
+                )
+                files_moved += 1
+
+        shutil.rmtree(products_dir, ignore_errors=True)
+
         self._logger.info(
-            "Exported products/ to external storage: %s -> %s",
+            "Exported and flattened products/ to external storage: "
+            "%s -> %s (%d files)",
             products_dir,
             destination,
+            files_moved,
         )
 
     @staticmethod
