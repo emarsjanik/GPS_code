@@ -228,6 +228,18 @@ class TestInitialize(StationManagerTestCase):
         self.assertTrue(status.initialized)
         self.assertFalse(status.running)
 
+    def test_export_retry_window_defaults_to_three_days(self) -> None:
+        self.manager.initialize()
+
+        self.assertEqual(self.manager._export_retry_window_days, 3)
+
+    def test_export_retry_window_reads_configured_value(self) -> None:
+        self.cfg.station["export_retry_window_days"] = 5
+
+        self.manager.initialize()
+
+        self.assertEqual(self.manager._export_retry_window_days, 5)
+
 
 # ------------------------------------------------------------
 # Chunked recording
@@ -434,6 +446,145 @@ class TestHealthCheck(StationManagerTestCase):
 
 
 # ------------------------------------------------------------
+# Station code derivation
+# ------------------------------------------------------------
+
+class TestStationCode(StationManagerTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.manager.initialize()
+
+    def test_derived_from_station_id_when_not_explicitly_set(self) -> None:
+        self.cfg.station["station_id"] = "USGS001"
+
+        self.assertEqual(self.manager._station_code(), "usgs")
+
+    def test_explicit_override_takes_precedence(self) -> None:
+        self.cfg.station["station_id"] = "USGS001"
+        self.cfg.station["gnssrefl_station_code"] = "wh01"
+
+        self.assertEqual(self.manager._station_code(), "wh01")
+
+    def test_empty_when_station_id_not_set(self) -> None:
+        self.assertEqual(self.manager._station_code(), "")
+
+
+# ------------------------------------------------------------
+# Export retry gap -- the real, confirmed fix
+# ------------------------------------------------------------
+
+class TestExportRetryGap(StationManagerTestCase):
+    """
+    Confirmed, real gap this class tests the fix for: the automatic
+    daily export used to run regardless of whether a day's GNSS-IR
+    processing actually succeeded, which meant any day whose orbit
+    product wasn't published yet by export time (routinely a 1-2 day
+    delay) was permanently lost -- its raw data got shipped off to
+    external storage, and products/ (including the SNR file) got
+    wiped, before there was ever a real chance to retry once the
+    orbit became available.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.station["station_id"] = "USGS001"
+        self.manager.initialize()
+
+    def _write_results(self, day: date, content: str) -> None:
+        doy = day.timetuple().tm_yday
+        results_dir = self.cfg.products_dir / str(day.year) / "results" / "usgs"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        (results_dir / f"{doy}.txt").write_text(content)
+
+    def test_has_real_results_false_when_file_missing(self) -> None:
+        day = date(2026, 7, 23)  # doy 204
+
+        self.assertFalse(self.manager._has_real_results_for_day(day))
+
+    def test_has_real_results_false_when_only_comments(self) -> None:
+        day = date(2026, 7, 23)
+        self._write_results(day, "% header comment\n% another comment\n")
+
+        self.assertFalse(self.manager._has_real_results_for_day(day))
+
+    def test_has_real_results_true_with_real_data_line(self) -> None:
+        day = date(2026, 7, 23)
+        self._write_results(day, "% header\n2026 204 1.500 100 12.5 1\n")
+
+        self.assertTrue(self.manager._has_real_results_for_day(day))
+
+    def test_day_with_real_results_is_ready_regardless_of_age(self) -> None:
+        day = date(2026, 7, 23)
+        self._write_results(day, "% header\n2026 204 1.500 100 12.5 1\n")
+        self.manager._today = lambda: day  # zero age -- results alone should be enough
+
+        self.assertTrue(self.manager._day_is_ready_to_export(day))
+
+    def test_day_without_results_within_window_is_not_ready(self) -> None:
+        # This is the actual bug this whole fix targets: a day one
+        # day old, no results yet (orbit likely not published),
+        # should NOT be exported yet.
+        day = date(2026, 7, 26)
+        self.manager._today = lambda: date(2026, 7, 27)  # 1 day old
+
+        self.assertFalse(self.manager._day_is_ready_to_export(day))
+
+    def test_day_without_results_past_window_exports_anyway(self) -> None:
+        # Bounds local storage growth: give up waiting eventually.
+        day = date(2026, 7, 20)
+        self.manager._today = lambda: date(2026, 7, 27)  # 7 days old, past default 3-day window
+
+        self.assertTrue(self.manager._day_is_ready_to_export(day))
+
+    def test_day_exactly_at_window_boundary_is_ready(self) -> None:
+        day = date(2026, 7, 24)
+        self.manager._today = lambda: date(2026, 7, 27)  # exactly 3 days old
+
+        self.assertTrue(self.manager._day_is_ready_to_export(day))
+
+    def test_export_actually_skipped_for_recent_day_without_results(self) -> None:
+        # Full integration: confirms _export_day_to_external_storage
+        # itself (not just the helper methods) leaves data in place.
+        self.external_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.external_root, ignore_errors=True)
+        self.cfg.station["external_storage_path"] = str(self.external_root)
+        self.manager.initialize()
+
+        day = date(2026, 7, 26)
+        self.manager._today = lambda: date(2026, 7, 27)  # 1 day old, no results
+
+        raw_file = self.cfg.raw_dir / "station_20260726.um980"
+        raw_file.write_bytes(b"real raw data, not yet processed")
+
+        self.manager._export_day_to_external_storage(day)
+
+        # Nothing moved -- left in place for a future retry.
+        self.assertTrue(raw_file.exists())
+        exported = self.external_root / "Raw" / "station_20260726.um980"
+        self.assertFalse(exported.exists())
+
+    def test_export_proceeds_once_real_results_exist(self) -> None:
+        self.external_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.external_root, ignore_errors=True)
+        self.cfg.station["external_storage_path"] = str(self.external_root)
+        self.manager.initialize()
+
+        day = date(2026, 7, 26)
+        self.manager._today = lambda: day  # zero age -- results alone should suffice
+        self._write_results(day, "% header\n2026 207 1.500 100 12.5 1\n")
+
+        raw_file = self.cfg.raw_dir / "station_20260726.um980"
+        raw_file.write_bytes(b"real raw data, now processed")
+
+        self.manager._export_day_to_external_storage(day)
+
+        exported = self.external_root / "Raw" / "station_20260726.um980"
+        self.assertTrue(exported.exists())
+        self.assertFalse(raw_file.exists())
+
+
+# ------------------------------------------------------------
 # run() / stop() / status() / shutdown() lifecycle
 # ------------------------------------------------------------
 
@@ -448,6 +599,20 @@ class TestExternalStorageExport(StationManagerTestCase):
         self.external_root = Path(tempfile.mkdtemp())
         self.cfg.station["external_storage_path"] = str(self.external_root)
         self.manager.initialize()
+        # Confirmed necessary after adding the export-retry-gap fix:
+        # these tests are all about export *mechanics* (does the
+        # right file move to the right place), not the new gating
+        # logic itself (that's covered by TestExportRetryGap above).
+        # None of them set up a real results file, so without this,
+        # every one of them would depend on whatever the real
+        # current date happens to be relative to the hardcoded
+        # 2026-07-09 test day -- fragile and wrong. Pinning "today"
+        # comfortably past the default 3-day retry window makes
+        # every day used below always old enough to export
+        # regardless of results, restoring the exact old,
+        # unconditional-export behavior these tests were written
+        # against.
+        self.manager._today = lambda: date(2026, 7, 20)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.external_root, ignore_errors=True)

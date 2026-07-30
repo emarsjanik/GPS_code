@@ -42,7 +42,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-SPLINE_FILE = Path.home() / "GNSS/v4.1/products/refl_code/Files/usgs/usgs_spline_out.txt"
+SPLINE_FILE = Path("/mnt/I2Rgus_Data/GPS_Data/Products/20260720/Files/usgs/usgs_spline_out.txt")
 OUTPUT_FILE = Path.home() / "GNSS/v4.1/products/refl_code/Files/usgs/noaa_comparison.png"
 
 REFERENCE_UNITS = "feet"  # matches the uploaded CSV; change to "meters" for a metric file

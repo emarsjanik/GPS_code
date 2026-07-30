@@ -150,6 +150,7 @@ class StationManager:
     _health_check_every_seconds: float = field(
         default=3600.0, init=False, repr=False
     )
+    _export_retry_window_days: int = field(default=3, init=False, repr=False)
     _external_storage_path: Path | None = field(
         default=None, init=False, repr=False
     )
@@ -202,6 +203,9 @@ class StationManager:
         self._health_check_every_seconds = float(
             station_section.get("health_check_interval_seconds", 3600.0)
         )
+        self._export_retry_window_days = int(
+            station_section.get("export_retry_window_days", 3)
+        )
 
         external_storage = station_section.get("external_storage_path")
         self._external_storage_path = (
@@ -221,10 +225,11 @@ class StationManager:
 
         self._logger.info(
             "StationManager initialized: chunk=%.0fs retry_delay=%.0fs "
-            "health_check_every=%.0fs",
+            "health_check_every=%.0fs export_retry_window=%dd",
             self._chunk_seconds,
             self._retry_delay_seconds,
             self._health_check_every_seconds,
+            self._export_retry_window_days,
         )
 
         return "READY"
@@ -472,6 +477,104 @@ class StationManager:
         except Exception as exc:
             self._logger.error("Health check failed (non-fatal): %s", exc)
 
+    def _station_code(self) -> str:
+        """
+        The 4-character gnssrefl station code -- matches the exact
+        same derivation gnssrefl_processor.py uses (explicit override
+        via gnssrefl_station_code if set, otherwise the first 4
+        characters of station_id, lowercased), so this stays
+        consistent with whatever the pipeline actually processed
+        under. Duplicated here deliberately rather than imported --
+        a few lines of simple, stable logic, safer than adding a
+        cross-module dependency into gnssrefl_processor.py's
+        internals just for this one small lookup.
+        """
+
+        assert self.cfg is not None
+        station_section = getattr(self.cfg, "station", {}) or {}
+
+        explicit = station_section.get("gnssrefl_station_code")
+        if explicit:
+            return explicit
+
+        station_id = station_section.get("station_id", "")
+        return station_id[:4].lower()
+
+    def _has_real_results_for_day(self, day: date) -> bool:
+        """
+        Checks whether a real GNSS-IR results file already exists
+        for this day -- i.e. whether the pipeline actually succeeded
+        in producing usable output, not just that it was attempted.
+
+        Confirmed against real results files: they always have at
+        least one non-comment data line when processing genuinely
+        succeeded; a missing file, or one containing only its header
+        comments, means processing hasn't succeeded yet -- most
+        commonly because that day's official orbit product hasn't
+        been published yet (confirmed to routinely take 1-2 days).
+        """
+
+        assert self.cfg is not None
+
+        station_code = self._station_code()
+        if not station_code:
+            return False
+
+        doy = day.timetuple().tm_yday
+        results_path = (
+            Path(self.cfg.products_dir)
+            / str(day.year)
+            / "results"
+            / station_code
+            / f"{doy}.txt"
+        )
+
+        if not results_path.exists():
+            return False
+
+        try:
+            with open(results_path) as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("%"):
+                        return True
+        except OSError:
+            return False
+
+        return False
+
+    def _day_is_ready_to_export(self, day: date) -> bool:
+        """
+        Confirmed, real gap this exists to close: the automatic daily
+        cycle used to export a day's raw data and wipe products/
+        immediately after one single processing attempt -- but that
+        attempt almost always happens before the day's official
+        orbit product is published (routinely a 1-2 day delay), so
+        it predictably failed, and the day was then permanently lost
+        with nothing ever retrying it.
+
+        A day is ready to export once either:
+          - it already has real GNSS-IR results (processing
+            genuinely succeeded), or
+          - it's older than the configured retry window, in which
+            case we give up waiting and export anyway, so local
+            storage doesn't grow unbounded waiting on a day whose
+            orbit may never publish (or some other permanent problem)
+
+        Until then, the day's raw data and products/ are left in
+        place specifically so the pipeline's own existing retry logic
+        (it already reprocesses anything still pending in
+        processing_queue on every run, provided the underlying raw
+        file can still be found) gets further chances to succeed on
+        a later cycle, once the orbit becomes available.
+        """
+
+        if self._has_real_results_for_day(day):
+            return True
+
+        age_days = (self._today() - day).days
+        return age_days >= self._export_retry_window_days
+
     def _export_day_to_external_storage(self, day: date) -> None:
         """
         Move the day's raw capture and the entire gnssrefl working
@@ -484,9 +587,16 @@ class StationManager:
         export).
 
         Disabled by default -- only runs if "external_storage_path"
-        is set in station.json. Runs regardless of whether the day's
-        pipeline processing succeeded or failed, since the raw
-        capture should be preserved somewhere either way.
+        is set in station.json.
+
+        Confirmed real gap this now guards against: previously ran
+        regardless of whether the day's pipeline processing actually
+        succeeded, which permanently lost any day whose orbit product
+        wasn't published yet by export time (routinely a 1-2 day
+        delay) -- see _day_is_ready_to_export() for the real fix.
+        A day without real results yet, but still within the retry
+        window, is simply left in place for a future cycle rather
+        than exported.
 
         Never raises. Local files are only removed after a
         confirmed-successful move (shutil.move()'s own behavior), so
@@ -500,6 +610,18 @@ class StationManager:
             return
 
         assert self.cfg is not None
+
+        if not self._day_is_ready_to_export(day):
+            self._logger.info(
+                "Delaying export for %s -- no real GNSS-IR results yet "
+                "(most likely the orbit product isn't published yet) "
+                "and still within the %d-day retry window; leaving "
+                "local data in place for a future retry instead of "
+                "losing the chance permanently",
+                day,
+                self._export_retry_window_days,
+            )
+            return
 
         try:
             if not self._external_storage_path.is_dir():

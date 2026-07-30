@@ -2,7 +2,7 @@
     "station_id": "USGS001",
     "station_name": "Marconi",
     "agency": "USGS",
-    "observer": "E Marsjanik",
+    "observer": "E Marsjanik / C Sherwood",
     "receiver_model": "Unicore UM980",
     "receiver_firmware": "",
     "receiver_port": "/dev/USB_GPS",
@@ -33,5 +33,7 @@
     "gnssrefl_orthometric_height": 18.665,
     "gnssrefl_max_arc_minutes": 40.0,
     "gnssrefl_elevation_span_tolerance": 1.0,
+    "gnssrefl_direct_signal_poly_order": 2,
+    "gnssrefl_azimuth_regions": [100, 130, 150, 215],    
     "external_storage_path": "/mnt/I2Rgus_Data/GPS_Data"
 }

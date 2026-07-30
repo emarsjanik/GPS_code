@@ -300,6 +300,18 @@ echo "otherwise-good arcs."
 elevation_span_tolerance=$(prompt_optional_numeric "Arc elevation-span tolerance (degrees)") || exit 1
 
 echo ""
+echo "--- Direct-signal removal polynomial order ---"
+echo "gnssrefl's own default if left blank: 4. A lower-order"
+echo "polynomial removes the antenna gain/power trend from raw SNR"
+echo "data before the real analysis begins. A narrow elevation mask"
+echo "(like the 5-15 degree setting above) gives each satellite pass"
+echo "less raw data to fit against, which can make the default order"
+echo "numerically unstable -- if you've seen a 'RankWarning: the fit"
+echo "may be poorly conditioned' message in your own pipeline output,"
+echo "lowering this (e.g. to 2) is the standard, documented fix."
+direct_signal_poly_order=$(prompt_optional_numeric "Direct-signal removal polynomial order") || exit 1
+
+echo ""
 echo "--- External storage (optional) ---"
 echo "If you want each day's raw data and processed results moved to"
 echo "external storage automatically after processing, enter the"
@@ -322,7 +334,7 @@ python3 - "$STATION_JSON" \
     "$gnssrefl_station_code" "$gnssrefl_monument_number" "$gnssrefl_country_code" \
     "$gnssrefl_orbit_source" "$gnssrefl_sample_rate" "$gnssrefl_all_frequencies" \
     "$elevation_min" "$elevation_max" "$rh_min" "$rh_max" "$azimuth_regions" \
-    "$peak2noise" "$amplitude_min" "$orthometric_height" "$refraction_model" "$max_arc_minutes" "$elevation_span_tolerance" \
+    "$peak2noise" "$amplitude_min" "$orthometric_height" "$refraction_model" "$max_arc_minutes" "$elevation_span_tolerance" "$direct_signal_poly_order" \
     "$external_storage_path" <<'PYEOF'
 import json
 import sys
@@ -337,7 +349,8 @@ import sys
     gnssrefl_orbit_source, gnssrefl_sample_rate, gnssrefl_all_frequencies,
     elevation_min, elevation_max, rh_min, rh_max, azimuth_regions,
     peak2noise, amplitude_min, orthometric_height, refraction_model,
-    max_arc_minutes, elevation_span_tolerance, external_storage_path,
+    max_arc_minutes, elevation_span_tolerance, direct_signal_poly_order,
+    external_storage_path,
 ) = sys.argv[1:]
 
 
@@ -407,6 +420,8 @@ if as_float(max_arc_minutes) is not None:
     data["gnssrefl_max_arc_minutes"] = as_float(max_arc_minutes)
 if as_float(elevation_span_tolerance) is not None:
     data["gnssrefl_elevation_span_tolerance"] = as_float(elevation_span_tolerance)
+if as_int(direct_signal_poly_order) is not None:
+    data["gnssrefl_direct_signal_poly_order"] = as_int(direct_signal_poly_order)
 if external_storage_path.strip():
     data["external_storage_path"] = external_storage_path
 

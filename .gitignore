@@ -13,17 +13,32 @@ raw/
 rinex/
 products/
 logs/
+archive/
 
 # Database
-database/*.db
+database/
 
-# Backup archives
+# Runtime logs anywhere in the tree (not just the top-level logs/)
+*.log
+
+# Archives -- not backed up
 *.tar.gz
+*.tar
 *.zip
+*.gz
+
+# Raw/reference data files -- not backed up (documentation and code only)
+*.rnx
+*.snr*
+*.um980
+*.csv
+*.xlsx
+*.png
+
+# Hardware/mechanical design files -- GNSS scripts and info only
+3d enclosure models/
 
 # OS files
 .DS_Store
 Thumbs.db
-# Additional generated data (added during cleanup)
-archive/
-database/
+*.backup

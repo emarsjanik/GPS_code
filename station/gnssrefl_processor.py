@@ -649,7 +649,7 @@ class GnssIrProcessor:
         Fine-tuning parameters (elevation mask, reflector height
         range, azimuth mask, QC thresholds, orthometric height
         reference, refraction model, maximum arc length, arc
-        elevation-span tolerance) are real
+        elevation-span tolerance, direct-signal polynomial order) are real
         make_gnssir_input() inputs that were never previously exposed
         here at all -- confirmed via gnssrefl's own documentation. Each is only
         passed through if explicitly set in station.json; left unset,
@@ -752,6 +752,22 @@ class GnssIrProcessor:
         elevation_span_tolerance = station_section.get("gnssrefl_elevation_span_tolerance")
         if elevation_span_tolerance is not None:
             kwargs["ediff"] = float(elevation_span_tolerance)
+
+        # Direct-signal-removal polynomial order (gnssrefl's own
+        # param: polyV) -- library default is 4. Confirmed directly
+        # relevant to us: our narrow elevation mask (5-15 degrees)
+        # gives each arc a much smaller window of raw SNR data to fit
+        # against than the wider 5-25 degree default, and our own
+        # real pipeline output has repeatedly shown numpy's
+        # "RankWarning: The fit may be poorly conditioned" for
+        # exactly this fit. Confirmed via general numerical-analysis
+        # references (not just gnssrefl's own docs) that fitting a
+        # lower-order polynomial is the standard, documented fix for
+        # this exact warning. Only passed through if explicitly
+        # configured, so gnssrefl's own default applies otherwise.
+        direct_signal_poly_order = station_section.get("gnssrefl_direct_signal_poly_order")
+        if direct_signal_poly_order is not None:
+            kwargs["polyV"] = int(direct_signal_poly_order)
 
         try:
             make_gnssir_input(**kwargs)

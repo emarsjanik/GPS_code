@@ -273,6 +273,7 @@ class TestInitialize(GnssIrProcessorTestCase):
         for key in (
             "e1", "e2", "h1", "h2", "azlist2",
             "peak2noise", "ampl", "Hortho", "refraction", "delTmax", "ediff",
+            "polyV",
         ):
             self.assertNotIn(key, call)
 
@@ -357,6 +358,20 @@ class TestInitialize(GnssIrProcessorTestCase):
 
         call = calls["make_gnssir_input"][0]
         self.assertNotIn("ediff", call)
+
+    def test_direct_signal_poly_order_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_direct_signal_poly_order"] = 2
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertEqual(call["polyV"], 2)
+
+    def test_direct_signal_poly_order_omitted_when_not_configured(self) -> None:
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertNotIn("polyV", call)
 
     def test_station_code_derived_from_station_id_when_not_configured(self) -> None:
         self.processor.initialize()
