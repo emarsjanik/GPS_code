@@ -30,8 +30,16 @@
 # process_gps_data.sh (or ~/process_gps_data.sh) to include the
 # newly recovered day(s).
 #
-# Usage: ./recover_missing_days.sh 204 205 206 207
-#        (one or more day-of-year numbers, space separated)
+# Usage:
+#   ./recover_missing_days.sh                  <- AUTO mode: finds
+#       every day with recoverable RINEX data in external storage
+#       that doesn't already have local results, and attempts to
+#       recover all of them. Safe to run repeatedly/unattended: days
+#       already processed are automatically skipped, and days whose
+#       orbit still isn't published simply get reported as
+#       unrecoverable this time, harmlessly, ready to retry later.
+#   ./recover_missing_days.sh 204 205 206 207  <- MANUAL mode: recover
+#       specific days only, unchanged from before.
 
 set -uo pipefail
 
@@ -40,11 +48,58 @@ STATION_CODE="usgs"           # 4-character code, used for GNSS-IR analysis
 STATION_CODE_LONG="usgs00usa" # 9-character code, used for RINEX-related steps
 YEAR="2026"                   # bump this once a year
 EXTERNAL_PRODUCTS_DIR="/mnt/I2Rgus_Data/GPS_Data/Products"
+LOCAL_RESULTS_DIR="$PROJECT_DIR/products/refl_code/$YEAR/results/$STATION_CODE"
 
+# ------------------------------------------------------------
+# Auto mode: find every day-of-year with a recoverable RINEX file
+# somewhere in external storage that doesn't already have a local
+# results file for it.
+# ------------------------------------------------------------
 if [ "$#" -eq 0 ]; then
-    echo "Usage: $0 <doy1> [doy2] [doy3] ..."
-    echo "Example: $0 204 205 206 207"
-    exit 1
+    echo "No specific days given -- auto-detecting missing, recoverable days..."
+
+    if [ ! -d "$EXTERNAL_PRODUCTS_DIR" ]; then
+        echo "External storage path not found at $EXTERNAL_PRODUCTS_DIR -- nothing to check."
+        exit 0
+    fi
+
+    # Confirmed real filename pattern (RINEX 3): matches
+    # USGS00USA_R_2026<DOY>0000_01D_01S_MO.rnx across every dated
+    # export folder, extracting just the 3-digit day-of-year from
+    # each match.
+    recoverable_doys=$(
+        find "$EXTERNAL_PRODUCTS_DIR" -iname "${STATION_CODE_LONG^^}_R_${YEAR}*_01D_01S_MO.rnx" 2>/dev/null \
+            | sed -E "s/.*${STATION_CODE_LONG^^}_R_${YEAR}([0-9]{3}).*/\1/" \
+            | sort -u
+    )
+
+    if [ -z "$recoverable_doys" ]; then
+        echo "No recoverable RINEX files found anywhere under $EXTERNAL_PRODUCTS_DIR."
+        exit 0
+    fi
+
+    days_to_recover=()
+    for doy_padded in $recoverable_doys; do
+        doy=$((10#$doy_padded))  # force base-10 so e.g. "008" isn't read as invalid octal
+        local_results_file="$LOCAL_RESULTS_DIR/${doy}.txt"
+        if [ ! -f "$local_results_file" ]; then
+            days_to_recover+=("$doy")
+        fi
+    done
+
+    if [ "${#days_to_recover[@]}" -eq 0 ]; then
+        echo "Every recoverable day already has local results -- nothing to do."
+        exit 0
+    fi
+
+    echo "Found ${#days_to_recover[@]} day(s) with recoverable data but no local results:"
+    echo "  ${days_to_recover[*]}"
+    echo ""
+
+    # Replace the positional arguments ($@) with the auto-detected
+    # day list, so everything below runs exactly as it would in
+    # manual mode -- no separate code path to maintain.
+    set -- "${days_to_recover[@]}"
 fi
 
 cd "$PROJECT_DIR" || { echo "Could not cd to $PROJECT_DIR -- aborting."; exit 1; }
