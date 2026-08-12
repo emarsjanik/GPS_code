@@ -23,7 +23,11 @@ It performs four independent tests:
    estimated constant vertical offset.
 
 3. Search for a systematic timing offset between GNSS-IR and the tide
-   model from -120 to +120 minutes.
+   model from -300 to +300 minutes (widened from an original +/-120
+   minute range -- that range could never have detected the specific
+   ~4-hour EDT/UTC offset hypothesis this test exists to check; if a
+   real offset that large were present, the true optimum would have
+   sat right at or beyond the old boundary, invisible to the search).
 
 4. Test whether GNSS-IR error increases with the amount of real tidal
    movement occurring during the same satellite arc.
@@ -122,9 +126,15 @@ MJD_EPOCH = datetime(1858, 11, 17)
 
 DEFAULT_REFERENCE_HEIGHT_M = 18.625
 
+# Widened from the original +/-120 minutes: that range could never
+# have detected the specific ~4-hour EDT/UTC offset hypothesis this
+# test exists to check in the first place. +/-300 minutes (+/-5
+# hours) gives real margin beyond a 4-hour offset in either direction,
+# so a result pinned at the new boundary would itself be a real,
+# actionable signal rather than an artifact of a too-narrow search.
 LAG_MINUTES = np.arange(
-    -120.0,
-    120.0 + 5.0,
+    -300.0,
+    300.0 + 5.0,
     5.0,
 )
 
@@ -813,19 +823,6 @@ def main():
 
         sys.exit(1)
 
-
-    if not tide_path.exists():
-
-        print(
-            f"ERROR: tide model file not found:"
-        )
-
-        print(
-            f"  {tide_path}"
-        )
-
-        sys.exit(1)
-
     print()
     print("=" * 72)
     print(
@@ -1428,6 +1425,19 @@ def main():
         f"RMS improvement     : "
         f"{zero_lag_row['rms_cm'] - best_lag['rms_cm']:.2f} cm"
     )
+
+    # Confirmed necessary: flag loudly if the search still landed at
+    # its own boundary, since that's a real sign the range may still
+    # be too narrow to have found the true optimum, not evidence the
+    # true lag is exactly at that value.
+    if abs(best_lag["lag_minutes"] - LAG_MINUTES[0]) < 1e-6 or abs(
+        best_lag["lag_minutes"] - LAG_MINUTES[-1]
+    ) < 1e-6:
+        print(
+            "  WARNING: best lag landed exactly at the search "
+            "boundary -- the true optimum may lie outside this "
+            "range. Consider widening LAG_MINUTES further."
+        )
 
     # ---------------------------------------------------------------
     # Within-arc tidal-smearing test
@@ -2069,6 +2079,10 @@ def main():
 
         f.write(
             "TIMING LAG SEARCH\n"
+        )
+
+        f.write(
+            f"search_range_minutes=[{LAG_MINUTES[0]:.0f}, {LAG_MINUTES[-1]:.0f}]\n"
         )
 
         f.write(

@@ -127,9 +127,11 @@ def main():
         # it's a genuine, QC-passing match -- real data showed 65-72% of
         # "matched" arcs actually had a NaN RH value inside an otherwise
         # non-None results dict. Requiring a real, finite RH is the
-        # correct, stricter filter. Confirmed separately (see chat):
-        # these are genuinely the same arcs our real pipeline's own
-        # peak2noise QC already rejects -- not a bug, not overly strict.
+        # correct, stricter filter. Confirmed twice now (see chat): once
+        # directly against gnssir's own peak2noise rejections, and again
+        # against a corrected regex parse of the raw production logs,
+        # which reproduced this exact same 99-arc set for days 204-207
+        # to an exact frequency-by-frequency match.
         matched = [
             (m, d) for m, d in arcs
             if m["gnssir_processing_results"] is not None
@@ -227,14 +229,38 @@ def main():
     tide_at_windows = np.array([tide_at(dt) for dt in window_dts])
     h_w_values = np.array([r["h_w"] for r in results])
 
-    # Fit scale+offset to compare shapes on a common footing (same
-    # approach used throughout tonight's other comparison scripts).
-    A = np.vstack([tide_at_windows, np.ones_like(tide_at_windows)]).T
-    a, b = np.linalg.lstsq(A, h_w_values, rcond=None)[0]
-    calibrated_tide = a * tide_at_windows + b
-    rms_vs_tide = float(np.sqrt(np.mean((h_w_values - calibrated_tide) ** 2)))
-    print(f"\nRMS of damping-aware corrected h_w vs. calibrated tide model shape: "
-          f"{rms_vs_tide:.4f} m")
+    # Confirmed necessary for a genuinely fair, apples-to-apples
+    # comparison against tonight's 99-arc production-success baseline
+    # (analyze_gnssir_tide_relationship.py, r=-0.069, RMS=58.36cm):
+    # that baseline deliberately used a UNIT-SLOPE fit (gnss = tide +
+    # offset, only the constant offset estimated), specifically to
+    # avoid a free scale factor concealing a real amplitude mismatch.
+    # Switched here from an earlier scale+offset fit to match that
+    # exact methodology -- a free scale factor could make this
+    # pipeline's own output look artificially better without genuinely
+    # confirming the underlying physical relationship, which would
+    # make any "improvement" over the baseline unearned.
+    offset = float(np.mean(h_w_values - tide_at_windows))
+    fitted = tide_at_windows + offset
+    residual = h_w_values - fitted
+    rms_vs_tide = float(np.sqrt(np.mean(residual ** 2)))
+    mae_vs_tide = float(np.mean(np.abs(residual)))
+
+    valid = np.isfinite(h_w_values) & np.isfinite(tide_at_windows)
+    if np.sum(valid) >= 3 and np.std(h_w_values[valid]) > 0 and np.std(tide_at_windows[valid]) > 0:
+        correlation = float(np.corrcoef(h_w_values[valid], tide_at_windows[valid])[0, 1])
+    else:
+        correlation = float("nan")
+
+    print(f"\n--- Unit-slope comparison vs. tide model (matches the 99-arc baseline methodology) ---")
+    print(f"  Constant offset : {offset:.4f} m")
+    print(f"  RMS residual    : {rms_vs_tide * 100:.2f} cm")
+    print(f"  MAE residual    : {mae_vs_tide * 100:.2f} cm")
+    print(f"  Correlation     : {correlation:.4f}")
+    print()
+    print(f"  Baseline for comparison (99-arc production success, same doy {doy1}-{doy2} range):")
+    print(f"    RMS residual  : 58.36 cm")
+    print(f"    Correlation   : -0.0691")
 
     # --- Plot ---
     # Confirmed necessary, same real bug as compare_to_tide_models.py's
@@ -261,8 +287,8 @@ def main():
         print(f"\nFound {len(insert_at)} real gap(s) between solved windows -- "
               "inserting breaks so the plot doesn't draw a misleading "
               "straight line across missing data.")
-        for offset, idx in enumerate(insert_at):
-            insert_pos = idx + offset
+        for offset_idx, idx in enumerate(insert_at):
+            insert_pos = idx + offset_idx
             mid_dt = window_dts_plot[insert_pos - 1] + (window_dts_plot[insert_pos] - window_dts_plot[insert_pos - 1]) / 2
             window_dts_plot.insert(insert_pos, mid_dt)
             h_w_plot = np.insert(h_w_plot, insert_pos, np.nan)
@@ -281,7 +307,9 @@ def main():
 
     fig.autofmt_xdate()
     ax1.set_title(f"{station} {year} doy {doy1}-{doy2}: damping-aware corrected water level "
-                  f"vs. real tide models\n(RMS = {rms_vs_tide:.4f} m)")
+                  f"vs. real tide models (unit-slope fit)\n"
+                  f"(RMS = {rms_vs_tide*100:.2f} cm, r = {correlation:.4f}; "
+                  f"baseline: RMS = 58.36 cm, r = -0.0691)")
     fig.tight_layout()
     output_path = Path("damping_correction_result.png")
     fig.savefig(output_path, dpi=150)
@@ -290,3 +318,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

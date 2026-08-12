@@ -3,7 +3,7 @@ USGS GNSS-IR / TIDE MODEL ANALYSIS
 Station: usgs
 Year: 2026
 DOY: 204-207
-Reference height: 18.665000 m
+Reference height: 18.625000 m
 Total extracted: 811
 QC passing: 811
 Final paired arcs: 99
@@ -23,7 +23,7 @@ meta['gnssir_processing_results'] is not None
 ZERO-LAG PHYSICAL COMPARISON
 GNSS water level = H_reference - RH
 Comparison = tide + constant offset
-offset_m=17.105647512
+offset_m=17.065647512
 RMS_cm=58.359110
 MAE_cm=47.770167
 mean_bias_cm=0.000000
@@ -36,6 +36,7 @@ mean_sec=1.304194
 max_sec=44.995200
 
 TIMING LAG SEARCH
+search_range_minutes=[-300, 300]
 best_lag_minutes=-35.000000
 best_rms_cm=57.239233
 zero_lag_rms_cm=58.359110
