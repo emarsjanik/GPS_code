@@ -34,11 +34,6 @@
     "gnssrefl_max_arc_minutes": 40.0,
     "gnssrefl_elevation_span_tolerance": 1.0,
     "gnssrefl_direct_signal_poly_order": 2,
-    "gnssrefl_azimuth_regions": [
-        353,
-        360,
-        0,
-        173
-    ],
+    "gnssrefl_azimuth_regions": [35, 135],    
     "external_storage_path": "/mnt/I2Rgus_Data/GPS_Data"
 }

@@ -4,14 +4,14 @@ Station: usgs
 Year: 2026
 DOY: 204-207
 Reference height: 18.625000 m
-Total extracted: 811
-QC passing: 811
-Final paired arcs: 99
+Total extracted: 1356
+QC passing: 1352
+Final paired arcs: 82
 
 ARC SETTINGS
 e1=5.0
 e2=15.0
-azlist=[100,130,150,215]
+azlist=[353,360,0,173]
 polyV=2
 pele=[5,30]
 attach_results=True
@@ -23,59 +23,59 @@ meta['gnssir_processing_results'] is not None
 ZERO-LAG PHYSICAL COMPARISON
 GNSS water level = H_reference - RH
 Comparison = tide + constant offset
-offset_m=17.065647512
-RMS_cm=58.359110
-MAE_cm=47.770167
-mean_bias_cm=0.000000
-correlation=-0.069077990
+offset_m=17.172871067
+RMS_cm=72.382598
+MAE_cm=57.026485
+mean_bias_cm=-0.000000
+correlation=-0.163056855
 
 SOLUTION EPOCH RELATIVE TO ARC MIDPOINT
 min_sec=-20.004800
-median_sec=-4.020800
-mean_sec=1.304194
-max_sec=44.995200
+median_sec=4.258000
+mean_sec=2.000702
+max_sec=23.463200
 
 TIMING LAG SEARCH
 search_range_minutes=[-300, 300]
-best_lag_minutes=-35.000000
-best_rms_cm=57.239233
-zero_lag_rms_cm=58.359110
-rms_improvement_cm=1.119877
+best_lag_minutes=-300.000000
+best_rms_cm=71.301819
+zero_lag_rms_cm=72.382598
+rms_improvement_cm=1.080779
 
 WITHIN-ARC TIDAL CHANGE
 minimum_cm=0.600778
-mean_cm=13.282610
-median_cm=14.119152
+mean_cm=13.640021
+median_cm=13.078234
 maximum_cm=25.511918
-percent_over_2cm=94.949495
-percent_over_5cm=86.868687
-percent_over_10cm=73.737374
+percent_over_2cm=95.121951
+percent_over_5cm=87.804878
+percent_over_10cm=73.170732
 
 WITHIN-ARC TIDAL-SMEARING TEST
-pearson_error_vs_abs_tide_change=-0.381545232
-spearman_error_vs_abs_tide_change=-0.420637301
-pearson_error_vs_duration=0.051931074
-spearman_error_vs_duration=-0.014386442
-pearson_error_vs_abs_tide_rate=-0.434308618
+pearson_error_vs_abs_tide_change=-0.281546448
+spearman_error_vs_abs_tide_change=-0.317990858
+pearson_error_vs_duration=0.153034789
+spearman_error_vs_duration=0.093750000
+pearson_error_vs_abs_tide_rate=-0.376495103
 
 TIDAL MOVEMENT BINS
-0-2 cm: n=5, mean_abs_error_cm=57.710442, median_abs_error_cm=53.023952, rms_cm=61.842097
-2-5 cm: n=8, mean_abs_error_cm=70.625349, median_abs_error_cm=64.703449, rms_cm=75.427184
-5-10 cm: n=13, mean_abs_error_cm=71.312573, median_abs_error_cm=58.193505, rms_cm=80.882844
-10-20 cm: n=59, mean_abs_error_cm=44.063653, median_abs_error_cm=41.154940, rms_cm=53.949142
->20 cm: n=14, mean_abs_error_cm=24.919472, median_abs_error_cm=19.781881, rms_cm=33.562259
+0-2 cm: n=4, mean_abs_error_cm=88.028309, median_abs_error_cm=83.311593, rms_cm=104.689539
+2-5 cm: n=6, mean_abs_error_cm=67.763051, median_abs_error_cm=65.902689, rms_cm=71.513700
+5-10 cm: n=12, mean_abs_error_cm=73.475755, median_abs_error_cm=56.849289, rms_cm=84.826242
+10-20 cm: n=42, mean_abs_error_cm=57.299780, median_abs_error_cm=50.830840, rms_cm=73.457136
+>20 cm: n=18, mean_abs_error_cm=34.954465, median_abs_error_cm=30.398754, rms_cm=48.371846
 
 RISING/FALLING
-RISING: n=58, signed_mean_cm=-8.006197, mean_abs_error_cm=48.668019
-FALLING: n=41, signed_mean_cm=11.325840, mean_abs_error_cm=46.500036
+RISING: n=45, signed_mean_cm=-7.334790, mean_abs_error_cm=58.347419
+FALLING: n=37, signed_mean_cm=8.920691, mean_abs_error_cm=55.419943
 
 FREQUENCY SUMMARY
-freq=1: n=38, mean_abs_error_cm=53.399011, rms_cm=64.246448, error_tide_change_r=-0.379783
-freq=5: n=4, mean_abs_error_cm=35.181746, rms_cm=43.912696, error_tide_change_r=-0.290056
-freq=20: n=1, mean_abs_error_cm=34.105148, rms_cm=34.105148, error_tide_change_r=nan
-freq=101: n=20, mean_abs_error_cm=49.020563, rms_cm=62.005855, error_tide_change_r=-0.251256
-freq=102: n=2, mean_abs_error_cm=55.763175, rms_cm=64.278526, error_tide_change_r=nan
-freq=201: n=13, mean_abs_error_cm=38.587749, rms_cm=44.907638, error_tide_change_r=-0.609349
-freq=205: n=3, mean_abs_error_cm=64.070467, rms_cm=72.076398, error_tide_change_r=-0.531187
-freq=207: n=5, mean_abs_error_cm=50.363880, rms_cm=60.672559, error_tide_change_r=-0.868169
-freq=302: n=13, mean_abs_error_cm=37.510989, rms_cm=44.791356, error_tide_change_r=-0.645960
+freq=1: n=17, mean_abs_error_cm=64.968910, rms_cm=77.444936, error_tide_change_r=-0.497907
+freq=5: n=4, mean_abs_error_cm=79.356818, rms_cm=116.845317, error_tide_change_r=-0.184476
+freq=20: n=3, mean_abs_error_cm=23.559129, rms_cm=27.950564, error_tide_change_r=0.099369
+freq=101: n=23, mean_abs_error_cm=50.973443, rms_cm=65.056849, error_tide_change_r=-0.369431
+freq=102: n=2, mean_abs_error_cm=124.170670, rms_cm=132.824077, error_tide_change_r=nan
+freq=201: n=12, mean_abs_error_cm=58.750663, rms_cm=73.823639, error_tide_change_r=-0.538943
+freq=205: n=6, mean_abs_error_cm=54.927880, rms_cm=65.172162, error_tide_change_r=-0.352104
+freq=207: n=5, mean_abs_error_cm=52.425709, rms_cm=58.948742, error_tide_change_r=-0.885718
+freq=302: n=10, mean_abs_error_cm=46.616130, rms_cm=54.601821, error_tide_change_r=-0.199798

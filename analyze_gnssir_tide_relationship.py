@@ -72,7 +72,7 @@ Production arc settings
 -----------------------
     e1=5.0
     e2=15.0
-    azlist=[100.0, 130.0, 150.0, 215.0]
+    azlist=[353.0, 360.0, 0.0, 173.0]
     polyV=2
     pele=[5, 30]
     attach_results=True
@@ -581,10 +581,10 @@ def extract_all_arcs(
             e1=5.0,
             e2=15.0,
             azlist=[
-                100.0,
-                130.0,
-                150.0,
-                215.0,
+                353.0,
+                360.0,
+                0.0,
+                173.0,
             ],
             polyV=2,
             pele=[
@@ -862,7 +862,7 @@ def main():
     )
 
     print(
-        "  azlist=[100,130,150,215]"
+        "  azlist=[353,360,0,173]"
     )
 
     print(
@@ -1981,7 +1981,7 @@ def main():
         )
 
         f.write(
-            "azlist=[100,130,150,215]\n"
+            "azlist=[353,360,0,173]\n"
         )
 
         f.write(
@@ -2257,15 +2257,16 @@ def main():
         alpha=0.45,
     )
 
-    lo = min(
-        np.min(tide_solution),
-        np.min(gnss_water),
-    )
-
-    hi = max(
-        np.max(tide_solution),
-        np.max(gnss_water),
-    )
+    # Confirmed real bug this fixes: using min/max across BOTH
+    # tide_solution and gnss_water together (rather than just the
+    # x-axis tide_solution range) drags the line span out to
+    # whichever variable happens to have the larger values -- since
+    # gnss_water sits around 16-18m while tide_solution sits around
+    # +/-1m, the line was being drawn far beyond any real tide value,
+    # making the fit impossible to actually judge against the real
+    # data cloud.
+    lo = np.min(tide_solution)
+    hi = np.max(tide_solution)
 
     line = np.linspace(
         lo,
