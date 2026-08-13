@@ -1,0 +1,26 @@
+MARCONI TOP-10 INTEGRATED GNSS-R / FRESNEL / TOPOBATHY TEST
+====================================================================================================
+Top N: 10
+Minimum repeated-track N: 3
+Geometry elevations: [5.0, 9.0, 13.0]
+DATUM_SHIFT_M: +0.00 m
+
+CLASSIFICATION
+A = strong ocean candidate: N>=4, |r|>=0.99,
+    slope 0.85-1.15, unit RMS<=10 cm, wet13>=70%
+B = probable ocean / mixed shoreline
+C = tide-responsive but geometry not confirmed
+D = weak or non-tidal
+
+FINAL RANKING
+----------------------------------------------------------------------------------------------------
+ 1. SAT= 26 N= 4 Az=90.93 r=+0.9966 slope=+0.9400 RMS=4.18cm wet13=0.750 class=A_STRONG_OCEAN_CANDIDATE score=0.861
+ 2. SAT=  1 N= 4 Az=56.33 r=+0.9817 slope=+0.7963 RMS=10.63cm wet13=0.793 class=B_PROBABLE_OCEAN_OR_MIXED_SHORELINE score=0.826
+ 3. SAT= 21 N= 4 Az=92.93 r=+0.9973 slope=+1.2293 RMS=7.31cm wet13=0.717 class=B_PROBABLE_OCEAN_OR_MIXED_SHORELINE score=0.811
+ 4. SAT= 24 N= 4 Az=57.28 r=+0.9591 slope=+0.6829 RMS=13.84cm wet13=0.797 class=C_TIDE_RESPONSIVE_GEOMETRY_UNCONFIRMED score=0.781
+ 5. SAT= 16 N= 4 Az=96.40 r=+0.9952 slope=+1.4264 RMS=11.48cm wet13=0.602 class=C_TIDE_RESPONSIVE_GEOMETRY_UNCONFIRMED score=0.765
+ 6. SAT=  2 N= 4 Az=52.82 r=+0.9633 slope=+0.6438 RMS=15.31cm wet13=0.664 class=C_TIDE_RESPONSIVE_GEOMETRY_UNCONFIRMED score=0.754
+ 7. SAT= 12 N= 3 Az=37.54 r=+0.9929 slope=+0.9896 RMS=4.45cm wet13=0.274 class=C_TIDE_RESPONSIVE_GEOMETRY_UNCONFIRMED score=0.690
+ 8. SAT= 28 N= 4 Az=114.33 r=+0.9733 slope=+0.7675 RMS=12.40cm wet13=0.410 class=C_TIDE_RESPONSIVE_GEOMETRY_UNCONFIRMED score=0.638
+ 9. SAT=  6 N= 3 Az=114.61 r=+0.9186 slope=+0.5661 RMS=12.52cm wet13=0.339 class=C_TIDE_RESPONSIVE_GEOMETRY_UNCONFIRMED score=0.598
+10. SAT=  3 N= 3 Az=37.12 r=+0.9763 slope=+0.8086 RMS=6.95cm wet13=0.109 class=C_TIDE_RESPONSIVE_GEOMETRY_UNCONFIRMED score=0.595
