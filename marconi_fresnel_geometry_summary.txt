@@ -1,0 +1,47 @@
+================================================================================
+MARCONI FRESNEL / WATER-SIDE GEOMETRY CLASSIFICATION
+================================================================================
+
+Input records: 82
+Water bearing: 83.060 deg
+Reference shoreline distance: 71.780 m
+NOTE: this is a reference shoreline plane, not a digitized shoreline polygon.
+
+OVERALL CLASSIFICATION
+  OPEN_WATER_CANDIDATE: 0
+  MIXED_LAND_WATER: 0
+  LAND_LIKELY: 57
+  INVALID: 25
+
+BY FREQUENCY
+  freq=1: 17
+  freq=5: 4
+  freq=20: 3
+  freq=101: 23
+  freq=102: 2
+  freq=201: 12
+  freq=205: 6
+  freq=207: 5
+  freq=302: 10
+
+REPEATED SAT/FREQ TRACKS
+  sat=1 freq=1 n=4
+  sat=9 freq=1 n=2
+  sat=14 freq=1 n=3
+  sat=23 freq=1 n=2
+  sat=25 freq=5 n=2
+  sat=29 freq=1 n=4
+  sat=102 freq=101 n=2
+  sat=103 freq=101 n=3
+  sat=109 freq=101 n=2
+  sat=115 freq=101 n=3
+  sat=116 freq=101 n=2
+  sat=121 freq=101 n=2
+  sat=218 freq=207 n=2
+  sat=236 freq=201 n=2
+
+INTERPRETATION
+OPEN_WATER_CANDIDATE means at least one sampled elevation (5, 10, or 15 deg) has >=80% of the Fresnel-zone polygon on the water side of the reference shoreline plane.
+MIXED_LAND_WATER means the footprint intersects both sides at one or more sampled elevations.
+LAND_LIKELY means all sampled elevations have <=20% of the footprint on the water side.
+These classifications are diagnostic only. A real shoreline polygon should replace the reference plane before production masking is changed.

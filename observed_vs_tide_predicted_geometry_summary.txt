@@ -1,0 +1,30 @@
+OBSERVED-RH VS TIDE-PREDICTED-OCEAN GEOMETRY
+==========================================================================================
+
+EOT20_heightm
+mean discrepancy: -17.214321 m
+median discrepancy: -17.270718 m
+RMS discrepancy: 17.229061 m
+predicted 10 deg zone >=80% water: 28/82
+predicted 10 deg zone <=20% water: 43/82
+
+GOT5.5_heightm
+mean discrepancy: -17.213735 m
+median discrepancy: -17.288073 m
+RMS discrepancy: 17.229496 m
+predicted 10 deg zone >=80% water: 28/82
+predicted 10 deg zone <=20% water: 43/82
+
+GOT5.6_heightm
+mean discrepancy: -17.211429 m
+median discrepancy: -17.263898 m
+RMS discrepancy: 17.226544 m
+predicted 10 deg zone >=80% water: 28/82
+predicted 10 deg zone <=20% water: 43/82
+
+FES2022_heightm
+mean discrepancy: -17.212000 m
+median discrepancy: -17.266860 m
+RMS discrepancy: 17.227312 m
+predicted 10 deg zone >=80% water: 28/82
+predicted 10 deg zone <=20% water: 43/82
