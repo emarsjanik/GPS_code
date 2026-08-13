@@ -1,0 +1,18 @@
+MARCONI CANDIDATE FRESNEL / SHORELINE VALIDATION
+==========================================================================================
+
+IMPORTANT: water fraction is computed against the
+repository-confirmed 83.06° / 71.78 m shoreline
+half-plane, not a digitized shoreline polygon.
+
+TRACK SUMMARY
+------------------------------------------------------------------------------------------
+PRN26_AZ91 EL=5° N=4 water_fraction_mean=1.000 min=1.000 max=1.000 center_signed_mean=+158.45 m
+PRN26_AZ91 EL=9° N=4 water_fraction_mean=1.000 min=1.000 max=1.000 center_signed_mean=+51.96 m
+PRN26_AZ91 EL=13° N=4 water_fraction_mean=0.880 min=0.820 max=0.936 center_signed_mean=+12.18 m
+PRN21_AZ93 EL=5° N=4 water_fraction_mean=1.000 min=1.000 max=1.000 center_signed_mean=+158.60 m
+PRN21_AZ93 EL=9° N=4 water_fraction_mean=1.000 min=1.000 max=1.000 center_signed_mean=+52.07 m
+PRN21_AZ93 EL=13° N=4 water_fraction_mean=0.883 min=0.828 max=0.932 center_signed_mean=+12.26 m
+PRN16_AZ96 EL=5° N=4 water_fraction_mean=1.000 min=1.000 max=1.000 center_signed_mean=+158.79 m
+PRN16_AZ96 EL=9° N=4 water_fraction_mean=1.000 min=1.000 max=1.000 center_signed_mean=+52.21 m
+PRN16_AZ96 EL=13° N=4 water_fraction_mean=0.888 min=0.825 max=0.931 center_signed_mean=+12.37 m
