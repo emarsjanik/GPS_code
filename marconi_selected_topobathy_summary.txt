@@ -1,0 +1,37 @@
+MARCONI TRUE TOPOBATHY / FRESNEL VALIDATION
+================================================================================================
+
+Topobathy: 2021022FA_Marconi_topobathy_1m.tif
+CRS: EPSG:6348
+Station latitude: 41.8928243333
+Station longitude: -69.9633227139
+H_ortho: 18.665 m
+MSL NAVD88 hypothesis: -0.242 m
+Primary tide model: EOT20_heightm
+
+The tide-predicted water surface is:
+    water_surface_NAVD88 = EOT20 + MSL_NAVD88
+
+The equivalent tide-predicted reflector height is:
+    RH_predicted = H_ortho - water_surface_NAVD88
+
+SELECTED TRACK GEOMETRY
+------------------------------------------------------------------------------------------------
+PRN 29 RISING  Az= 113.01 N=23 r=+0.9765 RMS=16.5 cm bias=-3.2 cm obs9wet=0.972 pred5wet=nan pred9wet=0.976 pred13wet=0.319 class=WATER_DOMINANT
+PRN 13 SETTING Az=  38.84 N=12 r=+0.9719 RMS=19.5 cm bias=+4.0 cm obs9wet=0.907 pred5wet=1.000 pred9wet=0.915 pred13wet=0.109 class=WATER_DOMINANT
+PRN  4 RISING  Az=  96.33 N=17 r=+0.9459 RMS=19.7 cm bias=+0.2 cm obs9wet=1.000 pred5wet=1.000 pred9wet=1.000 pred13wet=0.677 class=WATER_DOMINANT
+PRN  9 RISING  Az= 124.46 N=17 r=+0.9759 RMS=13.7 cm bias=+2.1 cm obs9wet=nan pred5wet=nan pred9wet=nan pred13wet=0.000 class=OUTSIDE_RASTER
+
+INTERPRETATION
+------------------------------------------------------------------------------------------------
+This is a physical footprint validation, not a statistical
+tide-validation score.
+
+A track is not called confirmed ocean solely because the
+GNSS-R time series follows EOT20. The independent topobathy
+footprint must also be water-dominated.
+
+The current +0.242 m datum hypothesis is used only to derive
+the tide-predicted NAVD88 water surface for geometry.
+
+The raster is EPSG:6348 and is sampled at its 1-m cell centers.

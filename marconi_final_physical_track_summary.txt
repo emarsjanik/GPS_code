@@ -1,0 +1,40 @@
+MARCONI FINAL PHYSICAL GNSS-R TRACK SCREEN
+================================================================================================
+
+Topobathy: 2021022FA_Marconi_topobathy_1m.tif
+Primary tide: EOT20_heightm
+H_ortho: 18.665 m
+Datum transformation: +0.242 m
+
+STATISTICAL SCREEN:
+  N >= 10
+  |median bias| <= 0.050 m
+  RMS <= 0.200 m
+  r >= 0.93
+
+PHYSICAL SCREEN:
+  adequate raster coverage >= 0.90
+  9° water-dominant >= 0.80
+  A-class 13° water >= 0.50
+
+Statistically selected tracks: 4
+Physically accepted A/B tracks: 2
+Final observations: 29
+Daily product days: 20
+
+TRACK CLASSIFICATION
+------------------------------------------------------------------------------------------------
+PRN 29 RISING  Az= 113.01 N=23 r=+0.9765 RMS=16.5 cm bias=-3.2 cm C5=0.000 C9=0.450 C13=1.000 W5=nan W9=1.000 W13=0.350 C_INSUFFICIENT_RASTER_COVERAGE
+PRN 13 SETTING Az=  38.84 N=12 r=+0.9719 RMS=19.5 cm bias=+4.0 cm C5=1.000 C9=1.000 C13=0.998 W5=1.000 W9=0.933 W13=0.058 B_WATER_DOMINANT_LOW_ANGLE
+PRN  4 RISING  Az=  96.33 N=17 r=+0.9459 RMS=19.7 cm bias=+0.2 cm C5=0.668 C9=1.000 C13=1.000 W5=1.000 W9=1.000 W13=0.702 B_WATER_DOMINANT_LOW_ANGLE
+PRN  9 RISING  Az= 124.46 N=17 r=+0.9759 RMS=13.7 cm bias=+2.1 cm C5=0.000 C9=0.000 C13=0.456 W5=nan W9=nan W13=0.000 C_INSUFFICIENT_RASTER_COVERAGE
+
+FINAL WATER-LEVEL PRODUCT STATUS
+------------------------------------------------------------------------------------------------
+Only A/B tracks are included in the final combined product.
+C tracks require a larger topobathy raster.
+D/E tracks are not physically accepted under the current rules.
+
+FINAL TRACKS:
+  PRN 13 S Az=38.8° class=B_WATER_DOMINANT_LOW_ANGLE
+  PRN 4 R Az=96.3° class=B_WATER_DOMINANT_LOW_ANGLE
