@@ -1,0 +1,56 @@
+MARCONI DATUM TEST -- CLEAN VERSION
+============================================================================================
+EOT20 model: EOT20_heightm
+H_ortho: 18.665 m
+Independent shift: +0.242 m
+
+POPULATION
+--------------------------------------------------------------------------------------------
+Raw mean: -0.2045 m
+Raw median: -0.2224 m
+Raw RMS: 0.4048 m
+Raw MAE: 0.3018 m
+Corrected mean: +0.0375 m
+Corrected median: +0.0196 m
+Corrected RMS: 0.3514 m
+Corrected MAE: 0.2375 m
+Correlation: +0.8686
+Slope: +0.8865
+
+TRACKS
+--------------------------------------------------------------------------------------------
+PRN  2 SETTING Az=52.89 N=17 raw_med=-0.3942 corr_med=-0.1522 raw_RMS=0.3756 corr_RMS=0.2788
+PRN 20 SETTING Az=69.88 N=20 raw_med=-0.3618 corr_med=-0.1198 raw_RMS=0.4051 corr_RMS=0.2602
+PRN  8 SETTING Az=83.44 N=17 raw_med=-0.3431 corr_med=-0.1011 raw_RMS=0.3989 corr_RMS=0.2618
+PRN 30 RISING  Az=102.97 N=18 raw_med=-0.3247 corr_med=-0.0827 raw_RMS=0.3468 corr_RMS=0.2130
+PRN 15 SETTING Az=93.26 N=22 raw_med=-0.3173 corr_med=-0.0753 raw_RMS=0.4203 corr_RMS=0.3203
+PRN  5 SETTING Az=117.33 N=17 raw_med=-0.3170 corr_med=-0.0750 raw_RMS=0.3703 corr_RMS=0.2422
+PRN 27 SETTING Az=63.43 N=15 raw_med=-0.3095 corr_med=-0.0675 raw_RMS=0.3636 corr_RMS=0.2265
+PRN 24 SETTING Az=57.25 N=23 raw_med=-0.2957 corr_med=-0.0537 raw_RMS=0.3475 corr_RMS=0.2570
+PRN  6 SETTING Az=114.73 N=18 raw_med=-0.2855 corr_med=-0.0435 raw_RMS=0.3997 corr_RMS=0.2607
+PRN 12 RISING  Az=133.25 N=4 raw_med=-0.2743 corr_med=-0.0323 raw_RMS=0.2777 corr_RMS=0.0643
+PRN 29 RISING  Az=113.01 N=23 raw_med=-0.2738 corr_med=-0.0318 raw_RMS=0.3095 corr_RMS=0.1650
+PRN  1 SETTING Az=56.24 N=17 raw_med=-0.2689 corr_med=-0.0269 raw_RMS=0.3725 corr_RMS=0.2897
+PRN 16 SETTING Az=96.48 N=15 raw_med=-0.2555 corr_med=-0.0135 raw_RMS=0.3938 corr_RMS=0.2722
+PRN 21 SETTING Az=92.84 N=19 raw_med=-0.2436 corr_med=-0.0016 raw_RMS=0.4142 corr_RMS=0.2689
+PRN  4 RISING  Az=96.33 N=17 raw_med=-0.2404 corr_med=+0.0016 raw_RMS=0.3151 corr_RMS=0.1967
+PRN  9 RISING  Az=124.46 N=17 raw_med=-0.2215 corr_med=+0.0205 raw_RMS=0.2622 corr_RMS=0.1369
+PRN 31 SETTING Az=127.05 N=8 raw_med=-0.2165 corr_med=+0.0255 raw_RMS=0.3551 corr_RMS=0.2129
+PRN 13 SETTING Az=38.84 N=12 raw_med=-0.2023 corr_med=+0.0397 raw_RMS=0.2539 corr_RMS=0.1947
+PRN 30 SETTING Az=33.75 N=17 raw_med=-0.1947 corr_med=+0.0473 raw_RMS=0.3815 corr_RMS=0.2546
+PRN  9 SETTING Az=35.02 N=17 raw_med=-0.1798 corr_med=+0.0622 raw_RMS=0.2642 corr_RMS=0.1586
+PRN  3 SETTING Az=37.18 N=16 raw_med=-0.1725 corr_med=+0.0695 raw_RMS=0.2663 corr_RMS=0.2264
+PRN  4 SETTING Az=30.52 N=15 raw_med=-0.1610 corr_med=+0.0810 raw_RMS=0.2818 corr_RMS=0.1865
+PRN 26 SETTING Az=90.71 N=14 raw_med=-0.1517 corr_med=+0.0903 raw_RMS=0.3629 corr_RMS=0.2624
+PRN 29 SETTING Az=33.33 N=13 raw_med=-0.1405 corr_med=+0.1015 raw_RMS=0.2662 corr_RMS=0.2056
+PRN 25 SETTING Az=47.61 N=16 raw_med=-0.1268 corr_med=+0.1152 raw_RMS=0.2801 corr_RMS=0.1876
+PRN 12 SETTING Az=37.54 N=21 raw_med=-0.1212 corr_med=+0.1208 raw_RMS=0.2626 corr_RMS=0.2174
+PRN 28 SETTING Az=114.24 N=15 raw_med=-0.1144 corr_med=+0.1276 raw_RMS=0.3113 corr_RMS=0.2259
+PRN 19 SETTING Az=148.97 N=12 raw_med=+1.3494 corr_med=+1.5914 raw_RMS=1.3662 corr_RMS=1.5862
+
+INTERPRETATION
+--------------------------------------------------------------------------------------------
+The +0.242 m value is an external hypothesis test.
+It is not fitted to these GNSS-R observations.
+A constant vertical shift changes the offset metrics but not
+correlation or regression slope.
