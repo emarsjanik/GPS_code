@@ -68,6 +68,25 @@ Confirmed against gnssrefl's own documentation (gnssrefl.readthedocs.io)
           properly. Worked around by removing any same-named file
           from the current working directory immediately before
           staging (_stage_rinex_file()).
+        - gnssir's own noise-floor estimation reads a config field
+          called NReg -- the region of the reflector-height spectrum
+          used to estimate background noise -- as a SEPARATE value
+          from h1/h2 (the actual RH search region), not
+          automatically derived from them. If NReg does not cover
+          the same range as h1/h2, every arc's noise-floor sample
+          comes back empty, the resulting Noise value silently
+          defaults to 0.0, and every single arc fails quality control
+          with no indication why beyond a RuntimeWarning ("divide by
+          zero encountered in scalar divide"). Confirmed directly by
+          tracing gnssrefl's own source (retrieve_rh.py) after a real
+          run silently produced zero saved arcs despite dozens of
+          arcs passing every earlier quality-control check.
+          quickLook (a separate gnssrefl code path) does not have
+          this problem: it sets NReg = [minH, maxH] automatically on
+          every run, which is why quickLook and gnssir can disagree
+          on the exact same underlying data even with identical h1/h2
+          settings. Worked around below by setting NReg explicitly
+          whenever h1/h2 are both explicitly configured.
 
 What this does, and what it deliberately does NOT do
 --------------------------------------------------------
@@ -696,6 +715,41 @@ class GnssIrProcessor:
             kwargs["h1"] = float(h1)
         if h2 is not None:
             kwargs["h2"] = float(h2)
+
+        # Confirmed, real bug this fixes: gnssrefl's gnssir/rinex2snr
+        # pipeline reads NReg (the reflector-height region used to
+        # estimate the noise floor) as a SEPARATE config field from
+        # h1/h2 (the actual RH search region) -- NOT automatically
+        # derived from them. If NReg does not cover the same range as
+        # h1/h2, every arc's noise-floor sample comes back empty, the
+        # resulting Noise value silently defaults to 0.0, and every
+        # single arc fails quality control -- confirmed directly by
+        # tracing gnssrefl's own source (retrieve_rh.py) after a real
+        # pipeline run silently produced zero saved arcs despite
+        # dozens of arcs passing every earlier quality-control check,
+        # accompanied by a real, reproducible "RuntimeWarning: divide
+        # by zero encountered in scalar divide" at the exact line
+        # that computes maxAmp/Noise. quickLook (gnssrefl's other,
+        # separate exploratory tool) does not have this problem: it
+        # sets NReg = [minH, maxH] automatically on every single run,
+        # which is exactly why quickLook and gnssir can silently
+        # disagree on identical underlying data even with identical
+        # h1/h2 settings -- quickLook's noise region always tracks
+        # whatever range you ask it to search, gnssir's does not.
+        #
+        # Only set here when BOTH h1 and h2 are explicitly configured
+        # above, matching this method's existing philosophy
+        # throughout: gnssrefl's own internal default applies
+        # whenever a value isn't explicitly configured, rather than
+        # this code silently overriding it. If only one of h1/h2 is
+        # set, NReg is deliberately left unset too, so gnssrefl's own
+        # default RH search behavior (which is presumably already
+        # internally self-consistent with its own default NReg)
+        # applies to the whole reflector-height configuration
+        # together, instead of mixing one explicit bound with an
+        # unrelated default NReg that may not match it.
+        if "h1" in kwargs and "h2" in kwargs:
+            kwargs["NReg"] = [kwargs["h1"], kwargs["h2"]]
 
         # Azimuth mask (gnssrefl's own param: azlist2 -- a list of
         # region boundaries, e.g. [0, 360] or [0, 150, 180, 360])

@@ -42,3 +42,9 @@ database/
 .DS_Store
 Thumbs.db
 *.backup
+
+# Stray gnssrefl working-directory output at the project root --
+# always a sign REFL_CODE wasn't set before running gnssrefl tools
+# (its real output belongs under products/refl_code/<year>/, never
+# here). Anchored to the repo root only, matches any 4-digit year.
+/[0-9][0-9][0-9][0-9]/
