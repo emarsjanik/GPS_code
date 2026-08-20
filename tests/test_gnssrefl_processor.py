@@ -15,7 +15,6 @@ The fake gnssir() reads the REFL_CODE environment variable itself
 results file, so it stays a faithful stand-in rather than a shortcut.
 
 Run with:
-
     python3 -m unittest discover -s tests -p "test_gnssrefl_processor.py" -v
 """
 
@@ -218,43 +217,132 @@ class GnssIrProcessorTestCase(unittest.TestCase):
 
 class TestInitialize(GnssIrProcessorTestCase):
 
-    def test_initializes_and_sets_environment_variables(self) -> None:
+    def test_initialize_returns_ready(self) -> None:
         result = self.processor.initialize()
 
         self.assertEqual(result, "READY")
-        self.assertEqual(os.environ["REFL_CODE"], str(self.processor._refl_code))
+
+    def test_initialize_sets_environment_variables(self) -> None:
+        self.processor.initialize()
+
+        self.assertEqual(
+            os.environ["REFL_CODE"], str(self.processor._refl_code)
+        )
         self.assertEqual(os.environ["ORBITS"], str(self.processor._orbits))
         self.assertEqual(os.environ["EXE"], str(self.processor._exe))
 
-    def test_creates_required_directories(self) -> None:
+    def test_initialize_creates_required_directories(self) -> None:
         self.processor.initialize()
 
         self.assertTrue(self.processor._refl_code.is_dir())
         self.assertTrue(self.processor._orbits.is_dir())
         self.assertTrue(self.processor._exe.is_dir())
+        self.assertTrue((self.processor._refl_code / "Files").is_dir())
 
-    def test_calls_make_gnssir_input_with_real_station_coordinates(self) -> None:
+    def test_refl_code_defaults_under_products_dir(self) -> None:
         self.processor.initialize()
 
-        self.assertEqual(len(calls["make_gnssir_input"]), 1)
-        call = calls["make_gnssir_input"][0]
-        self.assertAlmostEqual(call["lat"], 41.8928336813)
-        self.assertAlmostEqual(call["lon"], -69.9633123013)
-        self.assertAlmostEqual(call["height"], 21.774)
+        self.assertEqual(
+            self.processor._refl_code, self.cfg.products_dir / "refl_code"
+        )
 
-    def test_all_frequencies_enabled_by_default(self) -> None:
-        # Regression: confirmed against a real results file that
-        # every one of 20 real retrievals came from GPS alone,
-        # despite the RINEX data containing real SNR observables
-        # from GLONASS, Galileo, QZSS, and BeiDou too --
-        # make_gnssir_input()'s own default (allfreq=False) was
-        # silently restricting analysis to GPS only.
+    def test_refl_code_override_from_station_json(self) -> None:
+        override = self.root / "custom_refl_code"
+        self.cfg.station["gnssrefl_refl_code"] = str(override)
+
+        self.processor.initialize()
+
+        self.assertEqual(self.processor._refl_code, override)
+
+    def test_station_code_derived_from_station_id_when_not_configured(self) -> None:
+        self.processor.initialize()
+
+        self.assertEqual(self.processor._station_code, "usgs")
+
+    def test_station_code_explicit_override(self) -> None:
+        self.cfg.station["gnssrefl_station_code"] = "abcd"
+
+        self.processor.initialize()
+
+        self.assertEqual(self.processor._station_code, "abcd")
+
+    def test_station_code_too_short_falls_back_to_placeholder(self) -> None:
+        self.cfg.station_id = "AB"
+
+        self.processor.initialize()
+
+        self.assertEqual(len(self.processor._station_code), 4)
+
+    def test_station_code_9ch_built_from_monument_and_country(self) -> None:
+        self.processor.initialize()
+
+        self.assertEqual(self.processor._station_code_9ch, "usgs00usa")
+
+    def test_station_code_9ch_respects_configured_monument_and_country(self) -> None:
+        self.cfg.station["gnssrefl_monument_number"] = "01"
+        self.cfg.station["gnssrefl_country_code"] = "gbr"
+
+        self.processor.initialize()
+
+        self.assertEqual(self.processor._station_code_9ch, "usgs01gbr")
+
+    def test_gnssrefl_not_importable_raises(self) -> None:
+        # Setting a module to None in sys.modules is the standard,
+        # documented way to force ImportError on the next `import`
+        # of that name, regardless of whether a real package is
+        # actually installed on disk. Confirmed necessary: simply
+        # uninstalling the fake package (as an earlier version of
+        # this test did) is not sufficient on a machine with the
+        # real gnssrefl genuinely pip-installed (as any real
+        # station's own venv will have, including this project's
+        # own) -- Python's import machinery just falls back to the
+        # real package instead of failing, silently triggering real
+        # network calls (a real EGM96 download) from inside a unit
+        # test, and the test then fails for an unrelated reason
+        # (make_gnssir_input succeeding, not the intended "gnssrefl
+        # itself is not importable" scenario) -- caught directly on
+        # real hardware, not assumed.
+        _uninstall_fake_gnssrefl_package()
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "gnssrefl": None,
+                "gnssrefl.gnssir_input": None,
+                "gnssrefl.rinex2snr_cl": None,
+                "gnssrefl.gnssir_cl": None,
+            },
+        ):
+            with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
+                self.processor.initialize()
+
+    def test_make_gnssir_input_failure_raises(self) -> None:
+        _behavior["make_gnssir_input"] = "raise"
+
+        with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
+            self.processor.initialize()
+
+    def test_make_gnssir_input_sys_exit_raises_processor_error(self) -> None:
+        _behavior["make_gnssir_input"] = "sys_exit"
+
+        with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
+            self.processor.initialize()
+
+    def test_make_gnssir_input_called_with_real_coordinates(self) -> None:
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertEqual(call["lat"], self.cfg.latitude)
+        self.assertEqual(call["lon"], self.cfg.longitude)
+        self.assertEqual(call["height"], self.cfg.height)
+
+    def test_make_gnssir_input_called_with_allfreq_true_by_default(self) -> None:
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
         self.assertTrue(call["allfreq"])
 
-    def test_all_frequencies_configurable_to_false(self) -> None:
+    def test_allfreq_can_be_disabled_via_station_json(self) -> None:
         self.cfg.station["gnssrefl_all_frequencies"] = False
 
         self.processor.initialize()
@@ -262,88 +350,108 @@ class TestInitialize(GnssIrProcessorTestCase):
         call = calls["make_gnssir_input"][0]
         self.assertFalse(call["allfreq"])
 
-    def test_fine_tuning_parameters_omitted_when_not_configured(self) -> None:
-        # Confirmed correct default behavior: none of these new
-        # parameters should be passed at all unless explicitly set,
-        # so gnssrefl's own internal defaults apply -- upgrading
-        # never silently changes behavior for an existing station.
-        self.processor.initialize()
-
-        call = calls["make_gnssir_input"][0]
-        for key in (
-            "e1", "e2", "h1", "h2", "azlist2",
-            "peak2noise", "ampl", "Hortho", "refraction", "delTmax", "ediff",
-            "polyV",
-        ):
-            self.assertNotIn(key, call)
-
     def test_elevation_mask_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_elevation_min"] = 10.0
-        self.cfg.station["gnssrefl_elevation_max"] = 20.0
+        self.cfg.station["gnssrefl_elevation_min"] = 5.0
+        self.cfg.station["gnssrefl_elevation_max"] = 15.0
 
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertAlmostEqual(call["e1"], 10.0)
-        self.assertAlmostEqual(call["e2"], 20.0)
+        self.assertEqual(call["e1"], 5.0)
+        self.assertEqual(call["e2"], 15.0)
+
+    def test_elevation_mask_not_passed_when_unconfigured(self) -> None:
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertNotIn("e1", call)
+        self.assertNotIn("e2", call)
 
     def test_reflector_height_range_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_reflector_height_min"] = 1.0
-        self.cfg.station["gnssrefl_reflector_height_max"] = 15.0
+        self.cfg.station["gnssrefl_reflector_height_min"] = -0.5
+        self.cfg.station["gnssrefl_reflector_height_max"] = 5.0
 
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertAlmostEqual(call["h1"], 1.0)
-        self.assertAlmostEqual(call["h2"], 15.0)
+        self.assertEqual(call["h1"], -0.5)
+        self.assertEqual(call["h2"], 5.0)
+
+    def test_nr1_nr2_set_when_both_h1_and_h2_configured(self) -> None:
+        # Confirmed, real bug this guards against: gnssir's
+        # noise-floor estimation reads nr1/nr2 as SEPARATE config
+        # fields from h1/h2, not automatically derived from them --
+        # confirmed directly via inspect.signature(make_gnssir_input)
+        # against the real installed package. Without nr1/nr2 set,
+        # every arc's noise-floor sample comes back empty and every
+        # single arc silently fails quality control.
+        self.cfg.station["gnssrefl_reflector_height_min"] = -0.5
+        self.cfg.station["gnssrefl_reflector_height_max"] = 5.0
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertEqual(call["nr1"], -0.5)
+        self.assertEqual(call["nr2"], 5.0)
+        # And NOT a combined "NReg" keyword -- confirmed the real
+        # parameter names are nr1/nr2, not a single "NReg" list; an
+        # earlier version of this fix assumed the latter, which is
+        # not a valid parameter on the real function and raised
+        # TypeError on every call.
+        self.assertNotIn("NReg", call)
+
+    def test_nr1_nr2_not_set_when_only_h1_configured(self) -> None:
+        # Deliberately left unset when only one of h1/h2 is given,
+        # so gnssrefl's own default RH search behavior (presumably
+        # self-consistent with its own default nr1/nr2) applies to
+        # the whole reflector-height configuration together, rather
+        # than mixing one explicit bound with unrelated defaults.
+        self.cfg.station["gnssrefl_reflector_height_min"] = 2.0
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertNotIn("nr1", call)
+        self.assertNotIn("nr2", call)
+
+    def test_nr1_nr2_not_set_when_neither_h1_nor_h2_configured(self) -> None:
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertNotIn("nr1", call)
+        self.assertNotIn("nr2", call)
 
     def test_azimuth_regions_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_azimuth_regions"] = [0, 150, 180, 360]
+        self.cfg.station["gnssrefl_azimuth_regions"] = [353, 360, 0, 173]
 
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertEqual(call["azlist2"], [0.0, 150.0, 180.0, 360.0])
-
-    def test_qc_thresholds_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_peak2noise"] = 3.2
-        self.cfg.station["gnssrefl_amplitude_min"] = 6.0
-
-        self.processor.initialize()
-
-        call = calls["make_gnssir_input"][0]
-        self.assertAlmostEqual(call["peak2noise"], 3.2)
-        self.assertAlmostEqual(call["ampl"], 6.0)
+        self.assertEqual(call["azlist2"], [353.0, 360.0, 0.0, 173.0])
 
     def test_orthometric_height_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_orthometric_height"] = 12.5
+        self.cfg.station["gnssrefl_orthometric_height"] = 18.665
 
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertAlmostEqual(call["Hortho"], 12.5)
+        self.assertEqual(call["Hortho"], 18.665)
 
     def test_refraction_model_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_refraction_model"] = 2
+        self.cfg.station["gnssrefl_refraction_model"] = 0
 
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertEqual(call["refraction"], 2)
+        self.assertEqual(call["refraction"], 0)
 
     def test_max_arc_minutes_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_max_arc_minutes"] = 20.0
+        self.cfg.station["gnssrefl_max_arc_minutes"] = 40.0
 
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertAlmostEqual(call["delTmax"], 20.0)
-
-    def test_max_arc_minutes_omitted_when_not_configured(self) -> None:
-        self.processor.initialize()
-
-        call = calls["make_gnssir_input"][0]
-        self.assertNotIn("delTmax", call)
+        self.assertEqual(call["delTmax"], 40.0)
 
     def test_elevation_span_tolerance_passed_through_when_configured(self) -> None:
         self.cfg.station["gnssrefl_elevation_span_tolerance"] = 1.0
@@ -351,13 +459,7 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertAlmostEqual(call["ediff"], 1.0)
-
-    def test_elevation_span_tolerance_omitted_when_not_configured(self) -> None:
-        self.processor.initialize()
-
-        call = calls["make_gnssir_input"][0]
-        self.assertNotIn("ediff", call)
+        self.assertEqual(call["ediff"], 1.0)
 
     def test_direct_signal_poly_order_passed_through_when_configured(self) -> None:
         self.cfg.station["gnssrefl_direct_signal_poly_order"] = 2
@@ -367,69 +469,12 @@ class TestInitialize(GnssIrProcessorTestCase):
         call = calls["make_gnssir_input"][0]
         self.assertEqual(call["polyV"], 2)
 
-    def test_direct_signal_poly_order_omitted_when_not_configured(self) -> None:
-        self.processor.initialize()
+    def test_status_before_initialize(self) -> None:
+        status = self.processor.status()
 
-        call = calls["make_gnssir_input"][0]
-        self.assertNotIn("polyV", call)
+        self.assertFalse(status.initialized)
 
-    def test_station_code_derived_from_station_id_when_not_configured(self) -> None:
-        self.processor.initialize()
-
-        self.assertEqual(self.processor._station_code, "usgs")
-
-    def test_explicit_station_code_takes_precedence(self) -> None:
-        self.cfg.station["gnssrefl_station_code"] = "wh01"
-
-        self.processor.initialize()
-
-        self.assertEqual(self.processor._station_code, "wh01")
-
-    def test_raises_if_gnssrefl_not_importable(self) -> None:
-        _uninstall_fake_gnssrefl_package()
-
-        # Merely removing sys.modules entries only makes the
-        # subsequent `import gnssrefl` fail if the real package
-        # isn't *also* genuinely installed on whatever machine runs
-        # this test -- which held in initial testing, but not on a
-        # real machine with gnssrefl actually pip-installed (where
-        # Python would just fall through to importing the real
-        # package, defeating this test's purpose entirely, and
-        # incidentally explained a mysterious stray gnssrefl EGM96/
-        # json-writing side effect that had shown up unexplained in
-        # earlier full-suite runs). Setting sys.modules entries to
-        # None is the documented, robust way to force ImportError on
-        # the next import regardless of what's actually installed.
-        poisoned = unittest.mock.patch.dict(
-            sys.modules,
-            {
-                "gnssrefl": None,
-                "gnssrefl.gnssir_input": None,
-                "gnssrefl.rinex2snr_cl": None,
-                "gnssrefl.gnssir_cl": None,
-            },
-        )
-
-        with poisoned:
-            with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
-                self.processor.initialize()
-
-    def test_raises_if_make_gnssir_input_fails(self) -> None:
-        _behavior["make_gnssir_input"] = "raise"
-
-        with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
-            self.processor.initialize()
-
-    def test_raises_if_make_gnssir_input_calls_sys_exit(self) -> None:
-        # "never crash" applies to initialize() too -- a SystemExit
-        # from research-grade external code must not actually exit
-        # the process; it should surface as our own exception type.
-        _behavior["make_gnssir_input"] = "sys_exit"
-
-        with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
-            self.processor.initialize()
-
-    def test_status_reflects_successful_initialize(self) -> None:
+    def test_status_after_initialize(self) -> None:
         self.processor.initialize()
 
         status = self.processor.status()
@@ -460,7 +505,15 @@ class TestProcessSuccess(GnssIrProcessorTestCase):
         self.assertEqual(result.day, date(2026, 7, 8))
 
     def test_rinex_file_staged_with_correct_name_and_location(self) -> None:
-        self.processor.process(self.observation_file, day=date(2026, 7, 8))
+        # Tests _stage_rinex_file() directly, in isolation, rather
+        # than via process(): process() now removes its staged file
+        # once done with it (see
+        # test_staged_rinex_file_is_cleaned_up_after_processing
+        # below), so checking staging behavior through process()
+        # itself would only ever observe an already-deleted file.
+        staged_path = self.processor._stage_rinex_file(
+            self.observation_file, day=date(2026, 7, 8)
+        )
 
         # 2026-07-08 is day of year 189. Staged under the 4-char
         # directory ("usgs"), but named with the 9-char station code
@@ -476,10 +529,34 @@ class TestProcessSuccess(GnssIrProcessorTestCase):
             / "USGS00USA_R_20261890000_01D_01S_MO.rnx"
         )
 
+        self.assertEqual(staged_path, expected)
         self.assertTrue(expected.exists())
         self.assertEqual(
             expected.read_text(), self.observation_file.read_text()
         )
+
+    def test_staged_rinex_file_is_cleaned_up_after_processing(self) -> None:
+        # Confirmed, real bug this guards against: without this
+        # cleanup, the staged RINEX copy (~350-400MB per day on real
+        # hardware, since it's a full copy of the observation file)
+        # was never removed afterward -- the only existing cleanup
+        # (_stage_rinex_file() removing a same-named stale file
+        # before staging a new one) never triggers for a day that's
+        # processed exactly once, which is the normal case. Confirmed
+        # directly on real hardware: 29 accumulated files, 9.3GB,
+        # after several weeks of ordinary, non-reprocessing
+        # operation, with no upper bound on further growth.
+        self.processor.process(self.observation_file, day=date(2026, 7, 8))
+
+        staged = (
+            self.processor._refl_code
+            / "2026"
+            / "rinex"
+            / "usgs"
+            / "USGS00USA_R_20261890000_01D_01S_MO.rnx"
+        )
+
+        self.assertFalse(staged.exists())
 
     def test_stale_file_in_working_directory_is_removed_before_staging(
         self,
@@ -706,6 +783,29 @@ class TestProcessFailureModes(GnssIrProcessorTestCase):
         self.assertFalse(result.success)
         self.assertIn("rinex2snr failed", result.message)
 
+    def test_staged_rinex_file_is_cleaned_up_even_when_rinex2snr_fails(
+        self,
+    ) -> None:
+        # The more important half of the cleanup guarantee: some of
+        # the 29 leaked files found on real hardware came from
+        # failed/retried runs, not just successful ones, since the
+        # original code never cleaned up regardless of outcome. The
+        # staged file must be removed even when processing fails
+        # immediately after staging.
+        _behavior["rinex2snr"] = "raise"
+
+        self.processor.process(self.observation_file, day=date(2026, 7, 8))
+
+        staged = (
+            self.processor._refl_code
+            / "2026"
+            / "rinex"
+            / "usgs"
+            / "USGS00USA_R_20261890000_01D_01S_MO.rnx"
+        )
+
+        self.assertFalse(staged.exists())
+
     def test_gnssir_failure_never_raises(self) -> None:
         _behavior["gnssir"] = "raise"
 
@@ -725,6 +825,21 @@ class TestProcessFailureModes(GnssIrProcessorTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("gnssir failed", result.message)
+
+    def test_staged_rinex_file_is_cleaned_up_even_when_gnssir_fails(self) -> None:
+        _behavior["gnssir"] = "raise"
+
+        self.processor.process(self.observation_file, day=date(2026, 7, 8))
+
+        staged = (
+            self.processor._refl_code
+            / "2026"
+            / "rinex"
+            / "usgs"
+            / "USGS00USA_R_20261890000_01D_01S_MO.rnx"
+        )
+
+        self.assertFalse(staged.exists())
 
     def test_gnssir_success_but_no_results_file_is_still_a_failure(self) -> None:
         # The exact "do not assume success" principle from

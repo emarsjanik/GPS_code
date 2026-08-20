@@ -68,25 +68,43 @@ Confirmed against gnssrefl's own documentation (gnssrefl.readthedocs.io)
           properly. Worked around by removing any same-named file
           from the current working directory immediately before
           staging (_stage_rinex_file()).
-        - gnssir's own noise-floor estimation reads a config field
-          called NReg -- the region of the reflector-height spectrum
-          used to estimate background noise -- as a SEPARATE value
-          from h1/h2 (the actual RH search region), not
-          automatically derived from them. If NReg does not cover
-          the same range as h1/h2, every arc's noise-floor sample
-          comes back empty, the resulting Noise value silently
-          defaults to 0.0, and every single arc fails quality control
-          with no indication why beyond a RuntimeWarning ("divide by
-          zero encountered in scalar divide"). Confirmed directly by
-          tracing gnssrefl's own source (retrieve_rh.py) after a real
-          run silently produced zero saved arcs despite dozens of
-          arcs passing every earlier quality-control check.
-          quickLook (a separate gnssrefl code path) does not have
-          this problem: it sets NReg = [minH, maxH] automatically on
-          every run, which is why quickLook and gnssir can disagree
-          on the exact same underlying data even with identical h1/h2
-          settings. Worked around below by setting NReg explicitly
-          whenever h1/h2 are both explicitly configured.
+        - gnssir's own noise-floor estimation reads two config
+          fields, nr1/nr2, defining the region of the reflector-
+          height spectrum used to estimate background noise -- NOT
+          automatically derived from h1/h2 (the actual RH search
+          region). If nr1/nr2 don't cover the same range as h1/h2,
+          every arc's noise-floor sample comes back empty, the
+          resulting Noise value silently defaults to 0.0, and every
+          single arc fails quality control with no indication why
+          beyond a RuntimeWarning ("divide by zero encountered in
+          scalar divide"). Confirmed directly by tracing gnssrefl's
+          own source (retrieve_rh.py) after a real run silently
+          produced zero saved arcs despite dozens of arcs passing
+          every earlier quality-control check. quickLook (a separate
+          gnssrefl code path) does not have this problem: it sets
+          nr1/nr2 = minH/maxH automatically on every run, which is
+          why quickLook and gnssir can disagree on the exact same
+          underlying data even with identical h1/h2 settings.
+          Confirmed the real parameter names directly via
+          inspect.signature(make_gnssir_input) against the installed
+          package (nr1/nr2, NOT a combined 'NReg' keyword -- an
+          earlier version of this fix assumed the latter, which is
+          not a valid parameter name and raised TypeError on every
+          call; caught via a live pipeline run and corrected).
+        - _stage_rinex_file() copies the day's RINEX observation
+          file into gnssrefl's working directory (both the properly
+          staged directory AND, per the stale-file-reuse workaround
+          above, indirectly into gnssrefl's own current-working-
+          directory lookup path) so rinex2snr(nolook=True) can find
+          it. That staged copy was never cleaned up afterward --
+          confirmed directly on real hardware: 29 accumulated files,
+          9.3GB, spanning weeks of normal single-pass operation
+          (never reprocessed), since the only existing cleanup
+          (removing a same-named stale file before staging a new
+          one) never triggers for a day that's processed exactly
+          once. process() now removes its staged file in a finally
+          block once done with it, success or failure, since it is
+          only ever needed transiently for rinex2snr() to read.
 
 What this does, and what it deliberately does NOT do
 --------------------------------------------------------
@@ -355,6 +373,17 @@ class GnssIrProcessor:
         missing input, rinex2snr failing, gnssir failing) comes back
         as a GnssIrResult with success=False and a clear message.
 
+        The RINEX file staged into gnssrefl's working directory
+        (_stage_rinex_file()) is always removed once this call is
+        done with it, success or failure -- confirmed, real bug this
+        fixes: previously the staged copy (~350-400MB per day) was
+        never cleaned up afterward, only ever opportunistically
+        removed if a file with that exact same name happened to be
+        staged again later, which never happens for a day processed
+        exactly once. Confirmed directly on real hardware: 29
+        accumulated files, 9.3GB, after normal operation with no
+        reprocessing.
+
         Parameters
         ----------
         observation_file:
@@ -395,7 +424,7 @@ class GnssIrProcessor:
             )
 
         try:
-            self._stage_rinex_file(observation_file, day)
+            staged_path = self._stage_rinex_file(observation_file, day)
         except OSError as exc:
             elapsed = time.monotonic() - started
             message = f"Could not stage RINEX file for gnssrefl: {exc}"
@@ -406,74 +435,18 @@ class GnssIrProcessor:
                 self._failure_result(observation_file, day, message, elapsed)
             )
 
-        year = day.year
-        doy = day.timetuple().tm_yday
-
+        # Everything from here on operates on the file we just
+        # staged, so it must be cleaned up afterward regardless of
+        # how _process_staged() finishes -- success, a caught
+        # rinex2snr/gnssir failure, or (belt-and-suspenders) an
+        # uncaught exception. See the "confirmed, real bug" note
+        # above and in the module docstring.
         try:
-            self._run_rinex2snr(year, doy)
-        except (Exception, SystemExit) as exc:
-            # Catches SystemExit too: gnssrefl is research-grade code
-            # that may call sys.exit() internally on some error
-            # paths rather than raising cleanly. "Never crash" means
-            # never crash even if the external library tries to.
-            elapsed = time.monotonic() - started
-            message = f"rinex2snr failed: {exc}"
-            self._logger.error(
-                "FAILED %s: %s (%.2f sec)", observation_file.name, message, elapsed
+            return self._process_staged(
+                observation_file, day, staged_path, started
             )
-            return self._record(
-                self._failure_result(observation_file, day, message, elapsed)
-            )
-
-        try:
-            self._run_gnssir(year, doy)
-        except (Exception, SystemExit) as exc:
-            elapsed = time.monotonic() - started
-            message = f"gnssir failed: {exc}"
-            self._logger.error(
-                "FAILED %s: %s (%.2f sec)", observation_file.name, message, elapsed
-            )
-            return self._record(
-                self._failure_result(observation_file, day, message, elapsed)
-            )
-
-        elapsed = time.monotonic() - started
-
-        ok, num_tracks, notes, reflector_height, quality_score = self._read_results(
-            year, doy
-        )
-
-        output_directory = self._refl_code / str(year) / "results" / self._station_code
-
-        result = GnssIrResult(
-            success=ok,
-            observation_file=observation_file,
-            day=day,
-            station_code=self._station_code,
-            reflector_height=reflector_height,
-            soil_moisture=None,  # see module docstring -- genuinely out of scope
-            snow_depth=None,  # see module docstring -- genuinely out of scope
-            quality_score=quality_score,
-            num_tracks=num_tracks,
-            output_directory=output_directory,
-            message=notes,
-            runtime_seconds=elapsed,
-            gnssrefl_version=self._gnssrefl_version,
-        )
-
-        if ok:
-            self._logger.info(
-                "SUCCESS %s (%.2f sec, %d track(s))",
-                observation_file.name,
-                elapsed,
-                num_tracks,
-            )
-        else:
-            self._logger.error(
-                "FAILED %s: %s (%.2f sec)", observation_file.name, notes, elapsed
-            )
-
-        return self._record(result)
+        finally:
+            self._cleanup_staged_file(staged_path)
 
     def verify(self, result: GnssIrResult) -> bool:
         """
@@ -717,40 +690,54 @@ class GnssIrProcessor:
             kwargs["h2"] = float(h2)
 
         # Confirmed, real bug this fixes: gnssrefl's gnssir/rinex2snr
-        # pipeline reads NReg (the reflector-height region used to
-        # estimate the noise floor) as a SEPARATE config field from
+        # pipeline reads nr1/nr2 (the reflector-height region used to
+        # estimate the noise floor) as SEPARATE config fields from
         # h1/h2 (the actual RH search region) -- NOT automatically
-        # derived from them. If NReg does not cover the same range as
-        # h1/h2, every arc's noise-floor sample comes back empty, the
-        # resulting Noise value silently defaults to 0.0, and every
-        # single arc fails quality control -- confirmed directly by
-        # tracing gnssrefl's own source (retrieve_rh.py) after a real
-        # pipeline run silently produced zero saved arcs despite
-        # dozens of arcs passing every earlier quality-control check,
-        # accompanied by a real, reproducible "RuntimeWarning: divide
-        # by zero encountered in scalar divide" at the exact line
-        # that computes maxAmp/Noise. quickLook (gnssrefl's other,
-        # separate exploratory tool) does not have this problem: it
-        # sets NReg = [minH, maxH] automatically on every single run,
-        # which is exactly why quickLook and gnssir can silently
-        # disagree on identical underlying data even with identical
-        # h1/h2 settings -- quickLook's noise region always tracks
-        # whatever range you ask it to search, gnssir's does not.
+        # derived from them. If nr1/nr2 do not cover the same range
+        # as h1/h2, every arc's noise-floor sample comes back empty,
+        # the resulting Noise value silently defaults to 0.0, and
+        # every single arc fails quality control -- confirmed
+        # directly by tracing gnssrefl's own source (retrieve_rh.py)
+        # after a real pipeline run silently produced zero saved arcs
+        # despite dozens of arcs passing every earlier
+        # quality-control check, accompanied by a real, reproducible
+        # "RuntimeWarning: divide by zero encountered in scalar
+        # divide" at the exact line that computes maxAmp/Noise.
+        # quickLook (gnssrefl's other, separate exploratory tool)
+        # does not have this problem: it sets nr1/nr2 = minH/maxH
+        # automatically on every single run, which is exactly why
+        # quickLook and gnssir can silently disagree on identical
+        # underlying data even with identical h1/h2 settings --
+        # quickLook's noise region always tracks whatever range you
+        # ask it to search, gnssir's does not.
+        #
+        # Confirmed the real parameter names directly via
+        # inspect.signature(make_gnssir_input) against the actual
+        # installed package (gnssrefl 4.1.5): the function takes
+        # nr1/nr2 as two separate float keyword arguments and builds
+        # its own internal NReg=[nr1, nr2] -- there is no 'NReg'
+        # keyword argument on the function itself. An earlier version
+        # of this fix assumed a combined 'NReg' keyword by analogy
+        # with h1/h2's naming, without checking -- that assumption
+        # was wrong and raised TypeError on every single call,
+        # caught only via a live pipeline run against real hardware
+        # and corrected to nr1/nr2 as shown below.
         #
         # Only set here when BOTH h1 and h2 are explicitly configured
         # above, matching this method's existing philosophy
         # throughout: gnssrefl's own internal default applies
         # whenever a value isn't explicitly configured, rather than
         # this code silently overriding it. If only one of h1/h2 is
-        # set, NReg is deliberately left unset too, so gnssrefl's own
-        # default RH search behavior (which is presumably already
-        # internally self-consistent with its own default NReg)
+        # set, nr1/nr2 are deliberately left unset too, so gnssrefl's
+        # own default RH search behavior (which is presumably already
+        # internally self-consistent with its own default nr1/nr2)
         # applies to the whole reflector-height configuration
-        # together, instead of mixing one explicit bound with an
-        # unrelated default NReg that may not match it.
+        # together, instead of mixing one explicit bound with
+        # unrelated default noise-region bounds that may not match it.
         if "h1" in kwargs and "h2" in kwargs:
             kwargs["nr1"] = kwargs["h1"]
             kwargs["nr2"] = kwargs["h2"]
+
         # Azimuth mask (gnssrefl's own param: azlist2 -- a list of
         # region boundaries, e.g. [0, 360] or [0, 150, 180, 360])
         azimuth_regions = station_section.get("gnssrefl_azimuth_regions")
@@ -882,6 +869,11 @@ class GnssIrProcessor:
           refreshed, with no error or warning. To make this
           impossible to hit, any same-named file in the current
           working directory is removed before staging.
+
+        The path returned here is the same one process() now passes
+        to _cleanup_staged_file() once it's done being used -- see
+        that method's docstring for the real disk-growth bug this
+        closes.
         """
 
         assert self._refl_code is not None
@@ -916,6 +908,42 @@ class GnssIrProcessor:
 
         return staged_path
 
+    def _cleanup_staged_file(self, staged_path: Path) -> None:
+        """
+        Remove the RINEX file staged into gnssrefl's working
+        directory by _stage_rinex_file(), once process() is done
+        using it.
+
+        Confirmed, real bug this fixes: without this, the staged
+        copy (~350-400MB per day, since it's a copy of the full raw
+        RINEX observation file) was never cleaned up afterward. The
+        only existing cleanup -- _stage_rinex_file() itself removing
+        a same-named stale file before staging a new one -- only
+        triggers when a day is staged a SECOND time under the exact
+        same filename, which never happens for a day processed
+        exactly once (the normal, expected case). Confirmed directly
+        on real hardware: 29 files, 9.3GB, accumulated in station/
+        over several weeks of ordinary, non-reprocessing operation,
+        with no upper bound on further growth.
+
+        Called from a finally block in process(), so this runs
+        whether processing succeeded, failed partway through, or
+        raised -- the staged copy is only ever needed transiently,
+        for rinex2snr() to read during this one process() call.
+
+        Never raises: a failure to clean up a temporary file is
+        logged, not treated as a processing failure in its own
+        right.
+        """
+
+        try:
+            if staged_path.exists():
+                staged_path.unlink()
+        except OSError as exc:
+            self._logger.warning(
+                "Could not remove staged RINEX file %s: %s", staged_path, exc
+            )
+
     def _run_rinex2snr(self, year: int, doy: int) -> None:
         from gnssrefl.rinex2snr_cl import rinex2snr
 
@@ -940,6 +968,94 @@ class GnssIrProcessor:
             nooverwrite=False,
             screenstats=False,
         )
+
+    def _process_staged(
+        self,
+        observation_file: Path,
+        day: date,
+        staged_path: Path,
+        started: float,
+    ) -> GnssIrResult:
+        """
+        Runs rinex2snr and gnssir against a file that has already
+        been staged, and reports the outcome. Split out from
+        process() itself purely so process() can wrap the call in a
+        try/finally that always cleans up `staged_path` afterward
+        (see _cleanup_staged_file()), without deeply re-indenting
+        this entire body inside that try block. `staged_path` is not
+        otherwise used here -- gnssrefl locates the file itself via
+        year/doy -- it's threaded through only for log-message
+        parity with the rest of this class.
+        """
+
+        year = day.year
+        doy = day.timetuple().tm_yday
+
+        try:
+            self._run_rinex2snr(year, doy)
+        except (Exception, SystemExit) as exc:
+            # Catches SystemExit too: gnssrefl is research-grade code
+            # that may call sys.exit() internally on some error
+            # paths rather than raising cleanly. "Never crash" means
+            # never crash even if the external library tries to.
+            elapsed = time.monotonic() - started
+            message = f"rinex2snr failed: {exc}"
+            self._logger.error(
+                "FAILED %s: %s (%.2f sec)", observation_file.name, message, elapsed
+            )
+            return self._record(
+                self._failure_result(observation_file, day, message, elapsed)
+            )
+
+        try:
+            self._run_gnssir(year, doy)
+        except (Exception, SystemExit) as exc:
+            elapsed = time.monotonic() - started
+            message = f"gnssir failed: {exc}"
+            self._logger.error(
+                "FAILED %s: %s (%.2f sec)", observation_file.name, message, elapsed
+            )
+            return self._record(
+                self._failure_result(observation_file, day, message, elapsed)
+            )
+
+        elapsed = time.monotonic() - started
+
+        ok, num_tracks, notes, reflector_height, quality_score = self._read_results(
+            year, doy
+        )
+
+        output_directory = self._refl_code / str(year) / "results" / self._station_code
+
+        result = GnssIrResult(
+            success=ok,
+            observation_file=observation_file,
+            day=day,
+            station_code=self._station_code,
+            reflector_height=reflector_height,
+            soil_moisture=None,  # see module docstring -- genuinely out of scope
+            snow_depth=None,  # see module docstring -- genuinely out of scope
+            quality_score=quality_score,
+            num_tracks=num_tracks,
+            output_directory=output_directory,
+            message=notes,
+            runtime_seconds=elapsed,
+            gnssrefl_version=self._gnssrefl_version,
+        )
+
+        if ok:
+            self._logger.info(
+                "SUCCESS %s (%.2f sec, %d track(s))",
+                observation_file.name,
+                elapsed,
+                num_tracks,
+            )
+        else:
+            self._logger.error(
+                "FAILED %s: %s (%.2f sec)", observation_file.name, notes, elapsed
+            )
+
+        return self._record(result)
 
     def _results_file_path(self, day: date) -> Path:
         assert self._refl_code is not None
