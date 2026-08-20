@@ -181,7 +181,7 @@ def residual_stats(v):
 # ---------------------------------------------------------------------------
 
 RINEX_RX = re.compile(
-    r"^USGS00USA_R_(?P<year>\d{4})(?P<doy>\d{3})0000_01D_01S_MO\."
+    r"^USGS00USA_R_(?P<year>\d{4})(?P<doy>\d{3})00000_01D_01S_MO\."
     r"(?:rnx|crx)(?:\.(?:gz|Z))?$", re.I
 )
 
@@ -326,121 +326,121 @@ def result_files():
 
 
 def parse_result(path):
-    """
-    Parse a gnssrefl 4.1.x GNSS-IR result file.
-
-    Actual gnssrefl result format:
-
-      year doy RH sat UTCtime Azim Amp eminO emaxO NumbOf freq rise ...
-
-    Example:
-
-      2026 190 19.244   5 19.445 116.79  36.07 ...
-      2026 190 18.830  25 20.582 157.87   7.23 ...
-
-    Fields used here:
-      column 1  = year
-      column 2  = day of year
-      column 3  = reflector height (m)
-      column 4  = satellite / PRN
-      column 5  = UTC time in decimal hours
-      column 6  = azimuth (degrees)
-      column 12 = rise/set (-1 / +1)
-
-    This parser intentionally uses the documented/observed numeric
-    gnssrefl format rather than attempting to infer a CSV header.
-    """
-
     rows = []
-
     try:
         lines = path.read_text(errors="replace").splitlines()
-    except Exception as exc:
-        print(f"  WARNING: cannot read {path}: {exc}")
+    except OSError:
         return rows
 
+    # Header-based parsing.
+    for hi, line in enumerate(lines[:100]):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        delim = "," if "," in line else "\t" if "\t" in line else None
+        if not delim:
+            continue
+        h = [x.strip().lower() for x in line.split(delim)]
+        joined = " ".join(h)
+        if not (("sat" in joined or "sv" in joined) and
+                ("az" in joined) and
+                ("rh" in joined or "height" in joined)):
+            continue
+
+        def get(d, names):
+            for n in names:
+                if n in d:
+                    return d[n]
+            return None
+
+        for ln in lines[hi + 1:]:
+            if not ln.strip() or ln.lstrip().startswith("#"):
+                continue
+            a = [x.strip() for x in ln.split(delim)]
+            if len(a) != len(h):
+                continue
+            d = dict(zip(h, a))
+            dt = normalize_dt(get(d, [
+                "datetime", "date_time", "time", "utc", "date"
+            ]))
+            if dt is None:
+                continue
+            try:
+                sat = int(float(get(d, ["sat", "sv", "satellite", "prn"])))
+            except (TypeError, ValueError):
+                continue
+            az = fnum(get(d, ["azimuth", "azim", "az"]))
+            wl = fnum(get(d, [
+                "reflector_height", "reflector height", "rh",
+                "height", "height_m", "gnss_wl_m"
+            ]))
+            rv = get(d, ["rise", "rising", "direction", "azdir"])
+            try:
+                rise = int(float(rv))
+            except (TypeError, ValueError):
+                rise = 1 if str(rv).lower().startswith("r") else -1
+            if math.isfinite(az) and math.isfinite(wl):
+                rows.append(dict(
+                    datetime_utc=dt, sat=sat, rise=rise,
+                    azimuth=az, GNSS_WL_m=wl, source=str(path)
+                ))
+        if rows:
+            return rows
+
+    # Conservative fallback for numeric tables.  We only accept rows with a
+    # clearly recognizable Y/M/D/h/m/s block and plausible sat/az/height.
+    numrx = re.compile(
+        r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[Ee][-+]?\d+)?"
+    )
     for line in lines:
-        line = line.strip()
-
-        # Ignore comments, blank lines, and header material.
-        if not line or line.startswith("%") or line.startswith("#"):
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-
-        parts = line.split()
-
-        # A valid gnssrefl observation has at least 12 fields.
-        if len(parts) < 12:
-            continue
-
         try:
-            year = int(parts[0])
-            doy = int(parts[1])
-
-            rh = float(parts[2])
-            sat = int(float(parts[3]))
-            utc_hours = float(parts[4])
-            azimuth = float(parts[5])
-            rise = int(float(parts[11]))
-        except (ValueError, TypeError):
+            nums = [float(x) for x in numrx.findall(line)]
+        except ValueError:
+            continue
+        if len(nums) < 10:
             continue
 
-        # Basic sanity checks.
-        if not (2000 <= year <= 2100):
-            continue
+        for j in range(min(6, len(nums) - 6)):
+            try:
+                y, mo, da = map(int, nums[j:j+3])
+                hh, mi = map(int, nums[j+3:j+5])
+                sec = float(nums[j+5])
+                if not (2000 <= y <= 2100 and 1 <= mo <= 12 and
+                        1 <= da <= 31 and 0 <= hh <= 23 and
+                        0 <= mi <= 59 and 0 <= sec < 61):
+                    continue
+                isec = int(sec)
+                us = int(round((sec - isec) * 1e6))
+                dt = datetime(y, mo, da, hh, mi, isec, us)
+            except (ValueError, OverflowError):
+                continue
 
-        if not (1 <= doy <= 366):
-            continue
-
-        if not (1 <= sat <= 64):
-            continue
-
-        if not math.isfinite(rh):
-            continue
-
-        if not math.isfinite(utc_hours):
-            continue
-
-        if not math.isfinite(azimuth):
-            continue
-
-        if not (0.0 <= utc_hours < 24.0):
-            continue
-
-        if not (0.0 <= azimuth <= 360.0):
-            continue
-
-        if rise not in (-1, 1):
-            continue
-
-        try:
-            date0 = datetime(year, 1, 1) + timedelta(days=doy - 1)
-
-            total_seconds = utc_hours * 3600.0
-            whole_seconds = int(total_seconds)
-            microseconds = int(round(
-                (total_seconds - whole_seconds) * 1_000_000
-            ))
-
-            # Handle rounding exactly to the next second.
-            if microseconds >= 1_000_000:
-                whole_seconds += 1
-                microseconds -= 1_000_000
-
-            dt = date0 + timedelta(
-                seconds=whole_seconds,
-                microseconds=microseconds
-            )
-        except (ValueError, OverflowError):
-            continue
-
-        rows.append(dict(
-            datetime_utc=dt,
-            sat=sat,
-            rise=rise,
-            azimuth=azimuth,
-            GNSS_WL_m=rh,
-            source=str(path),
-        ))
+            tail = nums[j+6:]
+            for k in range(len(tail) - 3):
+                sat = int(round(tail[k]))
+                if not 1 <= sat <= 64:
+                    continue
+                candidates = [
+                    (k+1, k+3), (k+2, k+3), (k+1, k+4)
+                ]
+                made = False
+                for ai, wi in candidates:
+                    if wi >= len(tail):
+                        continue
+                    az, wl = tail[ai], tail[wi]
+                    if 0 <= az <= 360 and -20 <= wl <= 100:
+                        rise = int(tail[k+2]) if tail[k+2] in (-1, 1) else 1
+                        rows.append(dict(
+                            datetime_utc=dt, sat=sat, rise=rise,
+                            azimuth=float(az), GNSS_WL_m=float(wl),
+                            source=str(path)
+                        ))
+                        made = True
+                        break
+                if made:
+                    break
+            break
 
     return rows
 

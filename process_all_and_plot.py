@@ -210,43 +210,68 @@ def generate_spline(station, year, doys):
 
 def load_spline(spline_path, year):
     """
-    Parses gnssrefl's subdaily spline output file. Format (from real,
-    confirmed output): whitespace-separated columns where column 0 is
-    fractional day-of-year and column 1 is spline-fit reflector height
-    in meters. Lines starting with '%' are headers/comments. A value
-    of 999 means a real gap with no spline value available -- these
-    are converted to NaN so plotting shows a genuine break, not a
-    misleading straight line across missing data.
+    Parses gnssrefl's subdaily spline output file.
+
+    CONFIRMED REAL FORMAT (verified directly against actual file
+    contents -- the module previously guessed at this format
+    incorrectly, assuming column 0 was a simple fractional
+    day-of-year, which produced dates off by ~167 years):
+
+        (1) MJD
+        (2) RH(m)
+        (3) YYYY
+        (4) MM
+        (5) DD
+        (6) HH
+        (7) MM
+        (8) SS
+        (9) quasi-sea-level(m)   -- this IS Hortho - RH, already computed
+
+    Columns 3-8 are read directly for the datetime rather than
+    converting from MJD ourselves, since they're unambiguous. Column
+    9 (quasi-sea-level) is used directly as the water level, since
+    it's already computed with the station's own configured Hortho
+    value -- not recomputed here, to avoid any mismatch with this
+    script's own H_ORTHO_M constant.
+
+    A water-level value of 999 (or RH of 999) means a real gap with
+    no spline value available -- converted to NaN so plotting shows a
+    genuine break, not a misleading straight line across missing data.
     """
     if not spline_path.exists():
         return None, None
 
     times = []
-    rh_values = []
-
-    day_start_ref = datetime(year, 1, 1)
+    water_levels = []
 
     for line in spline_path.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("%"):
             continue
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 9:
             continue
         try:
-            frac_doy = float(parts[0])
-            rh = float(parts[1])
+            yyyy = int(float(parts[2]))
+            mm = int(float(parts[3]))
+            dd = int(float(parts[4]))
+            hh = int(float(parts[5]))
+            mi = int(float(parts[6]))
+            ss = int(float(parts[7]))
+            quasi_sea_level = float(parts[8])
         except ValueError:
             continue
 
-        dt = day_start_ref + timedelta(days=frac_doy - 1)
+        dt = datetime(yyyy, mm, dd, hh, mi, ss)
         times.append(dt)
-        rh_values.append(rh if abs(rh - 999.0) > 1e-6 else float("nan"))
+        water_levels.append(
+            quasi_sea_level if abs(quasi_sea_level - 999.0) > 1e-6 else float("nan")
+        )
 
     if not times:
         return None, None
 
-    return times, np.array(rh_values, dtype=float)
+    return times, np.array(water_levels, dtype=float)
 
 
 # ---------------------------------------------------------------------
@@ -360,7 +385,7 @@ def load_tide_model(tide_path):
 # ---------------------------------------------------------------------
 
 def make_plot(rows, tide_times, tide_ensemble, offset_m, model_names,
-              spline_times=None, spline_rh=None):
+              spline_times=None, spline_water_level=None):
     fig, ax1 = plt.subplots(figsize=(14, 7))
 
     dts = [r["datetime"] for r in rows]
@@ -371,9 +396,11 @@ def make_plot(rows, tide_times, tide_ensemble, offset_m, model_names,
     ax1.plot(dts, wl_corrected, "o", ms=3, alpha=0.5, color="tab:orange",
               label=f"GNSS-IR raw arcs (+{offset_m:.3f}m offset)")
 
-    # Optional smoothed spline overlay, if available.
-    if spline_times is not None and spline_rh is not None:
-        spline_wl = H_ORTHO_M - spline_rh + offset_m
+    # Optional smoothed spline overlay, if available. spline_water_level
+    # is already Hortho - RH as computed by gnssrefl itself (see
+    # load_spline docstring) -- not recomputed here.
+    if spline_times is not None and spline_water_level is not None:
+        spline_wl = spline_water_level + offset_m
         ax1.plot(spline_times, spline_wl, "-", linewidth=1.5, color="darkorange",
                   label="GNSS-IR smoothed spline (subdaily, -knots 4)")
 
@@ -490,12 +517,12 @@ def main():
     # a spline exists, generates/regenerates it fresh each run (cheap
     # relative to the gnssir step above), and gracefully falls back
     # to raw-points-only if subdaily fails for any reason.
-    spline_times, spline_rh = None, None
+    spline_times, spline_water_level = None, None
     if not args.no_spline:
         spline_path = find_spline_file(args.station, refl_code_dir)
         ok = generate_spline(args.station, args.year, successes)
         if ok:
-            spline_times, spline_rh = load_spline(spline_path, args.year)
+            spline_times, spline_water_level = load_spline(spline_path, args.year)
             if spline_times is not None:
                 print(f"Spline loaded: {len(spline_times)} points from {spline_path}")
             else:
@@ -505,7 +532,7 @@ def main():
     print(f"Tide models used: {model_names}")
 
     plot_path = make_plot(rows, tide_times, tide_ensemble, offset_m, model_names,
-                            spline_times, spline_rh)
+                            spline_times, spline_water_level)
     csv_path = write_csv(rows, tide_at, offset_m)
 
     print()

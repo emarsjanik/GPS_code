@@ -1,0 +1,25 @@
+MARCONI LONG-TERM GNSS-R / TIDE PIPELINE V4
+============================================================================================
+
+GNSS-IR configuration: ocean17_23_l1_e5_13
+Primary tide model: EOT20_heightm
+Diagnostic offset: +0.242 m
+
+GOOD-track criteria:
+  observations >= 14
+  unique days   >= 14
+  tide r        >= 0.9
+  slope         = 0.85 to 1.15
+  unit RMS      <= 30.0 cm
+  azimuth SD    <= 1.0 deg
+  +24.2 cm is NOT used to select good tracks.
+
+Total clustered tracks: 34
+GOOD tracks: 0
+
+GOOD-TRACK POPULATION STATISTICS
+--------------------------------------------------------------------------------------------
+Mean bias                                   nan cm                  nan cm
+Mean absolute deviation                     nan cm                  nan cm
+Median absolute deviation                   nan cm                  nan cm
+RMS                                         nan cm                  nan cm

@@ -1,0 +1,77 @@
+MARCONI LONG-TERM GNSS-R / TIDE PIPELINE V8
+====================================================================================================
+
+Base directory: /home/argus_user/GNSS/v4.1
+REFL_CODE: /home/argus_user/GNSS/v4.1/products/refl_code
+Result directory: /home/argus_user/GNSS/v4.1/products/refl_code/2026/results/usgs/ocean17_23_l1_e5_13
+GNSS reference height: 18.665 m
+Diagnostic offset: +0.242 m
+
+GOOD-track criteria:
+  observations >= 14
+  unique days   >= 14
+  tide r        >= 0.9
+  slope         = 0.85 to 1.15
+  unit RMS      <= 30.0 cm
+  azimuth SD    <= 1.0 deg
+  +24.2 cm is NOT used to select good tracks.
+
+GNSS-R transformation:
+  GNSS-R water elevation = 18.665 m - RH
+
+Total GNSS-R observations loaded: 536
+GOOD tracks: 6
+GOOD observations: 115
+
+RAW
+---
+  observations             = 115
+  mean bias                = -20.111 cm
+  mean absolute deviation = 21.755 cm
+  median absolute deviation = 17.811 cm
+  RMS                      = 27.215 cm
+
+GNSS-R +0.242 m
+---------------
+  observations             = 115
+  mean bias                = 4.089 cm
+  mean absolute deviation = 15.772 cm
+  median absolute deviation = 12.896 cm
+  RMS                      = 18.786 cm
+
+TRACKS
+====================================================================================================
+ 1 SAT=12 rise= 1 N=  5 days=  5 Az= 133.23+/-0.02 r=+0.9777 slope=+0.6363 rawRMS=31.73cm BAD
+ 2 SAT= 9 rise=-1 N= 20 days= 20 Az=  35.01+/-0.01 r=+0.9775 slope=+1.0310 rawRMS=27.01cm GOOD
+ 3 SAT=25 rise=-1 N= 18 days= 18 Az=  47.61+/-0.01 r=+0.9761 slope=+0.8979 rawRMS=26.57cm GOOD
+ 4 SAT=29 rise= 1 N= 25 days= 25 Az= 113.00+/-0.02 r=+0.9745 slope=+0.9519 rawRMS=32.24cm NEAR-GOOD
+ 5 SAT= 9 rise= 1 N= 20 days= 20 Az= 124.45+/-0.03 r=+0.9742 slope=+1.0215 rawRMS=28.65cm GOOD
+ 6 SAT=29 rise=-1 N= 16 days= 16 Az=  33.33+/-0.01 r=+0.9721 slope=+0.9976 rawRMS=26.63cm GOOD
+ 7 SAT=13 rise=-1 N= 13 days= 13 Az=  38.84+/-0.03 r=+0.9684 slope=+0.8717 rawRMS=24.58cm BAD
+ 8 SAT=27 rise=-1 N= 18 days= 18 Az=  63.42+/-0.01 r=+0.9644 slope=+0.9208 rawRMS=36.10cm NEAR-GOOD
+ 9 SAT= 4 rise=-1 N= 18 days= 18 Az=  30.52+/-0.01 r=+0.9629 slope=+0.9156 rawRMS=28.98cm GOOD
+10 SAT= 8 rise=-1 N= 20 days= 20 Az=  83.42+/-0.09 r=+0.9596 slope=+1.0171 rawRMS=37.31cm NEAR-GOOD
+11 SAT=12 rise=-1 N= 23 days= 23 Az=  37.54+/-0.01 r=+0.9583 slope=+0.8733 rawRMS=25.53cm GOOD
+12 SAT=28 rise=-1 N= 18 days= 18 Az= 114.25+/-0.05 r=+0.9561 slope=+0.9674 rawRMS=30.89cm NEAR-GOOD
+13 SAT=30 rise= 1 N= 21 days= 21 Az= 102.97+/-0.01 r=+0.9463 slope=+0.9421 rawRMS=32.21cm NEAR-GOOD
+14 SAT= 5 rise=-1 N= 19 days= 19 Az= 117.30+/-0.10 r=+0.9419 slope=+0.8847 rawRMS=37.98cm NEAR-GOOD
+15 SAT=20 rise=-1 N= 22 days= 22 Az=  69.89+/-0.06 r=+0.9376 slope=+0.9273 rawRMS=41.05cm NEAR-GOOD
+16 SAT= 4 rise= 1 N= 20 days= 20 Az=  96.33+/-0.01 r=+0.9367 slope=+0.9034 rawRMS=34.08cm NEAR-GOOD
+17 SAT= 6 rise=-1 N= 21 days= 21 Az= 114.72+/-0.07 r=+0.9345 slope=+0.9793 rawRMS=39.50cm NEAR-GOOD
+18 SAT=31 rise=-1 N= 11 days= 11 Az= 127.07+/-0.05 r=+0.9334 slope=+1.0884 rawRMS=37.88cm BAD
+19 SAT= 2 rise=-1 N= 20 days= 20 Az=  52.88+/-0.03 r=+0.9321 slope=+0.9867 rawRMS=35.30cm NEAR-GOOD
+20 SAT=16 rise=-1 N= 18 days= 18 Az=  96.47+/-0.04 r=+0.9310 slope=+0.8633 rawRMS=40.09cm NEAR-GOOD
+21 SAT=24 rise=-1 N= 25 days= 25 Az=  57.25+/-0.03 r=+0.9267 slope=+0.8372 rawRMS=33.39cm NEAR-GOOD
+22 SAT= 3 rise=-1 N= 19 days= 19 Az=  37.17+/-0.03 r=+0.9231 slope=+0.8107 rawRMS=27.71cm NEAR-GOOD
+23 SAT=30 rise=-1 N= 19 days= 19 Az=  33.75+/-0.01 r=+0.9217 slope=+0.9210 rawRMS=41.63cm NEAR-GOOD
+24 SAT=21 rise=-1 N= 21 days= 21 Az=  92.86+/-0.09 r=+0.9089 slope=+0.9246 rawRMS=44.78cm NEAR-GOOD
+25 SAT=26 rise=-1 N= 17 days= 17 Az=  90.74+/-0.10 r=+0.8957 slope=+0.9088 rawRMS=40.62cm NEAR-GOOD
+26 SAT=15 rise=-1 N= 24 days= 24 Az=  93.24+/-0.10 r=+0.8934 slope=+0.8980 rawRMS=40.53cm NEAR-GOOD
+27 SAT= 1 rise=-1 N= 20 days= 20 Az=  56.25+/-0.04 r=+0.8903 slope=+0.9349 rawRMS=36.00cm NEAR-GOOD
+28 SAT=25 rise= 1 N=  3 days=  3 Az= 157.85+/-0.01 r=+0.3233 slope=+0.0512 rawRMS=35.26cm BAD
+29 SAT=19 rise=-1 N= 14 days= 14 Az= 148.96+/-0.09 r=+0.1945 slope=+0.0154 rawRMS=138.86cm BAD
+30 SAT=13 rise= 1 N=  3 days=  3 Az= 137.09+/-0.02 r=-0.2169 slope=-0.1160 rawRMS=38.29cm BAD
+31 SAT= 3 rise= 1 N=  2 days=  2 Az= 137.78+/-0.00 r=-1.0000 slope=-1.3866 rawRMS=17.91cm BAD
+32 SAT=11 rise=-1 N=  1 days=  1 Az= 133.44+/-0.00 r=+nan slope=+nan rawRMS=15.85cm BAD
+33 SAT=17 rise=-1 N=  1 days=  1 Az= 137.18+/-0.00 r=+nan slope=+nan rawRMS=70.37cm BAD
+34 SAT=32 rise=-1 N=  1 days=  1 Az= 147.73+/-0.00 r=+nan slope=+nan rawRMS=171.81cm BAD
