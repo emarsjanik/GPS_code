@@ -749,8 +749,8 @@ class GnssIrProcessor:
         # together, instead of mixing one explicit bound with an
         # unrelated default NReg that may not match it.
         if "h1" in kwargs and "h2" in kwargs:
-            kwargs["NReg"] = [kwargs["h1"], kwargs["h2"]]
-
+            kwargs["nr1"] = kwargs["h1"]
+            kwargs["nr2"] = kwargs["h2"]
         # Azimuth mask (gnssrefl's own param: azlist2 -- a list of
         # region boundaries, e.g. [0, 360] or [0, 150, 180, 360])
         azimuth_regions = station_section.get("gnssrefl_azimuth_regions")
