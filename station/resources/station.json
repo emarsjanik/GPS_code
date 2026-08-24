@@ -40,5 +40,8 @@
         0,
         173
     ],
-    "external_storage_path": "/mnt/I2Rgus_Data/GPS_Data"
+    "external_storage_path": "/mnt/I2Rgus_Data/GPS_Data",
+    "tide_model_file": "/home/argus_user/GNSS/v4.1/marconi_tides_sherwood.xlsx",
+    "tide_model_value_column": "EOT20_heightm",
+    "tide_model_time_column": "time"
 }

@@ -2,7 +2,7 @@
 
 Autonomous GNSS data logging, RINEX conversion, and GNSS-IR (interferometric reflectometry) processing built around a Unicore UM980 receiver.
 
-For a full, zero-background operator's guide (installation, daily operation, troubleshooting), see [`docs/USER_MANUAL.docx`](docs/USER_MANUAL.docx). This README is the technical quick-reference.
+**New to this project? Start with [`GNSS-IR_Quick_Setup_Guide.docx`](GNSS-IR_Quick_Setup_Guide.docx)** — a complete, no-prior-experience-required walkthrough from downloading this repository through your first real plot, with a labeled screenshot of every command's real output. This is the master setup document for this project; everything below is the technical quick-reference for once you're up and running. For more depth than the guide covers (every configuration option, advanced troubleshooting), see [`QUICKSTART.md`](QUICKSTART.md) and [`STATION_JSON_REFERENCE.md`](STATION_JSON_REFERENCE.md).
 
 ## Data flow
 
@@ -40,24 +40,26 @@ products/refl_code/<year>/results/<station>/<doy>.txt   reflector heights
 
 ## Quick start
 
+The three commands below are this project's master install/verify/run
+scripts — the same ones walked through step by step, with real
+example output, in [`GNSS-IR_Quick_Setup_Guide.docx`](GNSS-IR_Quick_Setup_Guide.docx).
+If you're setting this up for the first time, use that guide instead
+of this section; it also covers identifying your receiver's USB port
+and giving it a permanent name before you get here.
+
 ```bash
-git clone https://github.com/emarsjanik/GPS_code.git
-cd GPS_code
+git clone -b master-scripts https://github.com/emarsjanik/GPS_code.git ~/GNSS/v4.1
+cd ~/GNSS/v4.1
 
-python3.10 -m venv gnssrefl_venv
-source gnssrefl_venv/bin/activate
-pip install --upgrade pip
-pip install pyserial gnssrefl
+./install.sh              # checks/installs every dependency, sets up
+                           # the venv, and walks you through station.json
 
-# station/resources/station.json needs station_id, lat/lon/height,
-# receiver_port, gnssrefl_station_code, and gnssrefl_orbit_source
-# (see Configuration below) before anything will work correctly.
+./test_installation.sh    # confirms the whole setup actually works,
+                           # with a clear pass/fail for each check
 
-python check_layout.py
-python -m unittest discover -s tests -v
+./process_and_plot.sh     # converts new raw data, runs the GNSS-IR
+                           # analysis, and generates a plot
 ```
-
-Full, from-scratch installation instructions (including building Python 3.10 and RTKLIB from source, confirmed working on Ubuntu 20.04) are in the user manual, Chapter 10.
 
 ## Module map
 
@@ -90,6 +92,8 @@ All classes follow the same shape: `initialize()` (may raise on a real setup pro
 
 ## Configuration (`station/resources/station.json`)
 
+See [`STATION_JSON_REFERENCE.md`](STATION_JSON_REFERENCE.md) for the complete field-by-field reference. Summary of the most important fields:
+
 | Field | Purpose |
 |---|---|
 | `station_id`, `latitude`, `longitude`, `height` | Station identity and coordinates |
@@ -101,6 +105,7 @@ All classes follow the same shape: `initialize()` (may raise on a real setup pro
 | `gnssrefl_sample_rate` | Recording sample rate in seconds; must match the real `LOG ... ONTIME` interval |
 | `record_raw_chunk_seconds` | `StationManager` recording chunk size; 3600 (1h) default, 600 (10min) recommended for cron/systemd-managed deployments so stop/restart stay responsive |
 | `manager_retry_delay_seconds`, `health_check_interval_seconds` | `StationManager` tuning |
+| `tide_model_file`, `tide_model_value_column`, `tide_model_time_column` | Optional — enables automatic tide model comparison in `process_and_plot.sh` |
 
 ## Running
 
@@ -129,7 +134,7 @@ Crontab (used instead of systemd by choice — see commit history for the reason
 python -m unittest discover -s tests -v
 ```
 
-163 tests as of this writing, covering every module above with fake `Receiver`/`gnssrefl`/`Pipeline` stand-ins — no real hardware or `gnssrefl` install required to run the suite. All fakes are installed via `sys.modules` injection rather than mocking library internals, so the real integration code paths are exercised, not bypassed.
+222 tests as of this writing, covering every module above with fake `Receiver`/`gnssrefl`/`Pipeline` stand-ins — no real hardware or `gnssrefl` install required to run the suite. All fakes are installed via `sys.modules` injection rather than mocking library internals, so the real integration code paths are exercised, not bypassed. `./test_installation.sh` runs this same suite as part of a broader, beginner-friendly pass/fail check of the whole setup.
 
 ```bash
 python check_layout.py
@@ -154,12 +159,10 @@ None of the above are tracked in git (see `.gitignore`) — they're all generate
 
 - NUC (Ubuntu 20.04.6 LTS), shared with an unrelated I2R I2RGUS coastal camera system on the same machine
 - ArduSimple SimpleRTK3B Budget receiver board (Unicore UM980 chip) — BeiDou/Galileo/GLONASS/GPS/NavIC/QZSS/SBAS
-- ArduSimple budget tripleband GNSS antenna — 5 dBi, built-in LNA, IP66
-
-Full specifications: user manual, Chapter 2.
+- ArduSimple budget tripleband GNSS antenna (DigiKey 3619-AS-ANT3B-BUDSUR-L1L2L5-25SMA-ND) — 5 dBi, built-in LNA, IP66
 
 ## Known open items
 
 - RINEX/product retention policy in `pipeline.py` is unimplemented — currently nothing prunes `rinex/`, `products/`, or `archive/` over time
-- `convbin` build source lives at `~/software/RTKLIB/` on the deployed station (not in this repo) — see user manual Chapter 10 for build steps
+- `convbin` build source lives at `~/software/RTKLIB/` on the deployed station (not in this repo) — see `install.sh`, which builds it fresh from the current `rtklibexplorer/RTKLIB` main branch
 - BeiDou/Galileo ephemeris logging works but hasn't been observed within short test windows; needs a longer recording to confirm reliably

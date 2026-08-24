@@ -197,6 +197,20 @@ through north: `[353, 360, 0, 173]` analyzes 353°–360° and 0°–173°
 
 ---
 
+## Tide model comparison (optional)
+
+If configured, `process_and_plot.sh` automatically generates a comparison
+plot and agreement statistics (correlation, mean deviation) against an
+independent tide model every time it runs. Set up during `./install.sh`
+(which reads the real column headers from your file and lets you pick
+one, rather than asking you to type a column name blind), or by hand.
+
+| Field | Type | Required? | Description |
+|---|---|---|---|
+| `tide_model_file` | string (path) | Optional | Full path to an `.xlsx` file with a timestamp column and one or more tide-height columns. Leave unset (or omit entirely) to disable this feature completely -- most sites won't have one, and that's fine. |
+| `tide_model_value_column` | string | Required if `tide_model_file` is set | The column name containing the tide height values to compare against, e.g. `"EOT20_heightm"`. A single file may have several candidate columns (one per tide model); pick whichever is most appropriate for your site. |
+| `tide_model_time_column` | string | Optional | The column name containing timestamps. Default `"time"`. |
+
 ## External storage (optional)
 
 | Field | Type | Description |

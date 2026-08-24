@@ -314,6 +314,73 @@ else
 fi
 
 # ----------------------------------------------------------------
+# Step 5: tide model comparison (optional -- only if configured)
+# ----------------------------------------------------------------
+
+section "Step 5: Tide model comparison (optional)"
+
+TIDE_FILE=$(python3 -c "
+import json
+d = json.load(open('$STATION_JSON'))
+print(d.get('tide_model_file', ''))
+" 2>/dev/null)
+
+if [ -z "$TIDE_FILE" ]; then
+    echo "  No tide model configured for this station -- skipping."
+    echo "  (Set this up any time by re-running the tide model step in"
+    echo "  ./install.sh, or by hand -- see STATION_JSON_REFERENCE.md.)"
+elif [ ! -f "$TIDE_FILE" ]; then
+    echo "  A tide model is configured (\"$TIDE_FILE\") but that file"
+    echo "  no longer exists at that location -- skipping this step."
+    echo "  Check the path, or re-configure it via ./install.sh."
+else
+    TIDE_VALUE_COL=$(python3 -c "
+import json
+d = json.load(open('$STATION_JSON'))
+print(d.get('tide_model_value_column', ''))
+" 2>/dev/null)
+    TIDE_TIME_COL=$(python3 -c "
+import json
+d = json.load(open('$STATION_JSON'))
+print(d.get('tide_model_time_column', 'time'))
+" 2>/dev/null)
+
+    SPLINE_FILE="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
+
+    if [ ! -f "$SPLINE_FILE" ]; then
+        echo "  No spline output found to compare against (Step 4 may not"
+        echo "  have completed successfully) -- skipping this step."
+    else
+        echo "  Comparing against: $TIDE_FILE (column: $TIDE_VALUE_COL)"
+        echo ""
+
+        TIDE_PLOT_OUTPUT="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_vs_tide.png"
+
+        python3 "$PROJECT_DIR/plot_gnssir_vs_tide.py" \
+            --spline-file "$SPLINE_FILE" \
+            --tide-file "$TIDE_FILE" \
+            --tide-time-col "$TIDE_TIME_COL" \
+            --tide-value-col "$TIDE_VALUE_COL" \
+            --output "$TIDE_PLOT_OUTPUT"
+        plot_exit=$?
+
+        echo ""
+
+        python3 "$PROJECT_DIR/compare_to_tide_deviation.py" \
+            --spline-file "$SPLINE_FILE" \
+            --tide-file "$TIDE_FILE" \
+            --tide-time-col "$TIDE_TIME_COL" \
+            --tide-value-col "$TIDE_VALUE_COL"
+        compare_exit=$?
+
+        if [ "$plot_exit" -ne 0 ] || [ "$compare_exit" -ne 0 ]; then
+            echo ""
+            echo "  Tide comparison reported a problem -- see the output above."
+        fi
+    fi
+fi
+
+# ----------------------------------------------------------------
 # Done
 # ----------------------------------------------------------------
 
@@ -322,6 +389,9 @@ section "Done"
 echo "Summary:"
 echo "  Results available for days $min_day-$max_day ($day_count day(s))"
 echo "  Plots directory: $REFL_CODE/Files/$STATION_CODE"
+if [ -n "$TIDE_FILE" ] && [ -f "$TIDE_FILE" ]; then
+    echo "  Tide comparison plot: $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_vs_tide.png"
+fi
 echo ""
 echo "To check whether an apparent signal is real (not an artifact),"
 echo "see ./validate_station.py."

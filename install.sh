@@ -381,6 +381,108 @@ else
 fi
 
 # ----------------------------------------------------------------
+# Step 6: optional tide model, for stations that have one
+# ----------------------------------------------------------------
+
+section "Step 6: Tide model (optional)"
+
+echo "  If you have an independent tide model for your site (e.g. an"
+echo "  .xlsx file with a time column and one or more tide-height"
+echo "  columns), process_and_plot.sh can automatically generate an"
+echo "  overlay plot and agreement statistics comparing your real"
+echo "  GNSS-IR results against it, every time you run it."
+echo ""
+echo "  This is entirely optional -- most sites won't have one, and"
+echo "  skipping this is completely fine."
+echo ""
+
+if confirm "  Do you have a tide model file you'd like to use?"; then
+    tide_file=""
+    while true; do
+        read -rp "  Full path to the tide model file: " tide_file
+        if [ -f "$tide_file" ]; then
+            break
+        else
+            warn "File not found: $tide_file"
+        fi
+    done
+
+    # Reads the real, actual column headers from the file the user
+    # just gave us, rather than asking them to type a column name
+    # blind -- confirmed real files in this project have several
+    # candidate columns (e.g. one per tide model: EOT20, GOT5.5,
+    # FES2022, ...), so guessing the right one isn't realistic.
+    columns_json=$(python3 -c "
+import json
+try:
+    from openpyxl import load_workbook
+    wb = load_workbook('$tide_file', read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    header = [c.value for c in next(ws.iter_rows(max_row=1))]
+    header = [h for h in header if h is not None]
+    print(json.dumps(header))
+except Exception as e:
+    print(json.dumps({'error': str(e)}))
+")
+
+    if echo "$columns_json" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if isinstance(d, list) else 1)" 2>/dev/null; then
+        echo ""
+        echo "  Found these columns in $tide_file:"
+        echo "$columns_json" | python3 -c "
+import json, sys
+cols = json.load(sys.stdin)
+for i, c in enumerate(cols, 1):
+    print(f'    {i}. {c}')
+"
+        echo ""
+        tide_value_col=""
+        while true; do
+            read -rp "  Which column has the tide height values you want to use? " choice
+            tide_value_col=$(echo "$columns_json" | python3 -c "
+import json, sys
+cols = json.load(sys.stdin)
+choice = '''$choice'''.strip()
+if choice.isdigit() and 1 <= int(choice) <= len(cols):
+    print(cols[int(choice) - 1])
+elif choice in cols:
+    print(choice)
+" 2>/dev/null)
+            if [ -n "$tide_value_col" ]; then
+                break
+            else
+                warn "Not a valid column number or name -- try again."
+            fi
+        done
+
+        tide_time_col=""
+        read -rp "  Which column has the timestamps? [time]: " tide_time_col
+        [ -z "$tide_time_col" ] && tide_time_col="time"
+
+        python3 -c "
+import json
+path = '$STATION_JSON'
+with open(path) as f:
+    d = json.load(f)
+d['tide_model_file'] = '$tide_file'
+d['tide_model_value_column'] = '''$tide_value_col'''
+d['tide_model_time_column'] = '''$tide_time_col'''
+with open(path, 'w') as f:
+    json.dump(d, f, indent=4)
+"
+        ok "Tide model configured: $tide_file (column: $tide_value_col)"
+        echo "  process_and_plot.sh will now generate a tide comparison"
+        echo "  automatically every time it runs."
+    else
+        fail "Could not read columns from that file -- is it a valid .xlsx?"
+        echo "  Skipping tide model setup. You can configure this later by"
+        echo "  hand -- see STATION_JSON_REFERENCE.md."
+    fi
+else
+    info "Skipping -- no tide model configured. You can add one later by"
+    info "re-running this step, or by hand -- see STATION_JSON_REFERENCE.md."
+fi
+
+# ----------------------------------------------------------------
 # Done
 # ----------------------------------------------------------------
 
