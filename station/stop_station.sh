@@ -21,7 +21,14 @@
 
 set -euo pipefail
 
-PIDFILE="/home/argus_user/GNSS/v4.1/logs/station_manager.pid"
+# Derived from this script's own location, matching
+# start_station.sh -- previously hardcoded to one machine's home
+# directory, so stopping the station silently did nothing for anyone
+# who installed elsewhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+PIDFILE="$PROJECT_DIR/logs/station_manager.pid"
 MAX_WAIT_SECONDS=3700  # must exceed record_raw_chunk_seconds; see station.json
 
 if [ ! -f "$PIDFILE" ]; then

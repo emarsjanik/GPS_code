@@ -18,11 +18,22 @@
 
 set -euo pipefail
 
-VENV_PYTHON="/home/argus_user/GNSS/v4.1/gnssrefl_venv/bin/python3.10"
-SCRIPT="/home/argus_user/GNSS/v4.1/station/station_manager.py"
-WORKDIR="/home/argus_user/GNSS/v4.1/station"
-PIDFILE="/home/argus_user/GNSS/v4.1/logs/station_manager.pid"
-LOGFILE="/home/argus_user/GNSS/v4.1/logs/station_manager.out"
+# Derived from this script's own location (station/), so this works
+# from any install path and any username -- these were previously
+# hardcoded to one specific machine's home directory, which silently
+# broke continuous operation for anyone who installed elsewhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# The venv's python: prefer whatever version is actually present
+# rather than assuming python3.10 specifically.
+VENV_PYTHON="$(ls "$PROJECT_DIR"/gnssrefl_venv/bin/python3* 2>/dev/null | head -1)"
+[ -z "$VENV_PYTHON" ] && VENV_PYTHON="$PROJECT_DIR/gnssrefl_venv/bin/python3"
+
+SCRIPT="$PROJECT_DIR/station/station_manager.py"
+WORKDIR="$PROJECT_DIR/station"
+PIDFILE="$PROJECT_DIR/logs/station_manager.pid"
+LOGFILE="$PROJECT_DIR/logs/station_manager.out"
 
 mkdir -p "$(dirname "$PIDFILE")"
 
