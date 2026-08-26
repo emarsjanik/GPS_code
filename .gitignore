@@ -54,3 +54,7 @@ Thumbs.db
 # station's real coordinates to everyone else silently produces
 # confident-looking, physically meaningless results.
 station/resources/station.json
+
+# One-off, station-specific admin scripts (kept outside the repo)
+nuc_cleanup.sh
+nuc_cleanup_round2.sh
