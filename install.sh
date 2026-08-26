@@ -362,14 +362,23 @@ section "Step 5: Station configuration"
 
 STATION_JSON="$PROJECT_DIR/station/resources/station.json"
 
+STATION_TEMPLATE="$PROJECT_DIR/station/resources/station.json.template"
+
+# Confirmed, real trap this avoids: this project previously shipped a
+# real, fully-populated station.json in the repository. A new user
+# cloning it inherited another station's actual coordinates, antenna
+# height, and site-specific tuning -- and because this step only
+# offered to re-run the wizard (defaulting to "no"), pressing Enter
+# silently kept all of it. Every downstream check then passed, and
+# the resulting plots looked entirely plausible while being
+# physically meaningless. The repository now ships only a template;
+# a real station.json is created here, by the wizard, from the
+# user's own answers.
 if [ -f "$STATION_JSON" ]; then
     ok "station.json already exists at $STATION_JSON"
     echo ""
-    if confirm "  Re-run the configuration wizard anyway (e.g. to change settings)?"; then
-        bash "$PROJECT_DIR/setup_station.sh"
-    else
-        info "Keeping existing configuration."
-    fi
+    echo "  Your existing configuration will be kept as-is."
+    echo "  To change any setting, run ./setup_station.sh at any time."
 else
     echo "  No station.json found yet. This is where you'll enter your"
     echo "  station's identity, receiver settings, and location --"

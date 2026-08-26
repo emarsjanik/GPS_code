@@ -1,0 +1,35 @@
+# Python dependencies for the GNSS-IR reference station.
+#
+# ./install.sh installs these automatically into a project-local
+# virtual environment (gnssrefl_venv/) -- you normally do not need to
+# run pip yourself. This file exists so the dependency list is
+# visible and auditable in one place rather than only living inside
+# the installer, and so a manual/offline install is possible:
+#
+#     source gnssrefl_venv/bin/activate
+#     pip install -r requirements.txt
+#
+# Not listed here (installed outside pip by ./install.sh):
+#   - RTKLIB's convbin, built from source from rtklibexplorer/RTKLIB.
+#     The version in Ubuntu's apt repositories is a DIFFERENT fork
+#     without the Unicore/UM980 support this project needs.
+
+# The GNSS-IR analysis engine this whole project wraps.
+gnssrefl
+
+# Serial communication with the receiver.
+pyserial
+
+# Reflection-zone KML output (validate_station.py).
+simplekml
+
+# Reading .xlsx tide model files (optional tide comparison).
+openpyxl
+
+# Numerics for the comparison/analysis tooling.
+numpy
+
+# Plotting. Also pulled in by gnssrefl itself, listed explicitly
+# because this project's own analysis_tools/ scripts import it
+# directly.
+matplotlib

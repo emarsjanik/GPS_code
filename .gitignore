@@ -48,3 +48,9 @@ Thumbs.db
 # (its real output belongs under products/refl_code/<year>/, never
 # here). Anchored to the repo root only, matches any 4-digit year.
 /[0-9][0-9][0-9][0-9]/
+
+# A real station.json is created by ./setup_station.sh from the
+# user's own answers. Only the template is tracked -- shipping one
+# station's real coordinates to everyone else silently produces
+# confident-looking, physically meaningless results.
+station/resources/station.json

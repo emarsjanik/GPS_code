@@ -356,7 +356,7 @@ print(d.get('tide_model_time_column', 'time'))
 
         TIDE_PLOT_OUTPUT="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_vs_tide.png"
 
-        python3 "$PROJECT_DIR/plot_gnssir_vs_tide.py" \
+        python3 "$PROJECT_DIR/analysis_tools/plot_gnssir_vs_tide.py" \
             --spline-file "$SPLINE_FILE" \
             --tide-file "$TIDE_FILE" \
             --tide-time-col "$TIDE_TIME_COL" \
@@ -366,7 +366,7 @@ print(d.get('tide_model_time_column', 'time'))
 
         echo ""
 
-        python3 "$PROJECT_DIR/compare_to_tide_deviation.py" \
+        python3 "$PROJECT_DIR/analysis_tools/compare_to_tide_deviation.py" \
             --spline-file "$SPLINE_FILE" \
             --tide-file "$TIDE_FILE" \
             --tide-time-col "$TIDE_TIME_COL" \

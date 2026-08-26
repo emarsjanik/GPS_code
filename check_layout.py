@@ -68,7 +68,7 @@ REQUIRED_DIRECTORIES = [
 ]
 
 REQUIRED_RESOURCE_FILES = [
-    "station/resources/station.json",
+    "station/resources/station.json.template",
 ]
 
 

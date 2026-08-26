@@ -18,7 +18,15 @@
 
 set -uo pipefail
 
-STATION_JSON="$HOME/GNSS/v4.1/station/resources/station.json"
+# Confirmed, real portability bug this fixes: this path was
+# previously hardcoded to $HOME/GNSS/v4.1, so a user who cloned this
+# project anywhere else had their configuration written to a
+# directory with no relation to their actual install -- silently,
+# with no warning, leaving the real install with no config at all.
+# Every other script in this project computes its paths relative to
+# its own file location; this one now does too.
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATION_JSON="$PROJECT_DIR/station/resources/station.json"
 
 prompt() {
     local question="$1"
