@@ -1,0 +1,49 @@
+# archive.conf.template
+#
+# Deployment-specific settings for the RINEX archiving and timeseries
+# upload scripts. Copy this to archive.conf and edit:
+#
+#     cp archive.conf.template archive.conf
+#     nano archive.conf
+#
+# archive.conf is gitignored, so your bucket name, paths, and station
+# code never reach the repository -- the scripts themselves stay
+# identical for every deployment.
+#
+# If archive.conf is absent, the scripts that need it will say so and
+# exit rather than guessing.
+
+# ---------------------------------------------------------------
+# S3 destination
+# ---------------------------------------------------------------
+# Base prefix under which rinex/, timeseries/, and products/ live.
+# No trailing slash.
+S3_BASE="s3://your-bucket/path/to/station/GPS"
+
+# ---------------------------------------------------------------
+# Station
+# ---------------------------------------------------------------
+# The 4-character gnssrefl station code -- the same value as
+# gnssrefl_station_code in station/resources/station.json, and the
+# name of the directory gnssrefl writes its results into.
+STATION_CODE="xxxx"
+
+# ---------------------------------------------------------------
+# Local paths
+# ---------------------------------------------------------------
+# Absolute path to this project. Most scripts derive this from their
+# own location and ignore this setting; it exists for the few that
+# are invoked in contexts where that is not reliable.
+PROJECT_DIR="$HOME/GNSS/v4.1"
+
+# Path to the aws CLI. Left explicit because cron runs with a
+# minimal PATH that often does not include /usr/local/bin.
+AWS_CLI="/usr/local/bin/aws"
+
+# ---------------------------------------------------------------
+# Retention
+# ---------------------------------------------------------------
+# How many days of compressed RINEX to keep on local disk before
+# prune_local_rinex.sh removes them (only ever after verifying the
+# S3 copy by checksum).
+KEEP_DAYS=30

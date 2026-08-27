@@ -58,3 +58,7 @@ station/resources/station.json
 # One-off, station-specific admin scripts (kept outside the repo)
 nuc_cleanup.sh
 nuc_cleanup_round2.sh
+
+# Per-deployment settings (bucket, station code, paths). Only the
+# template is tracked -- see archive.conf.template.
+archive.conf

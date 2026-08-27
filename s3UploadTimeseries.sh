@@ -35,12 +35,39 @@
 
 set -uo pipefail
 
-PROJECT_DIR="/home/argus_user/GNSS/v4.1"
-PRODUCTS_DIR="$PROJECT_DIR/products/refl_code/Files/usgs"
+# ---------------------------------------------------------------
+# Deployment settings. See archive.conf.template.
+#
+# Kept out of this script (and out of git) so the bucket name,
+# paths, and station code are per-deployment rather than baked into
+# shared code.
+# ---------------------------------------------------------------
+CONF_FILE="${ARCHIVE_CONF:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/archive.conf}"
+if [ ! -f "$CONF_FILE" ]; then
+    echo "Configuration not found: $CONF_FILE"
+    echo ""
+    echo "Create it from the template:"
+    echo "    cp archive.conf.template archive.conf"
+    echo "    nano archive.conf"
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$CONF_FILE"
+
+for _required in S3_BASE STATION_CODE; do
+    if [ -z "${!_required:-}" ]; then
+        echo "$_required is not set in $CONF_FILE"
+        exit 1
+    fi
+done
+AWS_CLI="${AWS_CLI:-/usr/local/bin/aws}"
+
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PRODUCTS_DIR="$PROJECT_DIR/products/refl_code/Files/$STATION_CODE"
 FILTER_SCRIPT="$PROJECT_DIR/filter_month.py"
-S3_BASE="s3://cmgp-coastcam/cameras/caco-05/GPS/timeseries"
-AWS="/usr/local/bin/aws"
-STATION_CODE="usgs"
+S3_TIMESERIES="$S3_BASE/timeseries"
+AWS="$AWS_CLI"
+
 
 # Tide comparison is optional -- read from station.json so this
 # stays correct if the configuration changes.
@@ -137,7 +164,7 @@ for period in "${periods[@]}"; do
     for f in "$tmpdir"/*; do
         [ -f "$f" ] || continue
         name=$(basename "$f")
-        if "$AWS" s3 cp "$f" "$S3_BASE/$label/$name" --quiet 2>/dev/null; then
+        if "$AWS" s3 cp "$f" "$S3_TIMESERIES/$label/$name" --quiet 2>/dev/null; then
             echo "  upload: $label/$name"
             uploaded_count=$((uploaded_count + 1))
         else

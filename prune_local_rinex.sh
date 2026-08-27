@@ -37,10 +37,37 @@
 
 set -uo pipefail
 
+# ---------------------------------------------------------------
+# Deployment settings. See archive.conf.template.
+#
+# Kept out of this script (and out of git) so the bucket name,
+# paths, and station code are per-deployment rather than baked into
+# shared code.
+# ---------------------------------------------------------------
+CONF_FILE="${ARCHIVE_CONF:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/archive.conf}"
+if [ ! -f "$CONF_FILE" ]; then
+    echo "Configuration not found: $CONF_FILE"
+    echo ""
+    echo "Create it from the template:"
+    echo "    cp archive.conf.template archive.conf"
+    echo "    nano archive.conf"
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$CONF_FILE"
+
+for _required in S3_BASE STATION_CODE; do
+    if [ -z "${!_required:-}" ]; then
+        echo "$_required is not set in $CONF_FILE"
+        exit 1
+    fi
+done
+AWS_CLI="${AWS_CLI:-/usr/local/bin/aws}"
+
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RINEX_DIR="$PROJECT_DIR/rinex"
-S3_PREFIX="s3://cmgp-coastcam/cameras/caco-05/GPS/rinex"
-AWS="/usr/local/bin/aws"
+S3_PREFIX="$S3_BASE/rinex"
+AWS="$AWS_CLI"
 
 KEEP_DAYS=30
 EXECUTE=false
