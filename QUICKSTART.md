@@ -1,12 +1,21 @@
 # Quickstart: GNSS-IR Reference Station
 
-This guide walks you through setting up a working GNSS-IR (GNSS
-Interferometric Reflectometry) reference station from a completely bare
-machine to your first real plot, with no prior experience assumed.
+**If you are setting up a station for the first time, start with
+[`GNSS-IR_Quick_Setup_Guide.docx`](GNSS-IR_Quick_Setup_Guide.docx)**, not
+this file. That guide is a short, illustrated walkthrough of the three
+commands that get you from a fresh clone to your first plot, with a
+screenshot of what each one should print.
 
-GNSS-IR uses the same signals a regular GPS receiver already gets from
-satellites, but analyzes how they *reflect* off a nearby surface (water,
-soil, snow) before reaching the antenna. That reflection shows up as a
+This document covers the same ground in more depth, and continues past
+where the guide stops: recording data, checking whether your results are
+scientifically meaningful, and running the station continuously and
+unattended. Read the guide first, then come here when you want detail.
+
+GNSS-IR (GNSS Interferometric Reflectometry) uses the same signals a
+regular GPS receiver already gets from satellites, but analyzes how they
+*reflect* off a nearby surface before reaching the antenna.
+
+That reflection -- off water, soil, or snow -- shows up as a
 subtle interference pattern in the raw signal strength data, and from that
 pattern, this software can work out how far below the antenna the
 reflecting surface is — and therefore, over time, how that distance
@@ -34,7 +43,25 @@ reflecting surface is — and therefore, over time, how that distance
 
 ---
 
+## Step 0: Get the code
+
+If you have not already downloaded this project:
+
+```bash
+git clone -b master-scripts https://github.com/emarsjanik/GPS_code.git ~/GNSS/v4.1
+cd ~/GNSS/v4.1
+```
+
+The `master-scripts` branch is the clean, focused version intended for
+running a station. Every command below assumes you are in that directory.
+
 ## Step 1: Install everything
+
+> **Do Step 3 first if your receiver is not yet connected and named.**
+> The setup wizard that runs at the end of this step asks for your
+> receiver's serial port, which you cannot answer until the receiver is
+> plugged in and has a stable device name. The illustrated guide covers
+> these in the right order.
 
 From the project directory:
 
