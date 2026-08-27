@@ -143,29 +143,71 @@ else
     if python3 -c "import json; json.load(open('$STATION_JSON'))" >/dev/null 2>&1; then
         report_pass "station.json exists and is valid JSON"
 
-        station_id=$(python3 -c "import json; print(json.load(open('$STATION_JSON')).get('station_id', ''))" 2>/dev/null)
-        latitude=$(python3 -c "import json; print(json.load(open('$STATION_JSON')).get('latitude', ''))" 2>/dev/null)
-        longitude=$(python3 -c "import json; print(json.load(open('$STATION_JSON')).get('longitude', ''))" 2>/dev/null)
+        # Consolidated configuration check. Emits one "STATUS message"
+        # line per finding; FAIL is used for anything that would
+        # silently produce confident-looking but physically
+        # meaningless results, rather than an error the user would
+        # notice on their own.
+        _check_station_config=$(python3 - "$STATION_JSON" <<'PYCHECK'
+import json
+import sys
 
-        if [ -z "$station_id" ]; then
-            report_warn "station_id is empty in station.json"
-        else
-            report_pass "station_id: $station_id"
-        fi
+path = sys.argv[1]
+try:
+    d = json.load(open(path))
+except Exception as exc:
+    print(f"FAIL Could not read station.json: {exc}")
+    sys.exit(0)
 
-        if [ -z "$latitude" ] || [ "$latitude" = "0.0" ] || [ "$latitude" = "0" ]; then
-            report_warn "latitude looks unset (0.0) -- GNSS-IR results will be"
-            echo "         meaningless until this is set to your station's"
-            echo "         real coordinates."
-        else
-            report_pass "latitude: $latitude"
-        fi
+PLACEHOLDERS = {"CHANGEME", "", None}
 
-        if [ -z "$longitude" ] || [ "$longitude" = "0.0" ] || [ "$longitude" = "0" ]; then
-            report_warn "longitude looks unset (0.0) -- see latitude note above."
-        else
-            report_pass "longitude: $longitude"
-        fi
+station_id = d.get("station_id")
+if station_id in PLACEHOLDERS:
+    print("FAIL station_id is not set (still a placeholder). Run ./setup_station.sh")
+else:
+    print(f"PASS station_id: {station_id}")
+
+for field in ("latitude", "longitude"):
+    v = d.get(field)
+    if v is None:
+        print(f"FAIL {field} is not set. GNSS-IR cannot produce meaningful "
+              f"results without your station's real coordinates. Run ./setup_station.sh")
+    elif isinstance(v, (int, float)) and float(v) == 0.0:
+        print(f"FAIL {field} is 0.0, which is a placeholder rather than a real "
+              f"position (0,0 is open ocean off West Africa). Run ./setup_station.sh")
+    else:
+        print(f"PASS {field}: {v}")
+
+height = d.get("height")
+if height is None:
+    print("FAIL height is not set. This must be your antenna's ELLIPSOIDAL "
+          "(WGS84) height in meters, not orthometric/MSL. Run ./setup_station.sh")
+else:
+    print(f"PASS height: {height} m (ellipsoidal)")
+
+rh_min = d.get("gnssrefl_reflector_height_min")
+rh_max = d.get("gnssrefl_reflector_height_max")
+if rh_min is None or rh_max is None:
+    print("FAIL gnssrefl_reflector_height_min/max are not set. Without these, "
+          "gnssrefl searches its own default range (roughly 0.5-8m), which only "
+          "finds a surface within a few meters BELOW the antenna -- wrong for any "
+          "antenna mounted higher than that, and it fails silently. "
+          "Run ./setup_station.sh, or see STATION_JSON_REFERENCE.md")
+else:
+    print(f"PASS reflector height search range: {rh_min}-{rh_max} m")
+PYCHECK
+)
+
+        while IFS= read -r finding; do
+            [ -z "$finding" ] && continue
+            status="${finding%% *}"
+            message="${finding#* }"
+            case "$status" in
+                PASS) report_pass "$message" ;;
+                WARN) report_warn "$message" ;;
+                FAIL) report_fail "$message" ;;
+            esac
+        done <<< "$_check_station_config"
 
         # Confirmed, real gap this check exists to catch: a real
         # multi-hour investigation was needed to discover that this
