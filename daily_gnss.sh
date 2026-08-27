@@ -39,6 +39,17 @@
 #   ./daily_gnss.sh              (process, then upload)
 #   ./daily_gnss.sh --no-upload  (process only)
 
+
+# ---------------------------------------------------------------
+# Explicit PATH.
+#
+# cron runs with PATH=/usr/bin:/bin, which does not include
+# /usr/local/bin where convbin is installed. Without this, RINEX
+# conversion silently reports NOT_READY and the station manager
+# stops processing -- confirmed to have happened here for five days
+# before anyone noticed, because nothing visibly broke.
+# ---------------------------------------------------------------
+export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin${PATH:+:$PATH}"
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

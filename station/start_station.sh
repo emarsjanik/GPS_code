@@ -16,6 +16,17 @@
 # Restart=on-failure, without ever risking two overlapping instances
 # fighting over the same serial port.
 
+
+# ---------------------------------------------------------------
+# Explicit PATH.
+#
+# cron runs with PATH=/usr/bin:/bin, which does not include
+# /usr/local/bin where convbin is installed. Without this, RINEX
+# conversion silently reports NOT_READY and the station manager
+# stops processing -- confirmed to have happened here for five days
+# before anyone noticed, because nothing visibly broke.
+# ---------------------------------------------------------------
+export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin${PATH:+:$PATH}"
 set -euo pipefail
 
 # Derived from this script's own location (station/), so this works
