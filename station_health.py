@@ -79,6 +79,94 @@ def parse_ts(value: str) -> datetime | None:
 # ------------------------------------------------------------------
 # 1. Errors the station recorded but nobody read
 # ------------------------------------------------------------------
+def _normalize_message(text: str) -> str:
+    """
+    Collapses a log message to its shape, so that the same problem
+    affecting different files or days groups as one finding.
+
+        "Raw file does not exist: /path/station_20260722.um980"
+        "Raw file does not exist: /path/station_20260723.um980"
+            -> "Raw file does not exist: <PATH>"
+
+    Deliberately conservative: it removes only paths, filenames,
+    dates and bare numbers. Two genuinely different failures should
+    never collapse into one, since hiding a real problem is far
+    worse than listing one twice.
+    """
+    if not text:
+        return ""
+    t = text.strip()
+    t = re.sub(r"/[^\s:,]+", "<PATH>", t)          # absolute paths
+    t = re.sub(r"\b\d{8}\b", "<DATE>", t)           # YYYYMMDD
+    t = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "<DATE>", t)
+    t = re.sub(r"\b\d+\b", "<N>", t)               # any remaining number
+    return t[:200]
+
+
+def _is_future_day_message(text: str) -> bool:
+    """
+    True when a message complains about a day that has not finished
+    recording yet.
+
+    gnssir reports "No results file produced: .../<doy>.txt" for a
+    day it has no complete data for, which is correct behaviour, not
+    a failure -- the day simply has not happened. Because processing
+    runs nightly, this would otherwise generate a FAIL every single
+    morning, and a monitor that cries wolf daily stops being read
+    shortly before the morning it says something true.
+    """
+    if not text or "No results file produced" not in text:
+        return False
+    m = re.search(r"/(\d{1,3})\.txt", text)
+    if not m:
+        return False
+    doy = int(m.group(1))
+    today_doy = int(utcnow().strftime("%j"))
+    # Today and yesterday are both legitimately incomplete: yesterday's
+    # UTC day only closes at 00:00 today, and is processed that evening.
+    return doy >= today_doy - 1
+
+
+def _failure_since_resolved(text: str) -> bool:
+    """
+    True when a logged failure named a specific artefact that now
+    exists -- i.e. the failure was transient and a later attempt
+    succeeded.
+
+    Only messages naming a checkable output qualify. A failure with
+    no verifiable artefact (a crash, a lost connection, a permission
+    error) is never suppressed by this, because there is no evidence
+    it resolved and staying quiet would be a guess rather than an
+    observation.
+
+    Archived RINEX counts as present: compress_rinex.sh replaces a
+    day's .obs/.nav pair with a single .tar.gz once processing is
+    done, so the original file being absent is the expected end
+    state, not a missing output.
+    """
+    if not text:
+        return False
+
+    for marker in ("No results file produced:",
+                   "observation file was not created:"):
+        if marker in text:
+            candidate = text.split(marker, 1)[1].strip().split()[0]
+            p = Path(candidate)
+            if p.exists():
+                return True
+            # A processed day's RINEX is replaced by its archive.
+            if p.suffix in (".obs", ".nav"):
+                archive = p.with_suffix(".tar.gz")
+                if archive.exists():
+                    return True
+                stem_archive = p.parent / (p.stem + ".tar.gz")
+                if stem_archive.exists():
+                    return True
+            return False
+
+    return False
+
+
 def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
     cutoff = utcnow() - timedelta(days=days)
 
@@ -90,20 +178,36 @@ def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
     recent = []
     for ts, module, severity, description, recovered in rows:
         dt = parse_ts(ts)
-        if dt and dt >= cutoff:
-            recent.append((dt, module, severity, description or "", recovered))
+        if not (dt and dt >= cutoff):
+            continue
+        # Not a failure: the day has not finished recording yet.
+        if _is_future_day_message(description or ""):
+            continue
+        # Not worth reporting: it failed then, but a later attempt
+        # succeeded and the output exists now.
+        if _failure_since_resolved(description or ""):
+            continue
+        recent.append((dt, module, severity, description or "", recovered))
 
     if not recent:
         record(OK, "errors", f"No errors logged in the last {days} day(s)")
         return
 
-    # Group identical messages -- five days of the same failure is one
+    # Group related messages -- five days of the same failure is one
     # problem, not five, and reading it as five obscures that it is
     # ongoing rather than transient.
+    #
+    # Grouping on the raw text was not enough: six stale queue
+    # entries produced six separate findings because each message
+    # named a different file. Normalizing paths, dates and numbers
+    # first collapses those into the one problem they actually are.
     groups: dict[tuple[str, str, str], list[datetime]] = {}
+    examples: dict[tuple[str, str, str], str] = {}
     for dt, module, severity, description, _recovered in recent:
-        key = (module or "?", severity or "?", description.strip()[:200])
+        normalized = _normalize_message(description)
+        key = (module or "?", severity or "?", normalized)
         groups.setdefault(key, []).append(dt)
+        examples.setdefault(key, description.strip())
 
     unrecovered = [g for g in groups.items() if g[0][1] in ("ERROR", "CRITICAL")]
 
@@ -131,7 +235,8 @@ def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
             detail = f"once, {last.strftime('%Y-%m-%d %H:%M')}Z"
             status = WARN
 
-        record(status, f"errors/{module}", f"{description[:160]} [{detail}]")
+        example = examples.get((module, severity, description), description)
+        record(status, f"errors/{module}", f"{example[:150]} [{detail}]")
 
 
 # ------------------------------------------------------------------
@@ -161,12 +266,19 @@ def check_processing_currency(station_code: str) -> None:
     newest = days[-1]
     lag = today_doy - newest
 
-    if lag <= 1:
+    # A two-day lag is this pipeline's normal steady state, not a
+    # symptom. A UTC day cannot be processed until it has finished
+    # recording (00:00 UTC the following day), and processing runs
+    # once nightly at 22:30 local -- so the freshest result is
+    # routinely two day-numbers behind "today".
+    if lag <= 2:
         record(OK, "processing",
-               f"{len(days)} days processed, newest is doy {newest} (current)")
-    elif lag <= 3:
+               f"{len(days)} days processed, newest is doy {newest} "
+               f"({lag}d behind, which is normal for a nightly run)")
+    elif lag <= 4:
         record(WARN, "processing",
-               f"Newest result is doy {newest}, {lag} days behind today ({today_doy})")
+               f"Newest result is doy {newest}, {lag} days behind today "
+               f"({today_doy}) -- a run may have been missed")
     else:
         record(FAIL, "processing",
                f"Newest result is doy {newest}, {lag} days behind today ({today_doy}) "
@@ -279,6 +391,27 @@ def check_recording(db: sqlite3.Connection) -> None:
         record(FAIL, "recording",
                "station_manager.py is NOT running -- no data is being recorded")
 
+    # Is the newest raw file actually growing? This is the real
+    # question -- a status flag can drift out of date, a file that
+    # stopped growing cannot be misinterpreted.
+    raw_dir = PROJECT_DIR / "raw"
+    if raw_dir.is_dir():
+        raws = sorted(raw_dir.glob("*.um980"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if raws:
+            newest = raws[0]
+            age_min = (utcnow() - datetime.fromtimestamp(
+                newest.stat().st_mtime, tz=timezone.utc)).total_seconds() / 60
+            if age_min > 90:
+                record(FAIL, "recording",
+                       f"{newest.name} has not been written to for "
+                       f"{age_min:.0f} minutes -- recording may have stopped")
+            else:
+                record(OK, "recording",
+                       f"{newest.name} written {age_min:.0f} min ago")
+        else:
+            record(WARN, "recording", "No raw files present")
+
     row = list(db.execute(
         "SELECT timestamp, disk_free, receiver_connected, internet_connected "
         "FROM system_health ORDER BY id DESC LIMIT 1"))
@@ -296,8 +429,14 @@ def check_recording(db: sqlite3.Connection) -> None:
         else:
             record(OK, "health", f"Health recorded {age_h:.0f}h ago")
 
-    if receiver_connected is not None and not receiver_connected:
-        record(FAIL, "health", "Last health record says the receiver was NOT connected")
+    # system_health.receiver_connected is deliberately NOT trusted
+    # here. On this station it reads 0 on every record going back
+    # days, while recording demonstrably works -- station_manager.py
+    # evidently never sets it. Asserting a failure on the strength of
+    # a field nobody maintains produces false alarms, and false
+    # alarms are how a monitoring report earns being ignored.
+    #
+    # Recording is verified directly instead, below.
 
 
 # ------------------------------------------------------------------
