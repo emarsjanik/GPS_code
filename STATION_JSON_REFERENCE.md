@@ -150,13 +150,66 @@ set together.
 
 | Field | Type | Description |
 |---|---|---|
-| `gnssrefl_azimuth_regions` | list of numbers (degrees) | Which compass directions have a genuinely clear view, as a flat list of region boundaries. Default (unset) is the full circle, `[0, 360]`. |
+| `gnssrefl_azimuth_regions` | list of numbers (degrees) | Which compass directions have a genuinely clear view, as a flat list of region boundaries. Default (unset) is the full circle, `[0, 360]`. **Worth measuring rather than guessing** -- see the note below. |
 
 If part of your view is blocked (a building, trees, rising terrain), list
 only the clear region(s). For example, `[0, 150, 180, 360]` analyzes
 0°–150° and 180°–360°, excluding the 150°–180° range. This can wrap
 through north: `[353, 360, 0, 173]` analyzes 353°–360° and 0°–173°
 (i.e., roughly northwest through south, wrapping across due north).
+
+### Tuning the azimuth mask against a reference
+
+An azimuth mask set from a map, or from what looks like open water in
+satellite imagery, is a reasonable starting point but rarely the best
+available. Arcs whose reflection point lands on wet sand, a bar, or a
+shoreline slope still return a plausible reflector height -- they do
+not fail, they quietly disagree with the arcs that are genuinely
+seeing water.
+
+If you have an independent water-level reference (a tide gauge, or a
+tide model), that disagreement is measurable, and the mask can be
+optimized rather than assumed.
+
+`analysis_tools/elevation_quality.py` compares each arc against the
+consensus of all arcs and groups the disagreement by azimuth, which
+shows directly which bearings are contributing error. On this
+project's own station the result was stark:
+
+| Azimuth band | Mean disagreement |
+|---|---|
+| 30-60 deg | 0.160 m |
+| 60-120 deg | ~0.170 m |
+| 120-150 deg | 0.719 m |
+| 150-175 deg | 1.253 m |
+
+Trimming the mask from `[353, 360, 0, 173]` to `[353, 360, 0, 130]`
+discarded 9% of arcs and improved agreement against an independent
+tide model by 18%:
+
+| | Before (to 173 deg) | After (to 130 deg) |
+|---|---|---|
+| Mean absolute deviation | 9.2 cm | 7.5 cm |
+| Correlation | 0.9884 | 0.9918 |
+| Internal spline RMS | 0.206 m | 0.105 m |
+
+Cuts at 110, 120 and 130 degrees all performed identically, so 130
+was chosen as the one retaining the most data -- more arcs is useful
+insurance on days with poor satellite geometry even when it does not
+change the average.
+
+Two cautions. First, tuning against a single reference risks fitting
+that reference's own quirks; here the result was corroborated
+independently by an azimuth-independence test and by the site
+geometry, which is what made it trustworthy. Second, **the mean
+offset moved 3.6 cm** when the mask changed, because the discarded
+arcs were biased. Any absolute datum calibration must be redone
+after changing the mask.
+
+To test a mask without touching production, build an isolated config
+with `make_gnssir_input(..., extension="myTest")` and reprocess with
+`gnssir <station> <year> <doy> -extension myTest`. Nothing in the
+production results directory is affected.
 
 ### Quality control thresholds
 
@@ -264,7 +317,7 @@ changed), showing which fields a real deployment actually used:
     "gnssrefl_max_arc_minutes": 40.0,
     "gnssrefl_elevation_span_tolerance": 1.0,
     "gnssrefl_direct_signal_poly_order": 2,
-    "gnssrefl_azimuth_regions": [353, 360, 0, 173],
+    "gnssrefl_azimuth_regions": [353, 360, 0, 130],
     "external_storage_path": "/mnt/external_storage/GPS_Data"
 }
 ```
