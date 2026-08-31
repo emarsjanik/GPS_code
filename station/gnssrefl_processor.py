@@ -755,11 +755,24 @@ class GnssIrProcessor:
 
         # Orthometric height reference (gnssrefl's own param: Hortho)
         # -- needed to report real, absolute water level rather than
-        # just relative reflector height. Never set for this station;
-        # a real, meaningful value for a future site.
+        # just relative reflector height.
+        #
+        # MUST BE A LIST, not a float. gnssrefl declares Hortho as a
+        # list (it supports several values with matching Hdates, for
+        # sites whose antenna height changes over time) and guards
+        # the assignment with `if type(Hortho) == list`. A float
+        # fails that check and is discarded with no warning, after
+        # which gnssrefl substitutes its own EGM96-derived value.
+        #
+        # That silently cost this station 4 cm on every published
+        # water level: the surveyed CGVD2013/CGG2013a height is
+        # 18.665 m, while the EGM96 fallback gave 18.625 m. Both are
+        # legitimate orthometric heights differing only by geoid
+        # model, but a 4 cm systematic offset is not negligible when
+        # the measurement's own noise floor is around 7.5 cm.
         orthometric_height = station_section.get("gnssrefl_orthometric_height")
         if orthometric_height is not None:
-            kwargs["Hortho"] = float(orthometric_height)
+            kwargs["Hortho"] = [float(orthometric_height)]
 
         # Refraction model (gnssrefl's own param: refraction) -- 1 is
         # the Bennett correction (gnssrefl's own default); matters

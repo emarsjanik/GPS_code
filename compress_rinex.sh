@@ -88,6 +88,60 @@ if [ "${#basenames[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# Removes loose .obs/.nav/.sbs for a day that is already archived,
+# but ONLY after confirming each one is present inside that archive
+# at exactly the same size.
+reconcile_orphans() {
+    local base="$1"
+    local archive="$2"
+
+    local orphans=()
+    for ext in obs nav sbs; do
+        [ -f "$RINEX_DIR/$base.$ext" ] && orphans+=("$base.$ext")
+    done
+
+    if [ "${#orphans[@]}" -eq 0 ]; then
+        echo "  [skip] $base -- archive already exists"
+        return 0
+    fi
+
+    local listing
+    listing=$(tar -tzvf "$archive" 2>/dev/null)
+    if [ -z "$listing" ]; then
+        echo "  [KEEP] $base -- archive unreadable; loose files left alone"
+        return 0
+    fi
+
+    local freed=0
+    local safe=true
+    for name in "${orphans[@]}"; do
+        local in_archive local_size
+        in_archive=$(echo "$listing" | awk -v n="$name" '$NF == n {print $3}' | head -1)
+        local_size=$(stat -c%s "$RINEX_DIR/$name" 2>/dev/null || echo 0)
+        if [ -z "$in_archive" ] || [ "$in_archive" != "$local_size" ]; then
+            safe=false
+            break
+        fi
+        freed=$((freed + local_size))
+    done
+
+    if ! $safe; then
+        echo "  [KEEP] $base -- loose files do not match the archive; left alone"
+        return 0
+    fi
+
+    if $EXECUTE; then
+        for name in "${orphans[@]}"; do
+            rm -f "$RINEX_DIR/$name"
+        done
+        total_before=$((total_before + freed))
+        echo "  [reconciled] $base -- removed ${#orphans[@]} duplicate file(s), $(numfmt --to=iec-i --suffix=B "$freed" 2>/dev/null || echo "$freed") (already in the archive)"
+    else
+        total_before=$((total_before + freed))
+        echo "  [would reconcile] $base -- ${#orphans[@]} loose file(s), $(numfmt --to=iec-i --suffix=B "$freed" 2>/dev/null || echo "$freed") already in the archive"
+    fi
+}
+
 for base in "${basenames[@]}"; do
     obs="$RINEX_DIR/$base.obs"
     nav="$RINEX_DIR/$base.nav"
@@ -95,7 +149,18 @@ for base in "${basenames[@]}"; do
     archive="$RINEX_DIR/$base.tar.gz"
 
     if [ -f "$archive" ]; then
-        echo "  [skip] $base -- archive already exists"
+        # The day is archived. But loose .obs/.nav may have appeared
+        # afterwards -- this station's pipeline converts a day's raw
+        # file after the archive was already made, recreating them.
+        # Simply skipping leaves those orphans to accumulate and to
+        # be uploaded as duplicates of data already in the archive.
+        #
+        # Reconcile instead: if the loose files are genuinely inside
+        # the archive at the same size, they are redundant and can
+        # go. If not, leave everything alone -- an incomplete archive
+        # is not something to paper over by deleting the only
+        # complete copy.
+        reconcile_orphans "$base" "$archive"
         skipped_count=$((skipped_count + 1))
         continue
     fi

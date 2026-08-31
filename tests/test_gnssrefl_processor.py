@@ -435,7 +435,21 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertEqual(call["Hortho"], 18.665)
+        # Hortho MUST be a list, not a bare float. gnssrefl declares
+        # it as a list (several values with matching Hdates, for
+        # antennas that get moved) and guards the assignment with
+        # `if type(Hortho) == list`. A float fails that check and is
+        # discarded WITHOUT ANY ERROR, after which gnssrefl quietly
+        # substitutes its own EGM96-derived height.
+        #
+        # Not hypothetical: this test previously asserted a bare
+        # float and passed, while production discarded the station's
+        # surveyed 18.665 m and used 18.625 m -- making every
+        # published water level 4 cm low, invisibly, for months.
+        #
+        # Do not "simplify" this back to a float.
+        self.assertEqual(call["Hortho"], [18.665])
+        self.assertIsInstance(call["Hortho"], list)
 
     def test_refraction_model_passed_through_when_configured(self) -> None:
         self.cfg.station["gnssrefl_refraction_model"] = 0

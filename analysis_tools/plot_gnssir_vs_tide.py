@@ -101,6 +101,9 @@ def main():
     p.add_argument("--output", default="gnssir_vs_tide.png")
     p.add_argument("--start-date", default=None, help="YYYY-MM-DD, optional, restricts the plotted window")
     p.add_argument("--end-date", default=None, help="YYYY-MM-DD, optional, restricts the plotted window")
+    p.add_argument("--no-align", action="store_true",
+                   help="do not remove the constant offset; show both series "
+                        "on their raw, unadjusted axes")
     args = p.parse_args()
 
     spline_times, spline_values = load_spline_output(Path(args.spline_file))
@@ -133,16 +136,43 @@ def main():
 
     fig, ax = plt.subplots(figsize=(16, 6))
 
-    ax.plot(spline_times, spline_values, color="tab:blue", linewidth=1.2,
-            label="GNSS-IR water level (this station)")
+    # Constant offset between the two series, measured from the
+    # overlapping data rather than hardcoded -- it has already
+    # changed twice as processing was corrected, and a stale
+    # constant would quietly make this plot dishonest.
+    shift = 0.0
+    if not args.no_align and len(tide_times) > 1:
+        base = tide_times[0]
+        tx = np.array([(t - base).total_seconds() for t in tide_times])
+        order = np.argsort(tx)
+        qx = np.array([(t - base).total_seconds() for t in spline_times])
+        tide_at = np.interp(qx, tx[order], np.asarray(tide_values)[order],
+                            left=np.nan, right=np.nan)
+        sv = np.asarray(spline_values, dtype=float)
+        usable = np.isfinite(tide_at) & np.isfinite(sv)
+        if usable.sum() > 10:
+            shift = float(np.mean(sv[usable] - tide_at[usable]))
+
+    plotted_values = (np.asarray(spline_values, dtype=float) - shift
+                      if shift else spline_values)
+    gnss_label = ("GNSS-IR water level (this station)" if not shift else
+                  f"GNSS-IR water level (shifted {-shift:+.3f} m)")
+
+    ax.plot(spline_times, plotted_values, color="tab:blue", linewidth=1.2,
+            label=gnss_label)
     ax.plot(tide_times, tide_values, color="tab:orange", linewidth=1.0,
             alpha=0.85, label=f"Tide model ({args.tide_value_col})")
 
     ax.set_xlabel("Date")
     ax.set_ylabel("Water level (m)")
-    ax.set_title("GNSS-IR Water Level vs. Tide Model\n"
-                  "(shown on a shared, unadjusted axis -- any constant vertical "
-                  "offset between the two references is intentionally left visible, not corrected)")
+    if shift:
+        subtitle = (f"(GNSS-IR shifted by {-shift:+.3f} m to remove the constant offset "
+                    f"between the two vertical references, so shape and timing "
+                    f"can be compared directly)")
+    else:
+        subtitle = ("(shown on a shared, unadjusted axis -- any constant vertical "
+                    "offset between the two references is intentionally left visible, not corrected)")
+    ax.set_title("GNSS-IR Water Level vs. Tide Model\n" + subtitle)
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
 
