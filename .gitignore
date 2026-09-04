@@ -66,3 +66,5 @@ archive.conf
 # Manifests describing the tide model files, which are themselves
 # data rather than code and not tracked here.
 *.manifest.json
+
+*.manifest.json
