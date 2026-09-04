@@ -62,3 +62,7 @@ nuc_cleanup_round2.sh
 # Per-deployment settings (bucket, station code, paths). Only the
 # template is tracked -- see archive.conf.template.
 archive.conf
+
+# Manifests describing the tide model files, which are themselves
+# data rather than code and not tracked here.
+*.manifest.json

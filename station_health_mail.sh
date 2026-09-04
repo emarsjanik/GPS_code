@@ -104,11 +104,32 @@ if ! command -v msmtp >/dev/null 2>&1; then
     exit 1
 fi
 
-printf 'Subject: %s\n\n%s\n' "$SUBJECT" "$BODY" | msmtp $RECIPIENTS
-mail_exit=$?
+# Retry on failure. A single attempt turns a momentary network
+# problem into a silent morning, which is indistinguishable from a
+# healthy one -- see this script's notes above.
+MAIL_ATTEMPTS=3
+MAIL_BACKOFF=30
+
+mail_exit=1
+for attempt in $(seq 1 "$MAIL_ATTEMPTS"); do
+    printf 'Subject: %s\n\n%s\n' "$SUBJECT" "$BODY" | msmtp $RECIPIENTS
+    mail_exit=$?
+
+    if [ "$mail_exit" -eq 0 ]; then
+        [ "$attempt" -gt 1 ] && echo "Sent on attempt $attempt." >&2
+        break
+    fi
+
+    if [ "$attempt" -lt "$MAIL_ATTEMPTS" ]; then
+        echo "msmtp attempt $attempt failed (exit $mail_exit); retrying in ${MAIL_BACKOFF}s..." >&2
+        sleep "$MAIL_BACKOFF"
+        MAIL_BACKOFF=$((MAIL_BACKOFF * 2))
+    fi
+done
 
 if [ "$mail_exit" -ne 0 ]; then
-    echo "msmtp failed (exit $mail_exit). Health check output follows:" >&2
+    echo "msmtp failed after $MAIL_ATTEMPTS attempts (exit $mail_exit)." >&2
+    echo "Health check output follows so it is not lost:" >&2
     echo "$REPORT" >&2
     exit 1
 fi

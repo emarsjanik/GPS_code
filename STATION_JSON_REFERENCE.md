@@ -250,6 +250,53 @@ production results directory is affected.
 
 ---
 
+### Choosing the reflector height window
+
+`gnssrefl_reflector_height_min` / `_max` are not merely a search
+hint. They are a hard limit on the water level that can be retrieved
+at all: anything outside is discarded during retrieval, with no error
+and no gap marker. A window that is too narrow does not degrade
+gracefully -- it silently deletes the extremes.
+
+Convert the window to water levels before trusting it:
+
+    water level = gnssrefl_orthometric_height - reflector height
+
+At this station (Hortho 18.665 m) a 17-23 m window meant a ceiling of
++1.665 m, against an observed maximum of +1.565 m. Ten centimetres of
+headroom. A modest storm surge would have truncated the record
+exactly when it mattered, and the plot would simply have shown a gap.
+
+Widening is not free, though, and the failure mode is subtle. A
+window extended too far admits spurious spectral peaks near its edge:
+plausible-looking reflector heights that are not water. Testing three
+windows against an independent tide model across the full record:
+
+| Window | Arcs | Internal RMS | Mean abs dev | Correlation | Artifacts |
+|---|---|---|---|---|---|
+| 17-23 m | 6454 | 0.105 m | 6.8 cm | 0.9933 | ~0 |
+| **16-24 m** | 6962 | 0.113 m | **6.8 cm** | 0.9931 | 63 (0.9%) |
+| 15-24 m | 6893 | 0.131 m | -- | -- | 403 (6.2%) |
+
+16-24 was adopted: no measurable cost, and the ceiling rises to
++2.665 m, about 1.1 m above the observed maximum.
+
+15-24 was rejected. Its 403 extra retrievals showed water levels of
++2.7 to +3.4 m, scattered across the tidal cycle on days with no
+storm, with simultaneous arcs disagreeing by centimetres. Real water
+level is consistent across arcs and occurs at high tide; these were
+neither.
+
+Two things worth carrying forward. First, **the averaged agreement
+figure will not reveal this problem** -- 15-24 m looked acceptable
+until the individual retrievals were examined, because a small
+fraction of bad points barely moves a mean. Look at the extremes
+directly. Second, during an actual surge, genuine high water and edge
+artifacts occupy the same band and are hard to separate; a wide
+window is still the right choice, but extreme values during a storm
+deserve scrutiny rather than assumption.
+
+
 ## Tide model comparison (optional)
 
 If configured, `process_and_plot.sh` automatically generates a comparison

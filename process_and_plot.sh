@@ -314,10 +314,47 @@ else
 fi
 
 # ----------------------------------------------------------------
-# Step 5: tide model comparison (optional -- only if configured)
+# Step 5: rolling 7-day plot for public display
+#
+# Generated at every station, unlike the tide comparison below which
+# only runs when a tide model is configured. This is a published
+# product rather than a diagnostic, so it should not depend on an
+# internal validation step being switched on.
+#
+# Writes into the products directory, so the existing upload picks
+# it up with everything else.
 # ----------------------------------------------------------------
 
-section "Step 5: Tide model comparison (optional)"
+section "Step 5: Rolling 7-day plot"
+
+SEVEN_DAY_PLOT="$REFL_CODE/Files/$STATION_CODE/7_day_plot.png"
+SPLINE_FILE="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
+
+if [ ! -f "$SPLINE_FILE" ]; then
+    echo "  No spline output yet -- skipping."
+elif [ ! -f "$PROJECT_DIR/analysis_tools/plot_7day.py" ]; then
+    echo "  analysis_tools/plot_7day.py not found -- skipping."
+else
+    if python3 "$PROJECT_DIR/analysis_tools/plot_7day.py" \
+        --spline-file "$SPLINE_FILE" \
+        --output "$SEVEN_DAY_PLOT"; then
+        echo ""
+        echo "  This plot is intended for public display and is"
+        echo "  referenced to local mean sea level via"
+        echo "  water_level_msl_offset in station.json."
+    else
+        echo ""
+        echo "  7-day plot could not be generated -- see above. The"
+        echo "  underlying results are unaffected; the next run will"
+        echo "  try again."
+    fi
+fi
+
+# ----------------------------------------------------------------
+# Step 6: tide model comparison (optional -- only if configured)
+# ----------------------------------------------------------------
+
+section "Step 6: Tide model comparison (optional)"
 
 TIDE_FILE=$(python3 -c "
 import json
@@ -389,6 +426,9 @@ section "Done"
 echo "Summary:"
 echo "  Results available for days $min_day-$max_day ($day_count day(s))"
 echo "  Plots directory: $REFL_CODE/Files/$STATION_CODE"
+if [ -f "$REFL_CODE/Files/$STATION_CODE/7_day_plot.png" ]; then
+    echo "  7-day public plot: $REFL_CODE/Files/$STATION_CODE/7_day_plot.png"
+fi
 if [ -n "$TIDE_FILE" ] && [ -f "$TIDE_FILE" ]; then
     echo "  Tide comparison plot: $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_vs_tide.png"
 fi
