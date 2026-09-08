@@ -35,6 +35,12 @@ set -uo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HEALTH_SCRIPT="$PROJECT_DIR/station_health.py"
 
+STATION_CODE=$(python3 -c "
+import json
+d = json.load(open('$PROJECT_DIR/station/resources/station.json'))
+print((d.get('gnssrefl_station_code') or (d.get('station_id') or '')[:4]).lower() or 'usgs')
+" 2>/dev/null || echo usgs)
+
 RECIPIENTS="emarsjanik@usgs.gov csherwood@usgs.gov"
 
 STATION_NAME="$(python3 -c "
@@ -112,7 +118,16 @@ MAIL_BACKOFF=30
 
 mail_exit=1
 for attempt in $(seq 1 "$MAIL_ATTEMPTS"); do
-    printf 'Subject: %s\n\n%s\n' "$SUBJECT" "$BODY" | msmtp $RECIPIENTS
+    # Message construction moved to a Python helper: attachments
+    # need a MIME multipart message, which is easy to get subtly
+    # wrong in shell. msmtp is still the transport, so credentials
+    # and this retry loop are unchanged.
+    PLOTS_DIR="$PROJECT_DIR/products/refl_code/Files/$STATION_CODE"
+    printf '%s\n' "$BODY" | python3 "$PROJECT_DIR/analysis_tools/send_health_mail.py" \
+        --subject "$SUBJECT" \
+        --to $RECIPIENTS \
+        --attach "$PLOTS_DIR/${STATION_CODE}_vs_tide.png" \
+        --attach "$PLOTS_DIR/7_day_plot.png"
     mail_exit=$?
 
     if [ "$mail_exit" -eq 0 ]; then
