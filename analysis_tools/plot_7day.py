@@ -81,6 +81,32 @@ def load_spline(path: Path):
     return times, np.asarray(values, dtype=float)
 
 
+def load_tide(path: Path, time_col: str, value_col: str):
+    """Reads the tide model spreadsheet. Returns ([], []) rather than
+    raising if anything is wrong -- the water level plot is the point,
+    and it is better to draw it without the model than not at all."""
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        header = [c.value for c in ws[1]]
+        ti, vi = header.index(time_col), header.index(value_col)
+        times, values = [], []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            t = row[ti]
+            if not isinstance(t, datetime):
+                continue
+            v = row[vi]
+            if isinstance(v, (int, float)):
+                times.append(t)
+                values.append(float(v))
+        wb.close()
+        return times, values
+    except Exception as exc:
+        print(f"  (tide model not plotted: {exc})")
+        return [], []
+
+
 def msl_offset(project_dir: Path) -> float:
     """Offset between this station's water levels and local mean sea
     level, from station.json. Zero if unset -- an unset offset should
@@ -124,6 +150,15 @@ def main() -> int:
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--station-name", default=None,
                    help="shown in the title; read from station.json if omitted")
+    p.add_argument("--tide-file", default=None,
+                   help="tide model spreadsheet; read from station.json if omitted")
+    p.add_argument("--tide-value-col", default=None)
+    p.add_argument("--tide-time-col", default=None)
+    p.add_argument("--no-tide", action="store_true",
+                   help="plot the measurement alone, without the predicted tide")
+    p.add_argument("--departure-threshold", type=float, default=0.25,
+                   help="metres; departures larger than this are annotated "
+                        "(default 0.25, about 2.8 sigma at this station)")
     args = p.parse_args()
 
     spline_path = Path(args.spline_file)
@@ -163,8 +198,72 @@ def main() -> int:
 
     fig, ax = plt.subplots(figsize=(12, 5))
 
-    for seg_t, seg_v in split_on_gaps(t_sel, list(v_plot)):
-        ax.plot(seg_t, seg_v, color="#1f6fb4", linewidth=1.6, solid_capstyle="round")
+    # Label only the first segment: the series is broken wherever
+    # data is missing, and labelling each piece would repeat the
+    # legend entry once per gap.
+    for seg_i, (seg_t, seg_v) in enumerate(split_on_gaps(t_sel, list(v_plot))):
+        ax.plot(seg_t, seg_v, color="#1f6fb4", linewidth=1.5,
+                solid_capstyle="round", zorder=2,
+                label="Measured water level (GNSS)" if seg_i == 0 else None)
+
+    # Predicted tide, drawn beneath the measurement so the
+    # observation stays visually primary.
+    tide_t, tide_v = [], []
+    if not args.no_tide:
+        tide_file = args.tide_file
+        tide_col = args.tide_value_col
+        tide_time_col = args.tide_time_col or "time"
+        if tide_file is None or tide_col is None:
+            try:
+                cfg = json.loads((project_dir / "station" / "resources"
+                                  / "station.json").read_text())
+                tide_file = tide_file or cfg.get("tide_model_file")
+                tide_col = tide_col or cfg.get("tide_model_value_column")
+                tide_time_col = args.tide_time_col or cfg.get(
+                    "tide_model_time_column") or "time"
+            except Exception:
+                pass
+
+        if tide_file and tide_col and Path(tide_file).exists():
+            all_t, all_v = load_tide(Path(tide_file), tide_time_col, tide_col)
+            keep_t = [(t, v) for t, v in zip(all_t, all_v)
+                      if cutoff <= t <= newest]
+            tide_t = [t for t, _ in keep_t]
+            tide_v = [v for _, v in keep_t]
+
+    if tide_t:
+        ax.plot(tide_t, tide_v, color="#d9822b", linewidth=1.6, alpha=0.65,
+                zorder=1, label="Predicted tide (model)")
+
+        # Mark where the measurement departs from prediction. This is
+        # the part of the water level that astronomy does not explain
+        # -- surge, wind setup, pressure -- and is the reason the two
+        # curves are shown together at all.
+        tx = np.array([(t - tide_t[0]).total_seconds() for t in tide_t])
+        qx = np.array([(t - tide_t[0]).total_seconds() for t in t_sel])
+        order = np.argsort(tx)
+        predicted = np.interp(qx, tx[order], np.asarray(tide_v)[order],
+                              left=np.nan, right=np.nan)
+        departure = v_plot - predicted
+        big = np.isfinite(departure) & (np.abs(departure) >= args.departure_threshold)
+
+        if big.any():
+            # Annotate the single largest departure rather than every
+            # point above the threshold, which would be unreadable.
+            i = int(np.nanargmax(np.abs(np.where(big, departure, np.nan))))
+            ax.annotate(
+                f"{departure[i]:+.2f} m from prediction",
+                xy=(t_sel[i], v_plot[i]),
+                xytext=(0, 28 if departure[i] > 0 else -34),
+                textcoords="offset points", ha="center", fontsize=9,
+                color="#b3450c",
+                arrowprops=dict(arrowstyle="->", color="#b3450c", linewidth=1.0))
+            ax.plot([t_sel[j] for j in np.where(big)[0]],
+                    [v_plot[j] for j in np.where(big)[0]],
+                    linestyle="none", marker="o", markersize=3.5,
+                    color="#b3450c", zorder=3)
+
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
     ax.axhline(0.0, color="#999999", linewidth=0.8, linestyle="--", zorder=0)
 
@@ -181,10 +280,16 @@ def main() -> int:
     fig.autofmt_xdate()
 
     span = f"{min(t_sel).strftime('%Y-%m-%d %H:%M')} to {newest.strftime('%Y-%m-%d %H:%M')} UTC"
+    if tide_t:
+        explain = ("Blue is measured water level; orange is the predicted "
+                   "astronomical tide. Differences reflect storm surge, wind "
+                   "and pressure,\nwhich the prediction does not include. ")
+    else:
+        explain = ""
     fig.text(0.01, 0.02,
-             f"Provisional data, subject to revision. Derived from reflected GPS "
-             f"signals, not an accredited tide gauge.\n{span}   |   "
-             f"U.S. Geological Survey",
+             f"{explain}Provisional data, subject to revision. Derived from "
+             f"reflected GPS signals, not an accredited tide gauge.\n{span}"
+             f"   |   U.S. Geological Survey",
              fontsize=7.5, color="#555555", va="bottom")
 
     fig.tight_layout(rect=(0, 0.06, 1, 1))
