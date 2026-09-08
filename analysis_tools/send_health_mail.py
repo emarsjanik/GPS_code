@@ -48,25 +48,115 @@ def deviation_stats() -> str:
     if not script.exists():
         return "(compare_to_tide_deviation.py not found)"
 
+    def run(spline_path):
+        try:
+            r = subprocess.run(
+                [sys.executable, str(script),
+                 "--spline-file", str(spline_path),
+                 "--tide-file", str(tide_file),
+                 "--tide-value-col", str(tide_col)],
+                capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return None, "(tide comparison timed out)"
+        except Exception as exc:
+            return None, f"(tide comparison failed: {exc})"
+        if r.returncode != 0:
+            return None, f"(tide comparison exited {r.returncode})"
+        return r.stdout, None
+
+    def summarize(out):
+        """Pulls the three numbers worth watching from the block."""
+        pts = mad = corr = "?"
+        for ln in out.splitlines():
+            if ln.startswith("Points compared"):
+                pts = ln.split(":", 1)[1].strip()
+            elif "MEAN ABSOLUTE DEVIATION" in ln and "MEDIAN" not in ln:
+                mad = ln.split(":", 1)[1].strip()
+            elif ln.startswith("Correlation"):
+                corr = ln.split(":", 1)[1].strip()
+        return pts, mad, corr
+
+    full_out, err = run(spline)
+    if err:
+        return err
+
+    # A recent-window copy of the spline, so the same comparison can
+    # be run over just the last few days. Written to a temporary file
+    # rather than adding a date filter to the comparison script,
+    # which is used elsewhere and better left alone.
+    # Each window answers a different question; see this patch's own
+    # notes. Ordered shortest first so the fastest-responding figure
+    # is read before the slow baseline.
+    WINDOWS = [(2, "Last 2 days"), (7, "Last 7 days")]
+
+    recent_note = ""
     try:
-        r = subprocess.run(
-            [sys.executable, str(script),
-             "--spline-file", str(spline),
-             "--tide-file", str(tide_file),
-             "--tide-value-col", str(tide_col)],
-            capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return "(tide comparison timed out)"
+        import tempfile
+        from datetime import datetime, timedelta
+
+        rows, header = [], []
+        for ln in spline.read_text(errors="replace").splitlines():
+            if ln.startswith("%"):
+                header.append(ln)
+                continue
+            c = ln.split()
+            if len(c) < 9:
+                continue
+            try:
+                dt = datetime(int(float(c[2])), int(float(c[3])), int(float(c[4])),
+                              int(float(c[5])), int(float(c[6])), int(float(c[7])))
+            except (ValueError, IndexError):
+                continue
+            rows.append((dt, ln))
+
+        summaries = []
+        if rows:
+            newest = max(dt for dt, _ in rows)
+            for days, label in WINDOWS:
+                cutoff = newest - timedelta(days=days)
+                recent = [ln for dt, ln in rows if dt >= cutoff]
+                # Too few points and the figure is meaningless rather
+                # than merely noisy; say so instead of printing it.
+                if len(recent) <= 20:
+                    summaries.append((label, None, None, len(recent)))
+                    continue
+                with tempfile.NamedTemporaryFile("w", suffix=".txt",
+                                                 delete=False) as tf:
+                    tf.write("\n".join(header + recent) + "\n")
+                    tmp_path = tf.name
+                out, err = run(Path(tmp_path))
+                Path(tmp_path).unlink(missing_ok=True)
+                if out:
+                    p, m, c = summarize(out)
+                    summaries.append((label, m, c, p))
+                else:
+                    summaries.append((label, None, None, len(recent)))
+
+        p1, m1, c1 = summarize(full_out)
+        summaries.append(("Full record", m1, c1, p1))
+
+        width = max(len(lbl) for lbl, *_ in summaries)
+        for label, mad, corr, pts in summaries:
+            if mad is None:
+                recent_note += (f"  {label:<{width}} : not enough data yet "
+                                f"({pts} points)\n")
+            else:
+                recent_note += (f"  {label:<{width}} : {mad}"
+                                f"   correlation {corr}"
+                                f"   ({pts} points)\n")
+        recent_note += (
+            "\n"
+            "  The short windows respond quickly but are noisy; the full\n"
+            "  record is steady but slow. Watch for all three drifting the\n"
+            "  same way -- one moving alone is usually just sampling.\n"
+            "\n")
     except Exception as exc:
-        return f"(tide comparison failed: {exc})"
+        recent_note = f"  (could not compute the recent windows: {exc})\n\n"
 
-    if r.returncode != 0:
-        return f"(tide comparison exited {r.returncode})\n{r.stderr.strip()[:400]}"
-
-    # Drop the two "Loaded N points" preamble lines; keep the block.
-    lines = [ln for ln in r.stdout.splitlines()
-             if not ln.startswith("Loaded ")]
-    return "\n".join(lines).strip()
+    lines = [ln for ln in full_out.splitlines()
+             if not ln.startswith("Loaded ")
+             and "points have both a GNSS-IR value" not in ln]
+    return recent_note + "\n".join(lines).strip()
 
 
 def main() -> int:
