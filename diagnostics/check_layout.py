@@ -54,7 +54,6 @@ IMPLEMENTED_STATION_FILES = {
 # this writing -- not yet implemented. Listed so the script doesn't
 # cry wolf about them, but still tells you they're stubs.
 KNOWN_STUB_STATION_FILES = {
-    "logger.py": "likely unneeded; logging is handled per-module already",
     "__init__.py": "intentionally empty, marks station/ as a package",
 }
 
@@ -70,11 +69,43 @@ REQUIRED_DIRECTORIES = [
     "station",
     "station/resources",
     "tests",
+    "analysis_tools",
+    "diagnostics",
+    "docs",
+    "maintenance",
 ]
 
 REQUIRED_RESOURCE_FILES = [
     "station/resources/station.json.template",
 ]
+
+# The scripts at the project root. Three are what a new user runs, in
+# this order; three are what cron invokes to keep the station running
+# unattended. A clone missing any of these is broken in a way the
+# rest of this check would not have noticed.
+REQUIRED_ROOT_SCRIPTS = {
+    "install.sh": "first thing a new user runs: dependencies, venv, setup wizard",
+    "test_installation.sh": "verifies the install before any data is collected",
+    "process_and_plot.sh": "converts new data, runs GNSS-IR, regenerates every plot",
+    "setup_station.sh": "the configuration wizard; re-runnable to change settings",
+    "daily_gnss.sh": "cron, nightly: process, plot, upload products and timeseries",
+    "archive_rinex.sh": "cron, nightly: compress RINEX, sync to cloud, prune local",
+    "station_health_mail.sh": "cron, daily: emails whether the station is working",
+}
+
+# Called by the scripts above, or run occasionally by hand. Not
+# entry points, but the station does not work without them.
+REQUIRED_SUPPORT_SCRIPTS = {
+    "maintenance/compress_rinex.sh": "packs each day's RINEX into one verified archive",
+    "maintenance/prune_local_rinex.sh": "deletes local archives only after verifying the cloud copy",
+    "maintenance/s3UploadTimeseries.sh": "uploads month-foldered timeseries data",
+    "maintenance/filter_month.py": "slices whole-record timeseries into single months",
+    "maintenance/clean_processing_queue.py": "clears queue entries whose raw file is gone",
+    "maintenance/recover_missing_days.sh": "reprocesses a day from external storage",
+    "diagnostics/check_layout.py": "this script",
+    "diagnostics/station_health.py": "is the station working right now?",
+    "diagnostics/validate_station.py": "is an apparent signal real, or an artifact?",
+}
 
 
 def _human_size(num_bytes: int) -> str:
@@ -97,6 +128,47 @@ def check_directories() -> list[str]:
             print(f"  MISSING  {rel_path}/  <-- create this directory")
             problems.append(f"Missing directory: {rel_path}/")
 
+    return problems
+
+
+def check_scripts() -> list[str]:
+    """The scripts a user or cron actually invokes.
+
+    Reported separately from station/ modules because a missing entry
+    point fails differently: the station keeps running and simply
+    stops doing one thing, which is harder to notice than an import
+    error.
+    """
+    problems = []
+    for title, table in (
+        ("Project root -- scripts you or cron run", REQUIRED_ROOT_SCRIPTS),
+        ("maintenance/ and diagnostics/ -- called by the above",
+         REQUIRED_SUPPORT_SCRIPTS),
+    ):
+        print()
+        print(title)
+        print("-" * 60)
+        for rel_path, description in table.items():
+            path = PROJECT_ROOT / rel_path
+            if not path.is_file():
+                print(f"  MISSING  {rel_path}")
+                print(f"           ({description})")
+                problems.append(f"Missing file: {rel_path}")
+                continue
+            if path.stat().st_size == 0:
+                print(f"  EMPTY    {rel_path}")
+                print(f"           ({description})")
+                problems.append(f"Empty file: {rel_path}")
+                continue
+            # An entry point that is not executable will fail from
+            # cron with a permission error rather than anything
+            # informative, so it is worth flagging here instead.
+            import os
+            if rel_path.endswith(".sh") and not os.access(path, os.X_OK):
+                print(f"  NOT EXEC {rel_path}  <-- chmod +x {rel_path}")
+                problems.append(f"Not executable: {rel_path}")
+                continue
+            print(f"  OK       {rel_path}")
     return problems
 
 
@@ -275,6 +347,7 @@ def main() -> int:
     all_problems: list[str] = []
 
     all_problems += check_directories()
+    all_problems += check_scripts()
     all_problems += check_implemented_files()
     check_stub_files()  # informational only, not counted as problems
     all_problems += check_test_files()
