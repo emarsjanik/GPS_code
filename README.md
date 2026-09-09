@@ -2,7 +2,7 @@
 
 Autonomous GNSS data logging, RINEX conversion, and GNSS-IR (interferometric reflectometry) processing built around a Unicore UM980 receiver.
 
-**New to this project? Start with [`GNSS-IR_Quick_Setup_Guide.docx`](GNSS-IR_Quick_Setup_Guide.docx)** — a complete, no-prior-experience-required walkthrough from downloading this repository through your first real plot, with a labeled screenshot of every command's real output. This is the master setup document for this project; everything below is the technical quick-reference for once you're up and running. For more depth than the guide covers (every configuration option, advanced troubleshooting), see [`QUICKSTART.md`](QUICKSTART.md) and [`STATION_JSON_REFERENCE.md`](STATION_JSON_REFERENCE.md).
+**New to this project? Start with [`GNSS-IR_Quick_Setup_Guide.docx`](GNSS-IR_Quick_Setup_Guide.docx)** — a complete, no-prior-experience-required walkthrough from downloading this repository through your first real plot, with a labeled screenshot of every command's real output. This is the master setup document for this project; everything below is the technical quick-reference for once you're up and running. For more depth than the guide covers (every configuration option, advanced troubleshooting), see [`QUICKSTART.md`](QUICKSTART.md) and [`STATION_JSON_REFERENCE.md`](STATION_JSON_REFERENCE.md). Setup needs your antenna's surveyed position; [`docs/GETTING_A_POSITION.md`](docs/GETTING_A_POSITION.md) explains how your own receiver can survey itself for free in about a day.
 
 ## Data flow
 

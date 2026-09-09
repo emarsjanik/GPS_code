@@ -55,6 +55,12 @@ cd ~/GNSS/v4.1
 The `master-scripts` branch is the clean, focused version intended for
 running a station. Every command below assumes you are in that directory.
 
+> **You will need your antenna surveyed latitude, longitude and height.**
+> If you do not have them yet, see
+> [`docs/GETTING_A_POSITION.md`](docs/GETTING_A_POSITION.md) -- the
+> receiver you are installing can survey itself for free in about a
+> day, and you can start recording before you have the result.
+
 ## Step 1: Install everything
 
 > **Do Step 3 first if your receiver is not yet connected and named.**

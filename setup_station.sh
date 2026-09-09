@@ -187,7 +187,17 @@ echo "Use plain decimal degrees only -- NOT degrees/minutes/seconds"
 echo "(e.g. use 41.8928, not 41 53'34\")."
 latitude=$(require_numeric_prompt "Latitude (decimal degrees)" "41.8928") || exit 1
 longitude=$(require_numeric_prompt "Longitude (decimal degrees)" "-69.9633") || exit 1
-height=$(require_numeric_prompt "Antenna height (meters, ellipsoidal)" "21.774") || exit 1
+echo ""
+echo "  The next three values come from a survey of your antenna."
+echo "  If you do not have one yet, see docs/GETTING_A_POSITION.md --"
+echo "  your own receiver can survey itself for free in about a day."
+echo ""
+echo "  Ellipsoidal height is height above the WGS84 ellipsoid, NOT"
+echo "  above sea level, and is often NEGATIVE. In the northeastern"
+echo "  US the geoid sits about 30 m above the ellipsoid, so an"
+echo "  antenna 19 m above the water reads about -10 m here."
+echo ""
+height=$(require_numeric_prompt "Antenna height (meters, ellipsoidal)" "-10.025") || exit 1
 
 echo ""
 echo "--- Marker / antenna ---"
