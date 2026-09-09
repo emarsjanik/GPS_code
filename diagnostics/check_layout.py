@@ -27,7 +27,12 @@ import py_compile
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+# Resolve the project root from this file's own location. The
+# script lives in diagnostics/, so the root is one level up -- but
+# tolerate being run from the root itself, which is where it used to
+# live and where someone may still copy it.
+_here = Path(__file__).resolve().parent
+PROJECT_ROOT = _here.parent if _here.name == "diagnostics" else _here
 
 # Files that should exist in station/ with real content (non-empty,
 # and valid Python). The description is shown only when something's

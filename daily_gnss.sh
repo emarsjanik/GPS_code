@@ -149,9 +149,9 @@ fi
 if $DO_UPLOAD; then
     log "--- Step 3: upload month-foldered timeseries ---"
 
-    if [ -x "$PROJECT_DIR/s3UploadTimeseries.sh" ]; then
+    if [ -x "$PROJECT_DIR/maintenance/s3UploadTimeseries.sh" ]; then
         ts_start=$(date +%s)
-        if "$PROJECT_DIR/s3UploadTimeseries.sh" >>"$LOG_FILE" 2>&1; then
+        if "$PROJECT_DIR/maintenance/s3UploadTimeseries.sh" >>"$LOG_FILE" 2>&1; then
             ts_elapsed=$(( $(date +%s) - ts_start ))
             log "Timeseries upload completed in ${ts_elapsed}s."
         else

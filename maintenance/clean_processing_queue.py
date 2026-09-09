@@ -54,7 +54,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent
+# This script lives in maintenance/, so the project root is one
+# level up. Tolerates being run from the root itself.
+_here = Path(__file__).resolve().parent
+PROJECT_DIR = _here.parent if _here.name == "maintenance" else _here
 
 
 def station_code() -> str:

@@ -35,7 +35,9 @@
 
 set -uo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This script now lives in maintenance/, so the project root is
+# one level up from the script itself.
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RINEX_DIR="$PROJECT_DIR/rinex"
 
 EXECUTE=false

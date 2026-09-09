@@ -16,7 +16,7 @@
 # deeper.
 #
 # Unlike running the underlying tools directly (python -m unittest,
-# check_layout.py, ...), this summarizes each one into a single
+# diagnostics/check_layout.py, ...), this summarizes each one into a single
 # pass/fail line with a short, plain-language explanation of what
 # went wrong and what to do about it -- the full, detailed output
 # from any failing step is saved to a log file so you (or someone
@@ -275,8 +275,8 @@ fi
 
 section "4. Project layout"
 
-if [ -f "$PROJECT_DIR/check_layout.py" ]; then
-    if run_logged "check_layout.py" python3 "$PROJECT_DIR/check_layout.py"; then
+if [ -f "$PROJECT_DIR/diagnostics/check_layout.py" ]; then
+    if run_logged "diagnostics/check_layout.py" python3 "$PROJECT_DIR/diagnostics/check_layout.py"; then
         report_pass "Project layout check passed"
     else
         report_fail "Project layout check found a problem"
@@ -284,7 +284,7 @@ if [ -f "$PROJECT_DIR/check_layout.py" ]; then
         tail -15 "$LOG_FILE" | sed 's/^/         /'
     fi
 else
-    report_warn "check_layout.py not found -- skipping this check"
+    report_warn "diagnostics/check_layout.py not found -- skipping this check"
 fi
 
 # ----------------------------------------------------------------

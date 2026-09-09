@@ -92,8 +92,8 @@ overall_status=0
 # ----------------------------------------------------------------
 log "--- Step 1: compress completed days ---"
 
-if [ -x "$PROJECT_DIR/compress_rinex.sh" ]; then
-    if "$PROJECT_DIR/compress_rinex.sh" --execute --keep-days "$COMPRESS_KEEP_DAYS" >>"$LOG_FILE" 2>&1; then
+if [ -x "$PROJECT_DIR/maintenance/compress_rinex.sh" ]; then
+    if "$PROJECT_DIR/maintenance/compress_rinex.sh" --execute --keep-days "$COMPRESS_KEEP_DAYS" >>"$LOG_FILE" 2>&1; then
         log "Compression step completed."
     else
         log "WARNING: compression step returned non-zero -- see log above."
@@ -143,8 +143,8 @@ fi
 if $DO_PRUNE; then
     log "--- Step 3: prune local archives already in S3 ---"
 
-    if [ -x "$PROJECT_DIR/prune_local_rinex.sh" ]; then
-        if SYNC_SCRIPT="$SYNC_SCRIPT" "$PROJECT_DIR/prune_local_rinex.sh" \
+    if [ -x "$PROJECT_DIR/maintenance/prune_local_rinex.sh" ]; then
+        if SYNC_SCRIPT="$SYNC_SCRIPT" "$PROJECT_DIR/maintenance/prune_local_rinex.sh" \
                 --execute --keep-days "$KEEP_DAYS" >>"$LOG_FILE" 2>&1; then
             log "Prune step completed."
         else

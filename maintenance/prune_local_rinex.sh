@@ -44,7 +44,7 @@ set -uo pipefail
 # paths, and station code are per-deployment rather than baked into
 # shared code.
 # ---------------------------------------------------------------
-CONF_FILE="${ARCHIVE_CONF:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/archive.conf}"
+CONF_FILE="${ARCHIVE_CONF:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/archive.conf}"
 if [ ! -f "$CONF_FILE" ]; then
     echo "Configuration not found: $CONF_FILE"
     echo ""
@@ -64,7 +64,9 @@ for _required in S3_BASE STATION_CODE; do
 done
 AWS_CLI="${AWS_CLI:-/usr/local/bin/aws}"
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This script now lives in maintenance/, so the project root is
+# one level up from the script itself.
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RINEX_DIR="$PROJECT_DIR/rinex"
 S3_PREFIX="$S3_BASE/rinex"
 AWS="$AWS_CLI"

@@ -33,7 +33,7 @@
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HEALTH_SCRIPT="$PROJECT_DIR/station_health.py"
+HEALTH_SCRIPT="$PROJECT_DIR/diagnostics/station_health.py"
 
 STATION_CODE=$(python3 -c "
 import json
