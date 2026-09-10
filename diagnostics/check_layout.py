@@ -102,6 +102,7 @@ REQUIRED_SUPPORT_SCRIPTS = {
     "maintenance/filter_month.py": "slices whole-record timeseries into single months",
     "maintenance/clean_processing_queue.py": "clears queue entries whose raw file is gone",
     "maintenance/recover_missing_days.sh": "reprocesses a day from external storage",
+    "maintenance/prepare_ppp_upload.py": "thins a day of RINEX for upload to a positioning service",
     "diagnostics/check_layout.py": "this script",
     "diagnostics/station_health.py": "is the station working right now?",
     "diagnostics/validate_station.py": "is an apparent signal real, or an artifact?",

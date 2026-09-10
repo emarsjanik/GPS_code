@@ -45,23 +45,30 @@ applies and every water level shifts by the same amount.
 
 ---
 
-## Step 2: find the RINEX file
-
-The station writes one observation file per day:
+## Step 2: prepare the file
 
 ```bash
-ls -la rinex/*.obs
+python3 maintenance/prepare_ppp_upload.py
 ```
 
-If the day has already been compressed into an archive, unpack it:
+That takes yesterday's complete day and writes
+`ppp_upload_YYYYMMDD.obs` in the project directory.
+
+Two things it does that matter. It picks a **complete** day -- a
+partial one gives a worse position, and today's file is still being
+written. And it thins the data from one reading per second to one
+every thirty, which is what static positioning uses. Your day of
+recording is around 386 MB; the prepared file is about 13 MB, which
+is a far more practical upload and gives exactly the same position.
+
+For a different day:
 
 ```bash
-tar -xzf rinex/station_YYYYMMDD.tar.gz -C rinex/
+python3 maintenance/prepare_ppp_upload.py --date 2026-09-09
 ```
 
-You want the `.obs` file. It will be a few hundred megabytes.
-
----
+If it cannot find the day you asked for, it will tell you which days
+are available.
 
 ## Step 3: upload it for processing
 
