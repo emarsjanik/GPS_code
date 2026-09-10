@@ -191,6 +191,28 @@ def msl_offset(project_dir: Path) -> float:
         return 0.0
 
 
+def _peak_of_each_run(flags, values):
+    """Indices of the largest-magnitude sample in each run of
+    consecutive True flags.
+
+    A departure lasting longer than the sampling interval sets
+    several adjacent flags. Marking each one implies several events
+    where there was one, so each run is reduced to its peak.
+    """
+    peaks = []
+    run = []
+    for i, flag in enumerate(flags):
+        if flag:
+            run.append(i)
+            continue
+        if run:
+            peaks.append(max(run, key=lambda j: abs(values[j])))
+            run = []
+    if run:
+        peaks.append(max(run, key=lambda j: abs(values[j])))
+    return peaks
+
+
 def split_on_gaps(times, values, max_gap_minutes=90):
     """Breaks the series wherever data is missing.
 
@@ -329,9 +351,14 @@ def main() -> int:
         big = np.isfinite(departure) & (np.abs(departure) >= args.departure_threshold)
 
         if big.any():
-            # Annotate the single largest departure rather than every
-            # point above the threshold, which would be unreadable.
-            i = int(np.nanargmax(np.abs(np.where(big, departure, np.nan))))
+            # One dot per event, at its peak -- not one per sample
+            # above the threshold, which turns a single hour-long
+            # departure into several apparently separate marks.
+            peaks = _peak_of_each_run(big, departure)
+
+            # Only the largest across the whole window is labelled;
+            # annotating every peak would crowd a busy week.
+            i = max(peaks, key=lambda j: abs(departure[j]))
             ax.annotate(
                 f"{departure[i]:+.2f} metres from the prediction",
                 xy=(t_sel[i], v_plot[i]),
@@ -339,9 +366,9 @@ def main() -> int:
                 textcoords="offset points", ha="center", fontsize=9,
                 color="#b3450c",
                 arrowprops=dict(arrowstyle="->", color="#b3450c", linewidth=1.0))
-            ax.plot([t_sel[j] for j in np.where(big)[0]],
-                    [v_plot[j] for j in np.where(big)[0]],
-                    linestyle="none", marker="o", markersize=3.5,
+            ax.plot([t_sel[j] for j in peaks],
+                    [v_plot[j] for j in peaks],
+                    linestyle="none", marker="o", markersize=4.5,
                     color="#b3450c", zorder=3)
 
     ax.axhline(0.0, color="#999999", linewidth=0.8, linestyle="--", zorder=0)
