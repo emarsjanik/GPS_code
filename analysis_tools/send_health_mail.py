@@ -159,6 +159,45 @@ def deviation_stats() -> str:
     return recent_note + "\n".join(lines).strip()
 
 
+# Images larger than this are downscaled before attaching. The GNSS
+# plots are around 200 KB and are left alone; the waterline
+# elevation maps are several megabytes and are not.
+DOWNSCALE_ABOVE_BYTES = 1_000_000
+DOWNSCALE_LONG_EDGE = 1400
+DOWNSCALE_QUALITY = 85
+
+
+def _downscale_for_email(path: Path, tmpdir: Path):
+    """Returns (bytes, filename) for attaching.
+
+    Falls back to the original on any failure -- a large attachment
+    is better than a missing one, and this runs unattended.
+    """
+    raw = path.read_bytes()
+    if len(raw) <= DOWNSCALE_ABOVE_BYTES:
+        return raw, path.name, False
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return raw, path.name, False
+
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            scale = DOWNSCALE_LONG_EDGE / max(w, h)
+            if scale >= 1.0:
+                return raw, path.name, False
+            im = im.resize((int(w * scale), int(h * scale)),
+                           Image.LANCZOS)
+            out = tmpdir / (path.stem + ".jpg")
+            im.save(out, "JPEG", quality=DOWNSCALE_QUALITY, optimize=True)
+        return out.read_bytes(), out.name, True
+    except Exception:
+        return raw, path.name, False
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--subject", required=True)
@@ -194,24 +233,33 @@ def main() -> int:
     msg["To"] = ", ".join(args.to)
     msg.set_content(body)
 
-    for path in attached:
-        msg.add_attachment(path.read_bytes(),
-                           maintype="image", subtype="png",
-                           filename=path.name)
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="health_mail_") as td:
+        tmpdir = Path(td)
+        for path in attached:
+            data, name, shrunk = _downscale_for_email(path, tmpdir)
+            subtype = "jpeg" if name.lower().endswith(".jpg") else "png"
+            msg.add_attachment(data, maintype="image", subtype=subtype,
+                               filename=name)
+            if shrunk:
+                print(f"  {path.name}: {path.stat().st_size / 1e6:.1f} MB "
+                      f"-> {len(data) / 1e6:.2f} MB for email", file=sys.stderr)
 
-    if args.dry_run:
-        print(f"--- would send to: {' '.join(args.to)} ---")
-        print(f"Subject: {args.subject}")
-        print(f"Attachments: {[p.name for p in attached] or 'none'}")
-        print()
-        print(body)
-        return 0
+        if args.dry_run:
+            print(f"--- would send to: {' '.join(args.to)} ---")
+            print(f"Subject: {args.subject}")
+            print(f"Attachments: {[p.name for p in attached] or 'none'}")
+            print()
+            print(body)
+            return 0
 
-    r = subprocess.run(["msmtp"] + args.to,
-                       input=msg.as_bytes(), capture_output=True)
+        r = subprocess.run(["msmtp"] + args.to,
+                           input=msg.as_bytes(), capture_output=True)
     if r.returncode != 0:
         sys.stderr.write(r.stderr.decode(errors="replace"))
     return r.returncode
+
+
 
 
 if __name__ == "__main__":

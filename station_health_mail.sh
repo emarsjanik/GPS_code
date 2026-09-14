@@ -41,7 +41,7 @@ d = json.load(open('$PROJECT_DIR/station/resources/station.json'))
 print((d.get('gnssrefl_station_code') or (d.get('station_id') or '')[:4]).lower() or 'usgs')
 " 2>/dev/null || echo usgs)
 
-RECIPIENTS="emarsjanik@usgs.gov csherwood@usgs.gov"
+RECIPIENTS="emarsjanik@usgs.gov csherwood@usgs.gov cvolpano@contractor.usgs.gov"
 
 STATION_NAME="$(python3 -c "
 import json
@@ -127,7 +127,9 @@ for attempt in $(seq 1 "$MAIL_ATTEMPTS"); do
         --subject "$SUBJECT" \
         --to $RECIPIENTS \
         --attach "$PLOTS_DIR/${STATION_CODE}_vs_tide.png" \
-        --attach "$PLOTS_DIR/7_day_plot.png"
+        --attach "$PLOTS_DIR/7_day_plot.png" \
+        --attach "/mnt/I2Rgus_Data/waterline/elevation_map_c1_7day.png" \
+        --attach "/mnt/I2Rgus_Data/waterline/elevation_map_c2_7day.png"
     mail_exit=$?
 
     if [ "$mail_exit" -eq 0 ]; then
