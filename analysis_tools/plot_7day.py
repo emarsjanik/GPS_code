@@ -294,15 +294,18 @@ def main() -> int:
     qc_line = None
     if not args.no_qc:
         try:
-            from water_level_qc import FAIL, GAUGE_STATION, qc_series
+            from water_level_qc import GAUGE_STATION, public_mask, qc_series
             cache = (Path(args.gauge_cache) if args.gauge_cache else
                      Path(args.output).resolve().parent / f"gauge_{GAUGE_STATION}.csv")
-            flags, summarize = qc_series(times, values, cache)
-            failed = flags >= FAIL
-            values = np.where(failed, np.nan, values)
+            flags, ep, summarize = qc_series(times, values, cache)
+            # Failed readings, plus the spline next to them and short
+            # pieces left between failures (see water_level_qc.py).
+            hidden = ~public_mask(ep, flags)
+            values = np.where(hidden, np.nan, values)
             win_start = max(times) - timedelta(days=args.days)
-            n_failed_window = int(sum(1 for t, f in zip(times, failed) if f and t >= win_start))
-            qc_line = summarize(win_start.replace(tzinfo=timezone.utc).timestamp())
+            n_failed_window = int(sum(1 for t, h in zip(times, hidden) if h and t >= win_start))
+            qc_line = (summarize(win_start.replace(tzinfo=timezone.utc).timestamp())
+                       + f"; {n_failed_window} left blank on the plot")
         except Exception as exc:          # never lose the plot over the check
             print(f"  QC not applied: {exc}")
 
