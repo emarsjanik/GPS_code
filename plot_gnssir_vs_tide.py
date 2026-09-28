@@ -4,10 +4,11 @@ plot_gnssir_vs_tide.py
 
 Generates a line graph directly overlaying the GNSS-IR water level
 (gnssrefl's evenly-sampled spline output) against the tide model, on
-a shared time and value axis -- so the real agreement in shape, and
-the real, still-unresolved constant offset between them, are both
-visible directly, honestly, without artificially aligning the two
-curves to hide the open question.
+a shared time and value axis in NAVD88 -- the GNSS-IR through
+gnssrefl_orthometric_height (19.014 m, NGS OPUS), the model through
+--tide-datum-offset (+0.09 m, see station_datum.py) -- so any offset
+still visible between them is real, not a datum artefact. Nothing is
+de-meaned or aligned.
 
 Confirmed, real file format used here (from direct inspection
 earlier in this project): gnssrefl's own evenly-sampled spline
@@ -35,6 +36,8 @@ matplotlib.use("Agg")  # write directly to a file, no display needed
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
+
+from station_datum import TIDE_MODEL_TO_NAVD88_M
 
 
 def load_spline_output(path: Path):
@@ -98,6 +101,9 @@ def main():
     p.add_argument("--tide-file", required=True)
     p.add_argument("--tide-time-col", default="time")
     p.add_argument("--tide-value-col", required=True)
+    p.add_argument("--tide-datum-offset", type=float, default=TIDE_MODEL_TO_NAVD88_M,
+                   help=f"Added to the tide model to put it on NAVD88 (default "
+                        f"{TIDE_MODEL_TO_NAVD88_M}, see station_datum.py; 0 for the raw model)")
     p.add_argument("--output", default="gnssir_vs_tide.png")
     p.add_argument("--start-date", default=None, help="YYYY-MM-DD, optional, restricts the plotted window")
     p.add_argument("--end-date", default=None, help="YYYY-MM-DD, optional, restricts the plotted window")
@@ -111,6 +117,7 @@ def main():
     tide_times, tide_values = load_tide_reference(
         Path(args.tide_file), args.tide_time_col, args.tide_value_col
     )
+    tide_values = np.asarray(tide_values, dtype=float) + args.tide_datum_offset
     print(f"Loaded {len(tide_times)} tide model points")
 
     if args.start_date:
@@ -136,13 +143,13 @@ def main():
     ax.plot(spline_times, spline_values, color="tab:blue", linewidth=1.2,
             label="GNSS-IR water level (this station)")
     ax.plot(tide_times, tide_values, color="tab:orange", linewidth=1.0,
-            alpha=0.85, label=f"Tide model ({args.tide_value_col})")
+            alpha=0.85, label=f"Tide model ({args.tide_value_col}, {args.tide_datum_offset:+.2f} m)")
 
     ax.set_xlabel("Date")
-    ax.set_ylabel("Water level (m)")
-    ax.set_title("GNSS-IR Water Level vs. Tide Model\n"
-                  "(shown on a shared, unadjusted axis -- any constant vertical "
-                  "offset between the two references is intentionally left visible, not corrected)")
+    ax.set_ylabel("Water level (m NAVD88)")
+    ax.set_title("GNSS-IR Water Level vs. Tide Model (NAVD88)\n"
+                  f"(shared axis, nothing aligned; model {args.tide_datum_offset:+.2f} m to NAVD88 -- "
+                  "any offset still visible is real)")
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
 

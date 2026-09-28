@@ -10,19 +10,18 @@ track together), but the real magnitude of disagreement.
 Reports two numbers, deliberately kept separate:
 
     RAW RMS difference
-        The literal difference between the two series. Includes
-        whatever unresolved vertical-datum offset exists between
-        gnssrefl_orthometric_height (not independently confirmed to
-        be NAVD88-referenced) and the tide model's own reference --
-        so this number conflates "does the tidal SIGNAL agree" with
-        "do the two vertical datums happen to agree", which have not
-        been established to be the same thing.
+        The literal difference between the two series. Both are on
+        NAVD88: the GNSS-IR through gnssrefl_orthometric_height
+        (19.014 m, NGS OPUS), the model through --tide-datum-offset
+        (+0.09 m, see station_datum.py). A remaining mean offset is
+        real (surge, setup, a bias) or means one of those two numbers
+        is wrong. A spline made before station.json was corrected used
+        18.665 m (CGVD2013) and reads 0.349 m low.
 
     DE-MEANED RMS difference (mean offset removed first)
         Isolates whether the SHAPE and AMPLITUDE of the two signals
         agree, independent of any constant vertical offset between
-        them. This is the more interpretable number until the datum
-        question is separately resolved.
+        them.
 
 Confirmed, real file format used here (from direct inspection
 earlier in this project): gnssrefl's own evenly-sampled spline
@@ -48,6 +47,8 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+from station_datum import TIDE_MODEL_TO_NAVD88_M
 
 
 def load_spline_output(path: Path):
@@ -144,6 +145,9 @@ def main():
     p.add_argument("--tide-file", required=True)
     p.add_argument("--tide-time-col", default="time")
     p.add_argument("--tide-value-col", required=True)
+    p.add_argument("--tide-datum-offset", type=float, default=TIDE_MODEL_TO_NAVD88_M,
+                   help=f"Added to the tide model to put it on NAVD88 (default "
+                        f"{TIDE_MODEL_TO_NAVD88_M}, see station_datum.py; 0 for the raw model)")
     args = p.parse_args()
 
     spline_times, spline_values = load_spline_output(Path(args.spline_file))
@@ -154,6 +158,7 @@ def main():
     tide_times, tide_values = load_tide_reference(
         Path(args.tide_file), args.tide_time_col, args.tide_value_col
     )
+    tide_values = np.asarray(tide_values, dtype=float) + args.tide_datum_offset
     print(f"Loaded {len(tide_times)} tide model points")
 
     tide_at_spline_times = interpolate_reference(tide_times, tide_values, spline_times)
@@ -184,7 +189,7 @@ def main():
     print(f"Points compared         : {n_valid}")
     print(f"Mean offset (GNSS - tide): {mean_offset:+.3f} m")
     print(f"RAW RMS difference       : {raw_rms:.3f} m")
-    print(f"  (includes any unresolved vertical-datum offset -- see script docstring)")
+    print(f"  (both on NAVD88 -- see script docstring)")
     print(f"DE-MEANED RMS difference : {demeaned_rms:.3f} m")
     print(f"  (offset removed; squares each error before averaging, so this weights")
     print(f"   occasional larger deviations more heavily than a plain average would)")

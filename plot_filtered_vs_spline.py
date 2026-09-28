@@ -26,7 +26,6 @@ Usage:
     python3 plot_filtered_vs_spline.py \\
         --filtered-file products/refl_code/Files/usgs/usgs_2026_subdaily_edit.txt \\
         --spline-file products/refl_code/Files/usgs/usgs_spline_out.txt \\
-        --hortho 18.625 \\
         --doy1 205 --doy2 225 \\
         --output filtered_vs_spline.png
 """
@@ -42,6 +41,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
+
+from station_datum import station_hortho
 
 
 def load_filtered_results(path: Path, hortho: float, doy1: int, doy2: int):
@@ -120,7 +121,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--filtered-file", required=True)
     p.add_argument("--spline-file", required=True)
-    p.add_argument("--hortho", type=float, required=True)
+    p.add_argument("--hortho", type=float, default=None,
+                   help="Antenna orthometric height (default: station.json, NAVD88)")
     p.add_argument("--doy1", type=int, required=True)
     p.add_argument("--doy2", type=int, required=True)
     p.add_argument("--year", type=int, default=2026)
@@ -128,7 +130,8 @@ def main():
     args = p.parse_args()
 
     filt_times, filt_values = load_filtered_results(
-        Path(args.filtered_file), args.hortho, args.doy1, args.doy2
+        Path(args.filtered_file),
+        args.hortho if args.hortho is not None else station_hortho(), args.doy1, args.doy2
     )
     print(f"Loaded {len(filt_times)} FILTERED retrievals (post outlier-removal)")
 

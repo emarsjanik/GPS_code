@@ -3,8 +3,8 @@
 process_all_and_plot.py
 
 Single-command GNSS-IR pipeline: finds every available day of raw SNR
-data, reprocesses all of it fresh through gnssir (production RH range,
--0.5 to 5.0m), builds a water-level time series, and overlays it
+data, reprocesses all of it fresh through gnssir (production RH range
+from station.json, 17-23 m at Marconi), builds a water-level time series, and overlays it
 against the real tide model in one plot.
 
 DESIGNED TO BE SIMPLE TO RUN:
@@ -16,16 +16,20 @@ workbook if there's exactly one .xlsx in the current directory, and
 process every day it has local SNR data for. Override any of that
 with flags if needed (see --help).
 
-IMPORTANT -- THE OFFSET CONSTANT
----------------------------------
-OFFSET_M below (currently +0.242m) is NOT a confirmed, validated datum
-correction. It was derived from a population-wide average across many
-different satellite tracks, and a careful per-track breakdown showed
-those tracks disagree with each other by up to ~1.75m -- inconsistent
-with a genuine, single physical datum offset. Treat this as a labeled,
-adjustable placeholder, not an established fact. It is applied and
-clearly marked on the plot so it's easy to see, question, and change.
-Set OFFSET_M = 0.0 (or pass --offset 0) to see the uncorrected result.
+VERTICAL DATUM -- EVERYTHING IS NAVD88
+--------------------------------------
+GNSS-IR water level = Hortho - RH, with Hortho read from station.json
+(19.014 m, NGS OPUS NAVD88/GEOID18). The tide model is shifted onto
+NAVD88 with TIDE_MODEL_TO_NAVD88_M (+0.09 m). Both curves share ONE
+axis, so any remaining offset is real and visible in the residual
+panel. See station_datum.py for where each number comes from.
+
+The old OFFSET_M = +0.242 m is gone (now 0). It was the empirical gap
+between the two curves, and is explained by two datum errors: Hortho
+18.665 m was CGVD2013, 0.349 m below NAVD88, and the model sits
+~0.09 m below NAVD88 (0.349 - 0.09 ~ 0.26). Adding it on top of the
+corrected Hortho would count the correction twice. --offset still
+exists for experiments and is labelled on the plot when non-zero.
 
 WHAT THIS ASSUMES
 ------------------
@@ -59,16 +63,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from openpyxl import load_workbook
 
+from station_datum import TIDE_MODEL_TO_NAVD88_M, hortho_note, station_hortho
+
 
 # ---------------------------------------------------------------------
 # CONFIGURATION -- the few things you might actually want to change
 # ---------------------------------------------------------------------
 
-# See the "IMPORTANT" note in the module docstring above before
-# trusting this value.
-OFFSET_M = 0.242
+# Extra shift added to GNSS-IR levels. 0: the datum is now handled by
+# Hortho (see "VERTICAL DATUM" above). Was +0.242 before that fix.
+OFFSET_M = 0.0
 
-H_ORTHO_M = 18.665  # station orthometric height, from station.json
+H_ORTHO_M = station_hortho()  # station orthometric height, from station.json
 
 TIDE_MODEL_COLUMNS_SUFFIX = "_heightm"  # matches marconi_tides_*.xlsx format
 
@@ -243,10 +249,21 @@ def load_spline(spline_path, year):
 
     times = []
     water_levels = []
+    file_hortho = None
 
     for line in spline_path.read_text(errors="replace").splitlines():
         line = line.strip()
-        if not line or line.startswith("%"):
+        if not line:
+            continue
+        if line.startswith("%"):
+            if "orthometric height" in line.lower() or "Hortho" in line:
+                for tok in line.replace(",", " ").split():
+                    try:
+                        val = float(tok)
+                    except ValueError:
+                        continue
+                    if 0.0 < val < 1000.0:
+                        file_hortho = val
             continue
         parts = line.split()
         if len(parts) < 9:
@@ -271,7 +288,17 @@ def load_spline(spline_path, year):
     if not times:
         return None, None
 
-    return times, np.array(water_levels, dtype=float)
+    water_levels = np.array(water_levels, dtype=float)
+    # gnssrefl takes Hortho from $REFL_CODE/input/<station>.json, which
+    # is only rewritten from station.json when the station restarts.
+    # If the two differ, put the spline on station.json's datum so it
+    # matches the raw arcs.
+    if file_hortho is not None and abs(file_hortho - H_ORTHO_M) >= 0.001:
+        print(f"NOTE: spline was made with Hortho {file_hortho:.3f} m, station.json says "
+              f"{H_ORTHO_M:.3f} m; shifting the spline {H_ORTHO_M - file_hortho:+.3f} m. "
+              f"Restart the station so gnssrefl's own json picks up the new value.")
+        water_levels = water_levels + (H_ORTHO_M - file_hortho)
+    return times, water_levels
 
 
 # ---------------------------------------------------------------------
@@ -283,7 +310,7 @@ def load_results(station, year, doys, refl_code_dir):
 
     rows = []
     for doy in doys:
-        path = result_dir / f"{doy}.txt"
+        path = result_dir / f"{doy:03d}.txt"  # gnssrefl zero-pads (gps.LSPresult_name)
         if not path.exists():
             continue
 
@@ -320,7 +347,7 @@ def load_results(station, year, doys, refl_code_dir):
 # TIDE MODEL
 # ---------------------------------------------------------------------
 
-def load_tide_model(tide_path):
+def load_tide_model(tide_path, datum_offset=TIDE_MODEL_TO_NAVD88_M):
     wb = load_workbook(tide_path, data_only=True)
     ws = wb[wb.sheetnames[0]]
     rows = list(ws.iter_rows(values_only=True))
@@ -368,7 +395,8 @@ def load_tide_model(tide_path):
         print("ERROR: insufficient tide model data.")
         sys.exit(1)
 
-    ensemble = np.mean([values[name] for name in model_cols], axis=0)
+    # Ensemble mean, moved onto NAVD88 (see station_datum.py).
+    ensemble = np.mean([values[name] for name in model_cols], axis=0) + datum_offset
     epoch = np.array([(t - times[0]).total_seconds() for t in times], dtype=float)
 
     def tide_at(dt):
@@ -384,45 +412,72 @@ def load_tide_model(tide_path):
 # PLOT
 # ---------------------------------------------------------------------
 
-def make_plot(rows, tide_times, tide_ensemble, offset_m, model_names,
-              spline_times=None, spline_water_level=None):
-    fig, ax1 = plt.subplots(figsize=(14, 7))
+def residual_stats(rows, tide_at, offset_m):
+    """GNSS-IR arc minus tide model (both NAVD88): (n, mean, std) or None."""
+    diffs = []
+    for r in rows:
+        tide = tide_at(r["datetime"])
+        if np.isfinite(tide):
+            diffs.append(r["water_level_raw_m"] + offset_m - tide)
+    if len(diffs) < 10:
+        return None
+    d = np.array(diffs)
+    return len(d), float(np.mean(d)), float(np.std(d))
+
+
+def make_plot(rows, tide_times, tide_ensemble, offset_m, model_names, tide_at,
+              tide_datum_offset, spline_times=None, spline_water_level=None):
+    # ONE shared axis: both series are NAVD88, so the vertical gap
+    # between them is real. (A twin axis autoscales each series on its
+    # own and hides any offset.)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9), sharex=True,
+                                   gridspec_kw={"height_ratios": [3, 1]})
 
     dts = [r["datetime"] for r in rows]
-    wl_corrected = [r["water_level_raw_m"] + offset_m for r in rows]
+    wl = [r["water_level_raw_m"] + offset_m for r in rows]
 
     # Raw, individual observations -- always shown, since smoothing
     # can hide real scatter/disagreement that's worth seeing directly.
-    ax1.plot(dts, wl_corrected, "o", ms=3, alpha=0.5, color="tab:orange",
-              label=f"GNSS-IR raw arcs (+{offset_m:.3f}m offset)")
+    label = "GNSS-IR raw arcs"
+    if offset_m != 0.0:
+        label += f" ({offset_m:+.3f} m extra offset)"
+    ax1.plot(dts, wl, "o", ms=3, alpha=0.5, color="tab:orange", label=label)
 
     # Optional smoothed spline overlay, if available. spline_water_level
     # is already Hortho - RH as computed by gnssrefl itself (see
     # load_spline docstring) -- not recomputed here.
     if spline_times is not None and spline_water_level is not None:
-        spline_wl = spline_water_level + offset_m
-        ax1.plot(spline_times, spline_wl, "-", linewidth=1.5, color="darkorange",
-                  label="GNSS-IR smoothed spline (subdaily, -knots 4)")
+        ax1.plot(spline_times, spline_water_level + offset_m, "-", linewidth=1.5,
+                 color="darkorange", zorder=3, label="GNSS-IR smoothed spline (subdaily, -knots 4)")
 
-    ax1.set_ylabel("GNSS-IR water level (m)", color="tab:orange")
-    ax1.tick_params(axis="y", labelcolor="tab:orange")
-
-    ax2 = ax1.twinx()
-    ax2.plot(tide_times, tide_ensemble, "-", color="tab:blue", linewidth=2,
-              label=f"Tide model (ensemble mean of {len(model_names)} models)")
-    ax2.set_ylabel("Tide model height (m)", color="tab:blue")
-    ax2.tick_params(axis="y", labelcolor="tab:blue")
-
-    title = "GNSS-IR Water Level vs. Tide Model"
-    if offset_m != 0.0:
-        title += f"\n(offset = {offset_m:+.3f}m -- see script docstring: NOT a validated constant)"
-    ax1.set_title(title)
-    ax1.set_xlabel("UTC")
+    ax1.plot(tide_times, tide_ensemble, "-", color="tab:blue", linewidth=2,
+             label=f"Tide model, mean of {len(model_names)} ({tide_datum_offset:+.2f} m to NAVD88)")
+    ax1.set_ylabel("Water level (m NAVD88)")
     ax1.grid(alpha=0.3)
+    ax1.legend(loc="upper right")
 
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+    # Residual panel: what the GNSS-IR saw that the model did not
+    # (surge, setup, bad arcs).
+    res_t, res = [], []
+    for t, v in zip(dts, wl):
+        tide = tide_at(t)
+        if np.isfinite(tide):
+            res_t.append(t)
+            res.append(v - tide)
+    ax2.plot(res_t, res, "o", ms=2, alpha=0.5, color="tab:gray")
+    ax2.axhline(0.0, color="k", linewidth=0.8)
+    ax2.set_ylabel("GNSS-IR - model (m)")
+    ax2.set_xlabel("UTC")
+    ax2.grid(alpha=0.3)
+
+    title = f"GNSS-IR Water Level vs. Tide Model (NAVD88, {hortho_note(H_ORTHO_M)})"
+    stats = residual_stats(rows, tide_at, offset_m)
+    if stats:
+        n, mean, std = stats
+        title += f"\nGNSS-IR - model: mean {mean:+.3f} m, std {std:.3f} m ({n} arcs)"
+    if offset_m != 0.0:
+        title += f"\n(extra offset {offset_m:+.3f} m applied to GNSS-IR -- see script docstring)"
+    ax1.set_title(title)
 
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -439,7 +494,7 @@ def write_csv(rows, tide_at, offset_m):
         writer = csv.writer(f)
         writer.writerow(["datetime_utc", "doy", "sat", "freq", "RH_m",
                           "water_level_raw_m", "water_level_corrected_m",
-                          "tide_ensemble_m"])
+                          "tide_ensemble_navd88_m"])
         for r in rows:
             tide = tide_at(r["datetime"])
             writer.writerow([
@@ -465,7 +520,11 @@ def parse_args():
     p.add_argument("--tide-file", default=None,
                     help="Path to tide model .xlsx (auto-detected if omitted and only one exists)")
     p.add_argument("--offset", type=float, default=None,
-                    help=f"Override the offset constant (default: {OFFSET_M}, see script docstring)")
+                    help=f"Extra shift added to GNSS-IR levels (default: {OFFSET_M}; "
+                         "the datum is handled by Hortho, see script docstring)")
+    p.add_argument("--tide-datum-offset", type=float, default=TIDE_MODEL_TO_NAVD88_M,
+                    help=f"Added to tide model heights to put them on NAVD88 "
+                         f"(default: {TIDE_MODEL_TO_NAVD88_M}, see station_datum.py)")
     p.add_argument("--refl-code", default=None,
                     help="Path to REFL_CODE directory (default: $REFL_CODE env var)")
     p.add_argument("--no-spline", action="store_true",
@@ -489,7 +548,9 @@ def main():
     print(f"Station        : {args.station}")
     print(f"Year           : {args.year}")
     print(f"REFL_CODE dir  : {refl_code_dir}")
-    print(f"Offset applied : {offset_m:+.3f} m  (see script docstring re: validity)")
+    print(f"Antenna height : {hortho_note(H_ORTHO_M)}")
+    print(f"Tide model     : {args.tide_datum_offset:+.3f} m to NAVD88")
+    print(f"Extra offset   : {offset_m:+.3f} m")
 
     tide_path = find_tide_workbook(args.tide_file)
 
@@ -528,11 +589,16 @@ def main():
             else:
                 print("WARNING: spline file could not be parsed; continuing with raw points only.")
 
-    tide_times, tide_ensemble, tide_at, model_names = load_tide_model(tide_path)
+    tide_times, tide_ensemble, tide_at, model_names = load_tide_model(
+        tide_path, args.tide_datum_offset)
     print(f"Tide models used: {model_names}")
 
-    plot_path = make_plot(rows, tide_times, tide_ensemble, offset_m, model_names,
-                            spline_times, spline_water_level)
+    plot_path = make_plot(rows, tide_times, tide_ensemble, offset_m, model_names, tide_at,
+                          args.tide_datum_offset, spline_times, spline_water_level)
+    stats = residual_stats(rows, tide_at, offset_m)
+    if stats:
+        print(f"GNSS-IR - model (NAVD88): mean {stats[1]:+.3f} m, std {stats[2]:.3f} m, "
+              f"{stats[0]} arcs")
     csv_path = write_csv(rows, tide_at, offset_m)
 
     print()

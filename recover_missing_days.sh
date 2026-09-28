@@ -124,7 +124,7 @@ if [ "$#" -eq 0 ]; then
     days_to_recover=()
     for doy_padded in $recoverable_doys; do
         doy=$((10#$doy_padded))  # force base-10 so e.g. "008" isn't read as invalid octal
-        local_results_file="$LOCAL_RESULTS_DIR/${doy}.txt"
+        local_results_file="$LOCAL_RESULTS_DIR/${doy_padded}.txt"  # gnssrefl zero-pads
         local_no_data_marker="$LOCAL_RESULTS_DIR/${doy}.no_data"
         # A day is only still "missing" if it has neither a real
         # results file NOR a no-data marker (see below) recording
@@ -252,7 +252,7 @@ for doy in "$@"; do
     # project's Python code (rinex_processor.py,
     # gnssrefl_processor.py) -- this shell script never had the
     # same verification until now.
-    results_file="$LOCAL_RESULTS_DIR/${doy}.txt"
+    results_file="$LOCAL_RESULTS_DIR/${doy_padded}.txt"  # gnssrefl zero-pads
 
     if [ ! -s "$results_file" ]; then
         echo "!! gnssir exited cleanly but produced no usable results for"
