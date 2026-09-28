@@ -37,6 +37,21 @@ storm (16 of 16 bad readings caught, 0 of 1471 good ones rejected).
 
 Only FAIL readings are removed; SUSPECT ones are kept.
 
+FOR PUBLIC DISPLAY (public_mask) two more rules, because the spline
+is one smooth curve fitted through every reading: bad readings bend it
+for about an hour either side, so points just outside a failed stretch
+pass the tests but are still pulled towards the bad values.
+
+  buffer        readings within PUBLIC_BUFFER_S of a failed one are
+                also left out.
+  fragments     a piece shorter than PUBLIC_MIN_SEGMENT_S that is left
+                between failures is dropped: an hour of data squeezed
+                between two failed stretches cannot be trusted, and on
+                a public plot it reads as a spike.
+
+On the real Sep 2026 storm the plain tests left short, steep pieces at
++1.3 to +1.8 m between the gaps; these rules remove them.
+
 GAUGE DATA are downloaded from the NOAA CO-OPS API (datum NAVD88,
 metric, UTC) and merged into a cache CSV, so a network outage falls
 back to what is already on disk.
@@ -66,6 +81,9 @@ REF_FIT_DAYS = 30
 MAX_RATE = 1.0                        # m per hour
 MAX_LAG_MIN = 180
 GAUGE_GAP_S = 720                     # gauge is 6-minute; wider gaps are gaps
+PUBLIC_BUFFER_S = 3600                # drop readings this close to a failure
+PUBLIC_MIN_SEGMENT_S = 3 * 3600       # drop shorter pieces left between failures
+SEGMENT_GAP_S = 90 * 60               # matches plot_7day.split_on_gaps
 
 GAUGE_STATION = "8447435"             # Chatham, Lydia Cove, MA
 API = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=water_level"
@@ -228,6 +246,38 @@ def run_qc(ep, lv, reference=None):
     return flags, [";".join(r) for r in reasons], fit
 
 
+def public_mask(ep, flags):
+    """
+    True where a reading may be shown publicly: not failed, not within
+    PUBLIC_BUFFER_S of a failed reading, and not part of a fragment
+    shorter than PUBLIC_MIN_SEGMENT_S that borders a removed reading.
+    """
+    ep = np.asarray(ep, dtype=float)
+    failed = np.asarray(flags) >= FAIL
+    show = ~failed
+    fail_ep = ep[failed]
+    if len(fail_ep):
+        # distance from each reading to the nearest failed one
+        j = np.searchsorted(fail_ep, ep)
+        after = fail_ep[np.minimum(j, len(fail_ep) - 1)]
+        before = fail_ep[np.maximum(j - 1, 0)]
+        near = np.minimum(np.abs(ep - after), np.abs(ep - before))
+        show &= near > PUBLIC_BUFFER_S
+
+    removed = ~show
+    idx = np.flatnonzero(show)
+    if len(idx):
+        # contiguous shown pieces: consecutive shown readings with no
+        # removed reading between them and no data gap
+        breaks = np.flatnonzero((np.diff(idx) > 1) | (np.diff(ep[idx]) > SEGMENT_GAP_S)) + 1
+        for seg in np.split(idx, breaks):
+            first, last = seg[0], seg[-1]
+            borders = (first > 0 and removed[first - 1]) or (last < len(ep) - 1 and removed[last + 1])
+            if borders and ep[last] - ep[first] < PUBLIC_MIN_SEGMENT_S:
+                show[seg] = False
+    return show
+
+
 def summary(flags, reasons, fit, ep=None, since=None) -> str:
     """One line for the log. `since` limits the counts to ep >= since."""
     sel = np.ones(len(flags), bool) if since is None else (np.asarray(ep) >= since)
@@ -259,7 +309,7 @@ def qc_series(times, values, gauge_cache: Path):
     end = datetime.fromtimestamp(ep.max(), tz=timezone.utc)
     reference = load_gauge(gauge_cache, start, end)
     flags, reasons, fit = run_qc(ep, values, reference)
-    return flags, (lambda since=None: summary(flags, reasons, fit, ep, since))
+    return flags, ep, (lambda since=None: summary(flags, reasons, fit, ep, since))
 
 
 def main() -> int:
@@ -278,7 +328,7 @@ def main() -> int:
         return 1
     cache = Path(args.gauge_cache) if args.gauge_cache else \
         Path(args.spline_file).parent / f"gauge_{GAUGE_STATION}.csv"
-    flags, summarize = qc_series(times, values, cache)
+    flags, _, summarize = qc_series(times, values, cache)
     print(summarize())
     days = {}
     for t, f in zip(times, flags):
