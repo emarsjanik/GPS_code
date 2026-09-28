@@ -50,7 +50,8 @@ standards than the internal diagnostic plots:
 
   - The predicted tide is shown alongside. Two curves tracking
     closely demonstrate the measurement works in a way one curve
-    cannot. Departures are labelled rather than left to be
+    cannot. Departures are marked with a numbered dot, each with its
+    own legend entry (when, and by how much), rather than left to be
     misread: a difference is not an error in either curve, it is
     the part of the water level that astronomy alone does not
     explain. They are marked only at high and low tide, comparing
@@ -92,6 +93,9 @@ import numpy as np
 # station's local zone so a reader sees the tide at the hour it
 # actually happens.
 DISPLAY_ZONE_LABEL = "Eastern Time"
+
+MARK_COLOUR = "#b3450c"
+MAX_MARKED = 8          # most high/low tides marked and listed in the legend
 
 
 class _USEastern(tzinfo):
@@ -439,21 +443,23 @@ def main() -> int:
                  if abs(d) >= args.departure_threshold]
 
         if marks:
-            # Only the largest across the whole window is labelled;
-            # annotating every peak would crowd a busy week.
-            i, kind, d = max(marks, key=lambda m: abs(m[2]))
-            ax.annotate(
-                f"{abs(d):.2f} metres {'above' if d > 0 else 'below'} "
-                f"the predicted {kind} tide",
-                xy=(t_sel[i], v_plot[i]),
-                xytext=(0, 28 if kind == "high" else -34),
-                textcoords="offset points", ha="center", fontsize=9,
-                color="#b3450c",
-                arrowprops=dict(arrowstyle="->", color="#b3450c", linewidth=1.0))
-            ax.plot([t_sel[m[0]] for m in marks],
-                    [v_plot[m[0]] for m in marks],
-                    linestyle="none", marker="o", markersize=4.5,
-                    color="#b3450c", zorder=3)
+            # Every marked tide gets a number beside its dot and its
+            # own legend entry saying when it was and by how much it
+            # differed. At most MAX_MARKED (the largest), so a stormy
+            # week does not bury the legend; numbered in time order.
+            marks = sorted(sorted(marks, key=lambda m: -abs(m[2]))[:MAX_MARKED])
+            for k, (i, kind, d) in enumerate(marks, start=1):
+                ax.plot([t_sel[i]], [v_plot[i]], linestyle="none", marker="o",
+                        markersize=4.5, color=MARK_COLOUR, zorder=3)
+                ax.annotate(str(k), xy=(t_sel[i], v_plot[i]),
+                            xytext=(0, 7 if kind == "high" else -15),
+                            textcoords="offset points", ha="center",
+                            fontsize=8.5, fontweight="bold", color=MARK_COLOUR)
+                when = t_sel[i].strftime("%b %d, %I:%M %p").replace(" 0", " ")
+                ax.plot([], [], linestyle="none", marker=f"${k}$", markersize=7,
+                        color=MARK_COLOUR,
+                        label=f"{when}\n{abs(d):.2f} m {'above' if d > 0 else 'below'} "
+                              f"predicted {kind} tide")
 
     ax.axhline(0.0, color="#999999", linewidth=0.8, linestyle="--", zorder=0)
 
