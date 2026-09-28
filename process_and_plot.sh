@@ -182,8 +182,8 @@ echo "  Station code: $STATION_CODE   Year: $YEAR"
 
 section "Step 1: Recovering previously missed days (if any)"
 
-if [ -f "$PROJECT_DIR/recover_missing_days.sh" ]; then
-    bash "$PROJECT_DIR/recover_missing_days.sh"
+if [ -f "$PROJECT_DIR/maintenance/recover_missing_days.sh" ]; then
+    bash "$PROJECT_DIR/maintenance/recover_missing_days.sh"
 else
     echo "  recover_missing_days.sh not found -- skipping this step."
     echo "  (This is only needed if you use external storage for"
