@@ -35,6 +35,14 @@ standards than the internal diagnostic plots:
     reflected signal, not read off a staff gauge, and the caption
     says so.
 
+  - Readings that fail an automatic quality check are left out
+    (water_level_qc.py). In heavy surf the reflections scatter off
+    waves and foam and the estimate can read metres too high; in the
+    25-26 Sep 2026 storm it reached ~3 m above what the NOAA gauge at
+    Chatham implied. Shown, those readings would be labelled as real
+    departures from the tide. They become gaps, and the caption says
+    so. --no-qc turns this off.
+
   - Gaps are left as gaps. The spline draws straight lines across
     missing data, which on a diagnostic plot is a recognisable
     artifact but on a public plot looks like a real, flat water
@@ -258,6 +266,11 @@ def main() -> int:
     p.add_argument("--tide-time-col", default=None)
     p.add_argument("--no-tide", action="store_true",
                    help="plot the water level alone, without the predicted tide")
+    p.add_argument("--no-qc", action="store_true",
+                   help="plot every reading, without the automatic quality check")
+    p.add_argument("--gauge-cache", default=None,
+                   help="CSV cache of the NOAA Chatham gauge used by the quality "
+                        "check (default: next to --output)")
     p.add_argument("--departure-threshold", type=float, default=0.25,
                    help="metres; departures larger than this are annotated "
                         "(default 0.25, about 2.8 sigma at this station)")
@@ -272,6 +285,26 @@ def main() -> int:
     if not times:
         print("No usable spline data found.")
         return 1
+
+    # Quality check on the whole record (the gauge fit uses the last
+    # 30 days), before the window is chosen. Failed readings become
+    # NaN, which breaks the line there and keeps them out of the
+    # departure labels.
+    n_failed_window = 0
+    qc_line = None
+    if not args.no_qc:
+        try:
+            from water_level_qc import FAIL, GAUGE_STATION, qc_series
+            cache = (Path(args.gauge_cache) if args.gauge_cache else
+                     Path(args.output).resolve().parent / f"gauge_{GAUGE_STATION}.csv")
+            flags, summarize = qc_series(times, values, cache)
+            failed = flags >= FAIL
+            values = np.where(failed, np.nan, values)
+            win_start = max(times) - timedelta(days=args.days)
+            n_failed_window = int(sum(1 for t, f in zip(times, failed) if f and t >= win_start))
+            qc_line = summarize(win_start.replace(tzinfo=timezone.utc).timestamp())
+        except Exception as exc:          # never lose the plot over the check
+            print(f"  QC not applied: {exc}")
 
     # The most recent N days present in the data, not the last N
     # calendar days -- if processing is a day behind, the plot should
@@ -404,17 +437,23 @@ def main() -> int:
             f"The blue line is the water level at {station_name} estimated "
             f"using reflected navigation satellite signals.\n")
 
+    if n_failed_window:
+        explain += ("Periods where the estimate failed an automatic quality check "
+                    "(for example in heavy surf) are left blank.\n")
+
     fig.text(0.01, 0.02,
              f"{explain}"
              f"Provisional data, subject to revision.   {span}   |   "
              f"U.S. Geological Survey",
              fontsize=7.5, color="#555555", va="bottom")
 
-    fig.tight_layout(rect=(0, 0.09, 0.86, 1))
+    fig.tight_layout(rect=(0, 0.11 if n_failed_window else 0.09, 0.86, 1))
     fig.savefig(args.output, dpi=150)
     print(f"Wrote {args.output}")
     print(f"  {len(t_sel)} points, {span}")
     print(f"  MSL offset applied: {-offset:+.3f} m")
+    if qc_line:
+        print(f"  {qc_line}")
     return 0
 
 
