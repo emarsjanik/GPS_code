@@ -30,7 +30,7 @@
     "gnssrefl_elevation_max": 15.0,
     "gnssrefl_reflector_height_min": 17.0,
     "gnssrefl_reflector_height_max": 23.0,
-    "gnssrefl_orthometric_height": 18.665,
+    "gnssrefl_orthometric_height": 19.014,
     "gnssrefl_max_arc_minutes": 40.0,
     "gnssrefl_elevation_span_tolerance": 1.0,
     "gnssrefl_direct_signal_poly_order": 2,

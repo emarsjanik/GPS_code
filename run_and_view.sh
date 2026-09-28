@@ -70,7 +70,7 @@ find_most_recent_run() {
     local end_day=${days[$end_idx]}
     local start_idx=$end_idx
 
-    while [ "$start_idx" -gt 0 ] && [ $((days[start_idx] - days[start_idx-1])) -eq 1 ]; do
+    while [ "$start_idx" -gt 0 ] && [ $((10#${days[start_idx]} - 10#${days[start_idx-1]})) -eq 1 ]; do
         start_idx=$((start_idx - 1))
     done
 

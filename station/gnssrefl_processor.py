@@ -755,18 +755,25 @@ class GnssIrProcessor:
 
         # Orthometric height reference (gnssrefl's own param: Hortho)
         # -- needed to report real, absolute water level rather than
-        # just relative reflector height. Never set for this station;
-        # a real, meaningful value for a future site.
+        # just relative reflector height. MUST be passed as a list:
+        # make_gnssir_input() only writes Hortho to the json
+        # `if type(Hortho) == list` (gnssir_input.py:398, gnssrefl
+        # 4.1.5) and silently drops a float. subdaily then falls back
+        # to ellipsoid height minus EGM96 geoid (sd_libs.py:816-822),
+        # 18.625 m at Marconi, so the configured value never reached
+        # the spline. subdaily unwraps a one-element list itself.
         orthometric_height = station_section.get("gnssrefl_orthometric_height")
         if orthometric_height is not None:
-            kwargs["Hortho"] = float(orthometric_height)
+            kwargs["Hortho"] = [float(orthometric_height)]
 
-        # Refraction model (gnssrefl's own param: refraction) -- 1 is
-        # the Bennett correction (gnssrefl's own default); matters
+        # Refraction model (gnssrefl's own param: refr_model, a string;
+        # "refraction" is only the on/off switch) -- 1 is the Bennett
+        # correction (gnssrefl's own default), 0 turns it off; matters
         # more for very tall or very short sites.
         refraction_model = station_section.get("gnssrefl_refraction_model")
         if refraction_model is not None:
-            kwargs["refraction"] = int(refraction_model)
+            kwargs["refr_model"] = str(int(refraction_model))
+            kwargs["refraction"] = int(refraction_model) != 0
 
         # Maximum arc length in minutes (gnssrefl's own param: delTmax)
         # -- library default is 75 minutes, documented as too long for
@@ -780,16 +787,13 @@ class GnssIrProcessor:
             kwargs["delTmax"] = float(max_arc_minutes)
 
         # Arc elevation-span quality control (gnssrefl's own param:
-        # ediff) -- requires every arc to span at least
-        # (e1+ediff) to (e2-ediff) degrees. Library default is 2,
-        # documented as too strict for a narrow elevation mask like
-        # ours (5-15 degrees is the documentation's own worked
-        # example for "you might want to make that a little
-        # stricter... an ediff of 1"). Confirmed directly against our
-        # own real pipeline output that this is actively rejecting
-        # real arcs at the default value. Only passed through if
-        # explicitly configured, so gnssrefl's own default applies
-        # otherwise.
+        # ediff) -- every arc must start within ediff degrees of e1
+        # and reach within ediff degrees of e2 (gnssir_v2.py:389-394).
+        # SMALLER is STRICTER: the library default 2 accepts arcs
+        # covering (e1+2) to (e2-2); 1 rejects any arc that does not
+        # reach (e1+1) to (e2-1). gnssrefl's docs suggest 1 for a
+        # narrow 5-15 degree mask. Only passed through if explicitly
+        # configured, so gnssrefl's own default applies otherwise.
         elevation_span_tolerance = station_section.get("gnssrefl_elevation_span_tolerance")
         if elevation_span_tolerance is not None:
             kwargs["ediff"] = float(elevation_span_tolerance)

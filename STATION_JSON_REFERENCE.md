@@ -169,13 +169,13 @@ through north: `[353, 360, 0, 173]` analyzes 353°–360° and 0°–173°
 
 | Field | Type | Description |
 |---|---|---|
-| `gnssrefl_orthometric_height` | number (meters) | Your antenna's height above a specific vertical datum (e.g. NAVD88, a local tide gauge datum). If set, gnssrefl reports real, absolute water level relative to this datum instead of just a relative reflector height. Meaningful for coastal sites; not typically applicable to interior lakes/rivers with no established local datum. |
+| `gnssrefl_orthometric_height` | number (meters) | Your antenna's height above a specific vertical datum (e.g. NAVD88, a local tide gauge datum). If set, gnssrefl reports real, absolute water level relative to this datum instead of just a relative reflector height. Meaningful for coastal sites; not typically applicable to interior lakes/rivers with no established local datum. **Check which height system the number is in.** A CSRS-PPP report gives CGVD2013 (Canadian), not NAVD88: for this station PPP said 18.665 m, NGS OPUS said 19.014 m NAVD88 (GEOID18), so every water level was 0.349 m low. Use an OPUS (or other NAVD88/GEOID18) height for US sites. See `station_datum.py`. |
 
 ### Refraction model
 
 | Field | Type | Description |
 |---|---|---|
-| `gnssrefl_refraction_model` | integer | Which tropospheric refraction correction to apply. `1` (gnssrefl's own default) is the standard Bennett correction. Leave unset unless you have a specific, understood reason to change it. |
+| `gnssrefl_refraction_model` | integer | Which tropospheric refraction correction to apply (passed to gnssrefl as `refr_model`). `1` (gnssrefl's own default) is the standard Bennett correction; `0` turns refraction off. Leave unset unless you have a specific, understood reason to change it. |
 
 ### Maximum arc length
 
@@ -187,7 +187,7 @@ through north: `[353, 360, 0, 173]` analyzes 353°–360° and 0°–173°
 
 | Field | Type | Description |
 |---|---|---|
-| `gnssrefl_elevation_span_tolerance` | number (degrees) | How close to your full elevation range (above) a satellite pass must actually reach to be accepted. gnssrefl's own default is 2 — e.g. with an elevation mask of 5–15°, a pass must span at least 7–13° to be accepted. This default is documented by gnssrefl itself as too strict for a narrow elevation mask like 5–15°; consider tightening it to `1` if you're using a narrow window like that and seeing very few retrievals. |
+| `gnssrefl_elevation_span_tolerance` | number (degrees) | How close to your full elevation range (above) a satellite pass must actually reach to be accepted. **Smaller is stricter.** gnssrefl's own default is 2 — with an elevation mask of 5–15°, a pass must span at least 7–13°. At `1` it must span 6–14°, which rejects more passes. gnssrefl's docs suggest `1` for a narrow 5–15° mask to keep only arcs that cover the window; raise it (e.g. back to 2) if you see too few retrievals. |
 
 ### Direct-signal removal polynomial order
 
@@ -244,9 +244,9 @@ changed), showing which fields a real deployment actually used:
     "gnssrefl_country_code": "usa",
     "gnssrefl_elevation_min": 5.0,
     "gnssrefl_elevation_max": 15.0,
-    "gnssrefl_reflector_height_min": -0.5,
-    "gnssrefl_reflector_height_max": 5.0,
-    "gnssrefl_orthometric_height": 18.665,
+    "gnssrefl_reflector_height_min": 17.0,
+    "gnssrefl_reflector_height_max": 23.0,
+    "gnssrefl_orthometric_height": 19.014,
     "gnssrefl_max_arc_minutes": 40.0,
     "gnssrefl_elevation_span_tolerance": 1.0,
     "gnssrefl_direct_signal_poly_order": 2,
@@ -257,7 +257,7 @@ changed), showing which fields a real deployment actually used:
 
 Notice this real example uses a narrow, non-default elevation mask
 (5–15°) and correspondingly tightens `gnssrefl_elevation_span_tolerance`
-(to `1.0`) and lowers `gnssrefl_direct_signal_poly_order` (to `2`) —
+(to `1.0`, stricter than the default 2) and lowers `gnssrefl_direct_signal_poly_order` (to `2`) —
 exactly the paired adjustment described above for a narrow window. If you
 copy this file as a starting point for your own station, **change the
 location fields first** — everything else can reasonably stay at these

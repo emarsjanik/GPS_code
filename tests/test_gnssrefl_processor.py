@@ -430,12 +430,13 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.assertEqual(call["azlist2"], [353.0, 360.0, 0.0, 173.0])
 
     def test_orthometric_height_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_orthometric_height"] = 18.665
+        self.cfg.station["gnssrefl_orthometric_height"] = 19.014
 
         self.processor.initialize()
 
+        # A list: make_gnssir_input() silently drops a float Hortho.
         call = calls["make_gnssir_input"][0]
-        self.assertEqual(call["Hortho"], 18.665)
+        self.assertEqual(call["Hortho"], [19.014])
 
     def test_refraction_model_passed_through_when_configured(self) -> None:
         self.cfg.station["gnssrefl_refraction_model"] = 0
@@ -443,7 +444,8 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertEqual(call["refraction"], 0)
+        self.assertEqual(call["refr_model"], "0")
+        self.assertIs(call["refraction"], False)
 
     def test_max_arc_minutes_passed_through_when_configured(self) -> None:
         self.cfg.station["gnssrefl_max_arc_minutes"] = 40.0

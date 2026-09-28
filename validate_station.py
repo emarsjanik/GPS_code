@@ -157,7 +157,7 @@ def parse_gnssir_results(result_dir, doys, freq_filter=1):
     """
     rows = []
     for doy in doys:
-        path = result_dir / f"{doy}.txt"
+        path = result_dir / f"{doy:03d}.txt"  # gnssrefl zero-pads (gps.LSPresult_name)
         if not path.exists():
             continue
         with open(path, errors="replace") as f:
