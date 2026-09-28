@@ -53,7 +53,10 @@ standards than the internal diagnostic plots:
     cannot. Departures are labelled rather than left to be
     misread: a difference is not an error in either curve, it is
     the part of the water level that astronomy alone does not
-    explain.
+    explain. They are marked only at high and low tide, comparing
+    each measured high (or low) with the predicted one: halfway up
+    or down, a tide arriving a little early or late opens a large
+    gap between the curves that is about timing, not height.
 
 Usage:
     python3 plot_7day.py \\
@@ -199,26 +202,73 @@ def msl_offset(project_dir: Path) -> float:
         return 0.0
 
 
-def _peak_of_each_run(flags, values):
-    """Indices of the largest-magnitude sample in each run of
-    consecutive True flags.
+def _turning_points(secs, values, half_window_s=3 * 3600, min_turn_m=0.1,
+                    max_step_s=90 * 60):
+    """High and low tides in a series: [(index, "high" | "low"), ...].
 
-    A departure lasting longer than the sampling interval sets
-    several adjacent flags. Marking each one implies several events
-    where there was one, so each run is reduced to its peak.
+    A reading is a high (low) tide if it is the largest (smallest)
+    within +/- half_window_s -- about a quarter of a tidal cycle, so
+    small wiggles on the way up or down do not count -- AND the level
+    falls (rises) by at least min_turn_m on BOTH sides within that
+    window, with readings on both sides no more than max_step_s away
+    (the gap used by split_on_gaps). The last two conditions stop the
+    cut end of a line at a data gap, which is also the largest nearby
+    value, from being taken for a turning point.
     """
-    peaks = []
-    run = []
-    for i, flag in enumerate(flags):
-        if flag:
-            run.append(i)
+    secs = np.asarray(secs, dtype=float)
+    values = np.asarray(values, dtype=float)
+    out = []
+    for i in range(len(values)):
+        v = values[i]
+        if not np.isfinite(v):
             continue
-        if run:
-            peaks.append(max(run, key=lambda j: abs(values[j])))
-            run = []
-    if run:
-        peaks.append(max(run, key=lambda j: abs(values[j])))
-    return peaks
+        # both neighbours present and not across a gap: the line
+        # actually continues through this reading
+        if (i == 0 or i == len(values) - 1
+                or not np.isfinite(values[i - 1]) or not np.isfinite(values[i + 1])
+                or secs[i] - secs[i - 1] > max_step_s or secs[i + 1] - secs[i] > max_step_s):
+            continue
+        near = (np.abs(secs - secs[i]) <= half_window_s) & np.isfinite(values)
+        before = near & (secs < secs[i])
+        after = near & (secs > secs[i])
+        if not before.any() or not after.any():
+            continue
+        if v >= values[near].max():
+            kind = "high"
+            turns = (values[before].min() <= v - min_turn_m and
+                     values[after].min() <= v - min_turn_m)
+        elif v <= values[near].min():
+            kind = "low"
+            turns = (values[before].max() >= v + min_turn_m and
+                     values[after].max() >= v + min_turn_m)
+        else:
+            continue
+        if not turns:
+            continue
+        # a flat top gives several equal readings; keep the first
+        if out and out[-1][1] == kind and secs[i] - secs[out[-1][0]] <= half_window_s:
+            continue
+        out.append((i, kind))
+    return out
+
+
+def peak_departures(obs_secs, obs_values, tide_secs, tide_values, max_shift_s=3 * 3600):
+    """Measured minus predicted height at each high and low tide.
+
+    Each measured high (low) is paired with the nearest predicted high
+    (low) within max_shift_s. Returns [(index, kind, difference), ...].
+    """
+    predicted = _turning_points(tide_secs, tide_values)
+    tide_secs = np.asarray(tide_secs, dtype=float)
+    out = []
+    for i, kind in _turning_points(obs_secs, obs_values):
+        match = [j for j, k in predicted
+                 if k == kind and abs(tide_secs[j] - obs_secs[i]) <= max_shift_s]
+        if not match:
+            continue
+        j = min(match, key=lambda j: abs(tide_secs[j] - obs_secs[i]))
+        out.append((i, kind, float(obs_values[i] - tide_values[j])))
+    return out
 
 
 def split_on_gaps(times, values, max_gap_minutes=90):
@@ -272,7 +322,8 @@ def main() -> int:
                    help="CSV cache of the NOAA Chatham gauge used by the quality "
                         "check (default: next to --output)")
     p.add_argument("--departure-threshold", type=float, default=0.25,
-                   help="metres; departures larger than this are annotated "
+                   help="metres; high or low tides that differ from the predicted "
+                        "ones by more than this are marked "
                         "(default 0.25, about 2.8 sigma at this station)")
     args = p.parse_args()
 
@@ -375,35 +426,32 @@ def main() -> int:
         ax.plot(tide_t, tide_v, color="#d9822b", linewidth=1.6, alpha=0.65,
                 zorder=1, label="Predicted tide")
 
-        # Mark where the estimate departs from the prediction. This
-        # is the part of the water level that the tide model does not
-        # account for, and is the reason both curves are shown.
-        tx = np.array([(t - tide_t[0]).total_seconds() for t in tide_t])
-        qx = np.array([(t - tide_t[0]).total_seconds() for t in t_sel])
+        # Mark where the estimate departs from the prediction -- the
+        # part of the water level the tide model does not account
+        # for, and the reason both curves are shown. Compared at high
+        # and low tide only (see the module docstring).
+        t_ref = min(tide_t[0], t_sel[0])
+        tx = np.array([(t - t_ref).total_seconds() for t in tide_t])
+        qx = np.array([(t - t_ref).total_seconds() for t in t_sel])
         order = np.argsort(tx)
-        predicted = np.interp(qx, tx[order], np.asarray(tide_v)[order],
-                              left=np.nan, right=np.nan)
-        departure = v_plot - predicted
-        big = np.isfinite(departure) & (np.abs(departure) >= args.departure_threshold)
+        marks = [(i, kind, d) for i, kind, d in
+                 peak_departures(qx, v_plot, tx[order], np.asarray(tide_v, dtype=float)[order])
+                 if abs(d) >= args.departure_threshold]
 
-        if big.any():
-            # One dot per event, at its peak -- not one per sample
-            # above the threshold, which turns a single hour-long
-            # departure into several apparently separate marks.
-            peaks = _peak_of_each_run(big, departure)
-
+        if marks:
             # Only the largest across the whole window is labelled;
             # annotating every peak would crowd a busy week.
-            i = max(peaks, key=lambda j: abs(departure[j]))
+            i, kind, d = max(marks, key=lambda m: abs(m[2]))
             ax.annotate(
-                f"{departure[i]:+.2f} metres from the prediction",
+                f"{abs(d):.2f} metres {'above' if d > 0 else 'below'} "
+                f"the predicted {kind} tide",
                 xy=(t_sel[i], v_plot[i]),
-                xytext=(0, 28 if departure[i] > 0 else -34),
+                xytext=(0, 28 if kind == "high" else -34),
                 textcoords="offset points", ha="center", fontsize=9,
                 color="#b3450c",
                 arrowprops=dict(arrowstyle="->", color="#b3450c", linewidth=1.0))
-            ax.plot([t_sel[j] for j in peaks],
-                    [v_plot[j] for j in peaks],
+            ax.plot([t_sel[m[0]] for m in marks],
+                    [v_plot[m[0]] for m in marks],
                     linestyle="none", marker="o", markersize=4.5,
                     color="#b3450c", zorder=3)
 
