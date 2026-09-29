@@ -346,19 +346,22 @@ def main() -> int:
     # NaN, which breaks the line there and keeps them out of the
     # departure labels.
     n_failed_window = 0
+    n_setup_window = 0
     qc_line = None
     if not args.no_qc:
         try:
             from water_level_qc import GAUGE_STATION, public_mask, qc_series
             cache = (Path(args.gauge_cache) if args.gauge_cache else
                      Path(args.output).resolve().parent / f"gauge_{GAUGE_STATION}.csv")
-            flags, ep, summarize = qc_series(times, values, cache)
+            flags, ep, summarize, qc_reasons = qc_series(times, values, cache)
             # Failed readings, plus the spline next to them and short
             # pieces left between failures (see water_level_qc.py).
             hidden = ~public_mask(ep, flags)
             values = np.where(hidden, np.nan, values)
             win_start = max(times) - timedelta(days=args.days)
             n_failed_window = int(sum(1 for t, h in zip(times, hidden) if h and t >= win_start))
+            n_setup_window = int(sum(1 for t, h, r in zip(times, hidden, qc_reasons)
+                                     if not h and t >= win_start and "possible_setup" in r))
             qc_line = (summarize(win_start.replace(tzinfo=timezone.utc).timestamp())
                        + f"; {n_failed_window} left blank on the plot")
         except Exception as exc:          # never lose the plot over the check
@@ -494,6 +497,9 @@ def main() -> int:
             f"The blue line is the water level at {station_name} estimated "
             f"using reflected navigation satellite signals.\n")
 
+    if n_setup_window:
+        explain += ("In heavy surf breaking waves raise the water level at the beach "
+                    "(wave setup) above what the tide and a harbour tide gauge show.\n")
     if n_failed_window:
         explain += ("Periods where the estimate failed an automatic quality check "
                     "(for example in heavy surf) are left blank.\n")
@@ -504,7 +510,7 @@ def main() -> int:
              f"U.S. Geological Survey",
              fontsize=7.5, color="#555555", va="bottom")
 
-    fig.tight_layout(rect=(0, 0.11 if n_failed_window else 0.09, 0.86, 1))
+    fig.tight_layout(rect=(0, 0.09 + 0.02 * (bool(n_failed_window) + bool(n_setup_window)), 0.86, 1))
     fig.savefig(args.output, dpi=150)
     print(f"Wrote {args.output}")
     print(f"  {len(t_sel)} points, {span}")
