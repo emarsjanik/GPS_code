@@ -347,23 +347,33 @@ def main() -> int:
     # departure labels.
     n_failed_window = 0
     n_setup_window = 0
+    n_runup_window = 0
+    runup_values = np.full(len(values), np.nan)
     qc_line = None
     if not args.no_qc:
         try:
-            from water_level_qc import GAUGE_STATION, public_mask, qc_series
+            from water_level_qc import GAUGE_STATION, is_runup, public_mask, qc_series
             cache = (Path(args.gauge_cache) if args.gauge_cache else
                      Path(args.output).resolve().parent / f"gauge_{GAUGE_STATION}.csv")
             flags, ep, summarize, qc_reasons = qc_series(times, values, cache)
             # Failed readings, plus the spline next to them and short
             # pieces left between failures (see water_level_qc.py).
-            hidden = ~public_mask(ep, flags)
+            # Readings kept as TOTAL water level (wave runup in heavy
+            # surf) are not still-water levels: they come off the main
+            # line and are drawn as their own dotted series.
+            runup = is_runup(qc_reasons)
+            runup_values = np.where(runup, values, np.nan)
+            hidden = ~public_mask(ep, flags, qc_reasons)
             values = np.where(hidden, np.nan, values)
             win_start = max(times) - timedelta(days=args.days)
-            n_failed_window = int(sum(1 for t, h in zip(times, hidden) if h and t >= win_start))
+            n_failed_window = int(sum(1 for t, h, u in zip(times, hidden, runup)
+                                      if h and not u and t >= win_start))
+            n_runup_window = int(sum(1 for t, u in zip(times, runup) if u and t >= win_start))
             n_setup_window = int(sum(1 for t, h, r in zip(times, hidden, qc_reasons)
                                      if not h and t >= win_start and "possible_setup" in r))
             qc_line = (summarize(win_start.replace(tzinfo=timezone.utc).timestamp())
-                       + f"; {n_failed_window} left blank on the plot")
+                       + f"; {n_failed_window} left blank, {n_runup_window} drawn as total "
+                         f"water level on the plot")
         except Exception as exc:          # never lose the plot over the check
             print(f"  QC not applied: {exc}")
 
@@ -373,6 +383,7 @@ def main() -> int:
     newest = max(times)
     cutoff = newest - timedelta(days=args.days)
     keep = [(t, v) for t, v in zip(times, values) if t >= cutoff]
+    runup_sel = np.array([u for t, u in zip(times, runup_values) if t >= cutoff], dtype=float)
     if not keep:
         print("No data in the requested window.")
         return 1
@@ -403,6 +414,18 @@ def main() -> int:
         ax.plot(seg_t, seg_v, color="#1f6fb4", linewidth=1.5,
                 solid_capstyle="round", zorder=2,
                 label="Estimated water level" if seg_i == 0 else None)
+
+    # Total water level in heavy surf (tide + surge + setup + wave runup),
+    # dotted so it cannot be mistaken for the still-water level.
+    if np.isfinite(runup_sel).any():
+        r_ok = np.isfinite(runup_sel)
+        r_t = [t for t, ok in zip(t_sel, r_ok) if ok]
+        r_v = list(runup_sel[r_ok] - offset)
+        for seg_i, (seg_t, seg_v) in enumerate(split_on_gaps(r_t, r_v)):
+            ax.plot(seg_t, seg_v, color="#7d3c98", linewidth=1.6, linestyle=":",
+                    marker="o", markersize=2.5, zorder=2,
+                    label="Total water level in heavy surf\n(includes waves running up the beach)"
+                    if seg_i == 0 else None)
 
     # Predicted tide, drawn beneath so the estimate stays visually
     # primary.
@@ -497,6 +520,9 @@ def main() -> int:
             f"The blue line is the water level at {station_name} estimated "
             f"using reflected navigation satellite signals.\n")
 
+    if n_runup_window:
+        explain += ("The dotted line is the total water level at the shore in heavy surf: tide, "
+                    "storm surge and waves running up the beach.\n")
     if n_setup_window:
         explain += ("In heavy surf breaking waves raise the water level at the beach "
                     "(wave setup) above what the tide and a harbour tide gauge show.\n")
@@ -510,7 +536,8 @@ def main() -> int:
              f"U.S. Geological Survey",
              fontsize=7.5, color="#555555", va="bottom")
 
-    fig.tight_layout(rect=(0, 0.09 + 0.02 * (bool(n_failed_window) + bool(n_setup_window)), 0.86, 1))
+    fig.tight_layout(rect=(0, 0.09 + 0.02 * (bool(n_failed_window) + bool(n_setup_window)
+                                          + bool(n_runup_window)), 0.86, 1))
     fig.savefig(args.output, dpi=150)
     print(f"Wrote {args.output}")
     print(f"  {len(t_sel)} points, {span}")

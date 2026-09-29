@@ -54,6 +54,22 @@ are unaffected (setup only raises the water). Without wave data the
 test falls back to the plain reference limit.
 Hs 3 m, Tp 10 s -> 0.76 m allowance; Hs 1 m, Tp 7 s -> 0.31 m.
 
+WAVE RUNUP -> TOTAL WATER LEVEL. In a big storm the footprint takes in
+the swash zone, and the reflecting surface is water running up the
+beach: the GNSS-IR then reads the TOTAL water level at the shore (tide
++ surge + setup + runup), the quantity total water level (TWL) models
+forecast for flooding and dune erosion. Readings above the setup
+allowance but within the Stockdon 2% runup,
+
+    R2 = 1.1 * (setup + sqrt(Hs * L0 * (0.563 beta^2 + 0.004)) / 2),
+
+are kept as SUSPECT with reason "possible_runup": NOT a still-water
+level (public_mask leaves them off the water-level line, the waterline
+pipeline must not use them), but the observation a TWL model is
+validated against (export_twl.py). Late Sep 2026 storm: excess over
+Chatham 2.0-3.3 m against R2 ~2.4-2.9 m. Only readings beyond the
+limit plus R2 fail.
+
 Only FAIL readings are removed; SUSPECT ones are kept.
 
 FOR PUBLIC DISPLAY (public_mask) two more rules, because the spline
@@ -226,18 +242,37 @@ def load_waves(cache: Path, station: str = WAVE_STATION):
     return ep, np.array([rows[int(e)][0] for e in ep]), np.array([rows[int(e)][1] for e in ep])
 
 
-def setup_allowance(epochs, waves):
-    """Largest plausible shoreline wave setup (m) at each epoch; 0 where no wave record."""
+def waves_at(epochs, waves):
+    """Nearest buoy (Hs, Tp) within WAVE_MAX_GAP_S of each epoch; NaN where none."""
     epochs = np.asarray(epochs, dtype=float)
     if waves is None or len(waves[0]) == 0:
-        return np.zeros(len(epochs))
+        return np.full(len(epochs), np.nan), np.full(len(epochs), np.nan)
     w_ep, hs, tp = waves
     j = np.clip(np.searchsorted(w_ep, epochs), 0, len(w_ep) - 1)
     jm = np.clip(j - 1, 0, len(w_ep) - 1)
     k = np.where(np.abs(w_ep[jm] - epochs) < np.abs(w_ep[j] - epochs), jm, j)
     ok = np.abs(w_ep[k] - epochs) <= WAVE_MAX_GAP_S
-    l0 = 9.81 * tp[k] ** 2 / (2 * np.pi)
-    return np.where(ok, SETUP_COEF * SETUP_BETA * np.sqrt(np.maximum(hs[k] * l0, 0.0)), 0.0)
+    return np.where(ok, hs[k], np.nan), np.where(ok, tp[k], np.nan)
+
+
+def stockdon(hs, tp, beta=SETUP_BETA):
+    """Stockdon et al. (2006) shoreline setup and 2% runup (m); NaN in -> NaN out."""
+    hl = np.maximum(np.asarray(hs, float) * 9.81 * np.asarray(tp, float) ** 2 / (2 * np.pi), 0.0)
+    setup = SETUP_COEF * beta * np.sqrt(hl)
+    swash = np.sqrt(hl * (0.563 * beta ** 2 + 0.004))
+    return setup, 1.1 * (setup + swash / 2)
+
+
+def setup_allowance(epochs, waves):
+    """Largest plausible shoreline wave setup (m) at each epoch; 0 where no wave record."""
+    setup, _ = stockdon(*waves_at(epochs, waves))
+    return np.nan_to_num(setup)
+
+
+def runup_allowance(epochs, waves):
+    """Stockdon 2% runup (m) at each epoch; 0 where no wave record."""
+    _, r2 = stockdon(*waves_at(epochs, waves))
+    return np.nan_to_num(r2)
 
 
 def reference_at(r_ep, r_lv, epochs):
@@ -308,10 +343,13 @@ def run_qc(ep, lv, reference=None, waves=None):
             predicted = a * reference_at(reference[0], reference[1], ep - lag_s) + b
             limit = max(REF_LIMIT, REF_SIGMAS * sigma)
             allowance = setup_allowance(ep, waves)
+            runup = runup_allowance(ep, waves)
             for i in np.flatnonzero(np.isfinite(predicted) & (np.abs(lv - predicted) > limit)):
                 excess = lv[i] - predicted[i]
                 if 0 < excess <= limit + allowance[i]:
                     mark(i, SUSPECT, "possible_setup")    # above the gauge, within wave setup
+                elif 0 < excess <= limit + runup[i]:
+                    mark(i, SUSPECT, "possible_runup")    # total water level, not still water
                 else:
                     mark(i, FAIL, "reference")
 
@@ -334,14 +372,23 @@ def run_qc(ep, lv, reference=None, waves=None):
     return flags, [";".join(r) for r in reasons], fit
 
 
-def public_mask(ep, flags):
+def is_runup(reasons):
+    """True for readings kept as total water level (wave runup), not still water."""
+    return np.array(["possible_runup" in r for r in reasons], dtype=bool)
+
+
+def public_mask(ep, flags, reasons=None):
     """
-    True where a reading may be shown publicly: not failed, not within
-    PUBLIC_BUFFER_S of a failed reading, and not part of a fragment
-    shorter than PUBLIC_MIN_SEGMENT_S that borders a removed reading.
+    True where a reading may be shown publicly AS STILL-WATER LEVEL: not
+    failed, not total-water-level (runup) when `reasons` is given, not
+    within PUBLIC_BUFFER_S of a failed reading, and not part of a
+    fragment shorter than PUBLIC_MIN_SEGMENT_S that borders a removed
+    reading.
     """
     ep = np.asarray(ep, dtype=float)
     failed = np.asarray(flags) >= FAIL
+    if reasons is not None:
+        failed = failed | is_runup(reasons)
     show = ~failed
     fail_ep = ep[failed]
     if len(fail_ep):
@@ -378,8 +425,10 @@ def summary(flags, reasons, fit, ep=None, since=None) -> str:
             + (f" ({', '.join(f'{k} {v}' for k, v in sorted(counts.items()))})" if counts else "")
             + f", {int(((flags == SUSPECT) & sel).sum())} suspect kept"
             + (f" ({sum(1 for r, s in zip(reasons, sel) if s and 'possible_setup' in r)} "
-               f"above the gauge by no more than wave setup)"
-               if any("possible_setup" in r for r, s in zip(reasons, sel) if s) else ""))
+               f"within wave setup, {sum(1 for r, s in zip(reasons, sel) if s and 'possible_runup' in r)} "
+               f"within wave runup = total water level)"
+               if any(("possible_setup" in r or "possible_runup" in r)
+                      for r, s in zip(reasons, sel) if s) else ""))
     if fit:
         a, lag_s, b, sigma = fit
         text += f"; gauge fit a={a:.2f} lag={lag_s / 60:+.0f} min b={b:+.2f} sigma={sigma:.3f} m"
@@ -427,7 +476,8 @@ def main() -> int:
     flags, ep, summarize, reasons = qc_series(times, values, cache)
     print(summarize())
     for label, pick in (("failed", lambda f, r: f >= FAIL),
-                        ("possible wave setup (kept)", lambda f, r: "possible_setup" in r)):
+                        ("possible wave setup (kept)", lambda f, r: "possible_setup" in r),
+                        ("total water level, within wave runup (kept)", lambda f, r: "possible_runup" in r)):
         days = {}
         for t, f, r in zip(times, flags, reasons):
             if pick(f, r):
@@ -467,8 +517,13 @@ def plot_setup(times, values, gauge_cache, out_png, days=7):
     ax[0].fill_between(t, limit + allow[sel], -limit, color="green", alpha=0.12,
                        label="kept: within the limit, or above by no more than wave setup")
     ax[0].plot(t, np.full(len(t), limit), "k:", lw=0.8, label=f"plain limit +/-{limit:.2f} m")
+    runup = runup_allowance(ep, waves)
+    ax[0].fill_between(t, limit + runup[sel], limit + allow[sel], color="purple", alpha=0.08,
+                       label="kept as total water level: above by no more than wave runup (R2)")
+    rs = np.array(reasons)[sel]
     for name, m, c in (("passed", flags[sel] < SUSPECT, "tab:blue"),
-                       ("possible wave setup (kept)", np.array(["possible_setup" in r for r in np.array(reasons)[sel]]), "tab:orange"),
+                       ("possible wave setup (kept)", np.array(["possible_setup" in r for r in rs]), "tab:orange"),
+                       ("total water level, within runup (kept)", np.array(["possible_runup" in r for r in rs]), "purple"),
                        ("failed", flags[sel] >= FAIL, "tab:red")):
         ax[0].plot(np.array(t)[m], excess[sel][m], ".", color=c, label=name)
     ax[0].set_ylabel("GNSS-IR minus gauge-predicted (m)")
@@ -476,7 +531,10 @@ def plot_setup(times, values, gauge_cache, out_png, days=7):
     ax[0].set_title(f"Wave-setup test, last {days} days (UTC)")
     ax[1].plot(allow[sel], excess[sel], ".", color="grey")
     ax[1].plot([0, allow.max() + 0.1], [limit, limit + allow.max() + 0.1], "g-", lw=1,
-               label="fail line: limit + setup allowance")
+               label="limit + setup allowance")
+    xs = np.linspace(0, allow.max() + 0.1, 20)
+    ax[1].plot(xs, limit + xs * (runup.max() / max(allow.max(), 1e-9)), "-", color="purple", lw=1,
+               label="fail line: limit + runup (R2)")
     ax[1].set_xlabel(f"wave setup allowance from buoy {WAVE_STATION} (m)")
     ax[1].set_ylabel("GNSS-IR minus gauge-predicted (m)")
     ax[1].legend(fontsize=8)
