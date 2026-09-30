@@ -335,9 +335,15 @@ if [ ! -f "$SPLINE_FILE" ]; then
 elif [ ! -f "$PROJECT_DIR/analysis_tools/plot_7day.py" ]; then
     echo "  analysis_tools/plot_7day.py not found -- skipping."
 else
+    # --no-qc: the public plot shows every estimate. With the QC on, the
+    # storm high tides of Sep 25-27 2026 (up to 3 m above the Chatham gauge,
+    # the total water level in heavy surf) were hidden together with an
+    # hour either side, which left only the low-tide troughs and made the
+    # plot look broken. The QC result is kept as its own diagnostic plot
+    # below instead.
     if python3 "$PROJECT_DIR/analysis_tools/plot_7day.py" \
         --spline-file "$SPLINE_FILE" \
-        --output "$SEVEN_DAY_PLOT"; then
+        --output "$SEVEN_DAY_PLOT" --no-qc; then
         echo ""
         echo "  This plot is intended for public display and is"
         echo "  referenced to local mean sea level via"
@@ -347,6 +353,18 @@ else
         echo "  7-day plot could not be generated -- see above. The"
         echo "  underlying results are unaffected; the next run will"
         echo "  try again."
+    fi
+
+    # Diagnostic (not for the public): GNSS-IR minus the Chatham gauge
+    # against the wave setup and runup allowances, last 7 days.
+    WAVE_SETUP_PLOT="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_wave_setup_check.png"
+    if [ -f "$PROJECT_DIR/analysis_tools/water_level_qc.py" ]; then
+        if python3 "$PROJECT_DIR/analysis_tools/water_level_qc.py" "$SPLINE_FILE" \
+            --plot-setup "$WAVE_SETUP_PLOT"; then
+            echo "  Wave-setup check: $WAVE_SETUP_PLOT"
+        else
+            echo "  Wave-setup check could not be made -- see above (the 7-day plot is unaffected)."
+        fi
     fi
 fi
 
