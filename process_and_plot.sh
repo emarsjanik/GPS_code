@@ -297,9 +297,28 @@ echo ""
 # tide model from 0.75 to 0.989. Reconsider if your station's own
 # tidal period or sampling rate differs substantially from this
 # site's.
+# Azimuth window for the water level. At Marconi the antenna is only ~75 m
+# landward of the waterline, so arcs near the 353/173 deg edges of the
+# reflection window run ALONG the shore and reflect off the beach. Measured
+# against the Chatham-derived tide, Jul-Sep 2026 (gnssir_reflection_audit.py
+# in caco05-waterline): all azimuths 0.248 m RMS calm / 0.492 m rough
+# (+0.10 m bias); 35-125 deg only 0.221 / 0.276 m (+0.03 m), keeping 81% of
+# arcs. subdaily applies this to the stored results, so no reprocessing is
+# needed. To revert, set both to empty: SUBDAILY_AZIM1="" SUBDAILY_AZIM2="".
+SUBDAILY_AZIM1=35
+SUBDAILY_AZIM2=125
+azim_args=()
+if [ -n "$SUBDAILY_AZIM1" ] && [ -n "$SUBDAILY_AZIM2" ]; then
+    azim_args=(-azim1 "$SUBDAILY_AZIM1" -azim2 "$SUBDAILY_AZIM2")
+fi
+
 if run_with_spinner \
     "Generating plots" \
-    subdaily "$STATION_CODE" "$YEAR" -doy1 "$min_day" -doy2 "$max_day" -rhdot True -knots 8; then
+    subdaily "$STATION_CODE" "$YEAR" -doy1 "$min_day" -doy2 "$max_day" -rhdot True -knots 8 \
+        ${azim_args[@]+"${azim_args[@]}"} \
+   || { [ ${#azim_args[@]} -gt 0 ] && echo "  subdaily failed with the azimuth window -- retrying without it" \
+        && run_with_spinner "Generating plots (all azimuths)" \
+           subdaily "$STATION_CODE" "$YEAR" -doy1 "$min_day" -doy2 "$max_day" -rhdot True -knots 8; }; then
 
     PLOTS_DIR="$REFL_CODE/Files/$STATION_CODE"
     echo ""
