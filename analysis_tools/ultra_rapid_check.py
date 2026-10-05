@@ -20,7 +20,9 @@ WHAT IT DOES (each run)
   1. Copies today's raw file so far (raw/station_YYYYMMDD.um980; the
      receiver keeps appending to the original) and converts the copy to
      RINEX in products/refl_code_ultra/rinex.
-  2. Runs rinex2snr + gnssir on it with orb=ultra, writing ONLY under
+  2. Runs rinex2snr + gnssir on it with orb=ultra -- or, when today's
+     ultra-rapid file is not published yet, the broadcast orbits in the
+     station's own data (orb=nav: GPS only) -- writing ONLY under
      products/refl_code_ultra (its own REFL_CODE: orbits, SNR, results).
      The production products/refl_code is never written.
   3. Copies the production results of the previous two days into that
@@ -94,26 +96,28 @@ def compare(ultra_dir: Path, prod_spline: Path) -> None:
     if len(pe) < 2:
         print(f"  production spline not found: {prod_spline}")
         return
-    print(f"  {'run':<18} {'readings':>8} {'covered':>8} {'bias':>8} {'RMS':>7} {'max|d|':>7}  latency")
+    print(f"  {'run':<16} {'orbit':<5} {'readings':>8} {'covered':>8} {'bias':>8} {'RMS':>7} {'max|d|':>7}  latency")
     all_d = []
     for h in hist:
         rows = [l.split(",") for l in h.read_text().splitlines()[1:] if l.strip()]
         if not rows:
             continue
         ue = np.array([float(r[0]) for r in rows]); uv = np.array([float(r[1]) for r in rows])
-        run = datetime.strptime(h.stem.split("_", 1)[1], "%Y%m%d_%H%M").replace(tzinfo=timezone.utc)
+        parts = h.stem.split("_")                      # ultra_YYYYMMDD_HHMM[_orbit]
+        run = datetime.strptime(parts[1] + "_" + parts[2], "%Y%m%d_%H%M").replace(tzinfo=timezone.utc)
+        orb = parts[3] if len(parts) > 3 else "ultra"
         lat = (run.timestamp() - ue.max()) / 3600
         m = (ue >= pe[0]) & (ue <= pe[-1])
         if not m.any():
-            print(f"  {run:%Y-%m-%d %H:%M}  {len(ue):>8} {0:>8}  (final not available yet)  {lat:.1f} h")
+            print(f"  {run:%Y-%m-%d %H:%M} {orb:<5} {len(ue):>8} {0:>8}  (final not available yet)  {lat:.1f} h")
             continue
         d = uv[m] - np.interp(ue[m], pe, pv)
         all_d.append(d)
-        print(f"  {run:%Y-%m-%d %H:%M}  {len(ue):>8} {int(m.sum()):>8} {d.mean():>+8.3f} "
+        print(f"  {run:%Y-%m-%d %H:%M} {orb:<5} {len(ue):>8} {int(m.sum()):>8} {d.mean():>+8.3f} "
               f"{np.sqrt(np.mean(d ** 2)):>7.3f} {np.abs(d).max():>7.3f}  {lat:.1f} h")
     if all_d:
         d = np.concatenate(all_d)
-        print(f"  {'ALL':<18} {'':>8} {len(d):>8} {d.mean():>+8.3f} {np.sqrt(np.mean(d ** 2)):>7.3f} "
+        print(f"  {'ALL':<22} {'':>8} {len(d):>8} {d.mean():>+8.3f} {np.sqrt(np.mean(d ** 2)):>7.3f} "
               f"{np.abs(d).max():>7.3f}")
         print()
         print("  latency = run time minus the newest same-day level it produced.")
@@ -126,6 +130,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Same-day GNSS-IR with ultra-rapid orbits (check only)")
     p.add_argument("--compare", action="store_true", help="only compare saved runs with production")
     p.add_argument("--days-back", type=int, default=2, help="production days copied in for continuity")
+    p.add_argument("--orbits", default="ultra,nav",
+                   help="orbit sources to try in order (default ultra, then broadcast nav)")
     args = p.parse_args()
 
     from config import Config
@@ -157,8 +163,7 @@ def main() -> int:
 
     # the same configuration, pointed at its own folders and ultra orbits -- in memory only
     cfg.rinex_dir = ultra / "rinex"
-    cfg.station = dict(cfg.station, gnssrefl_refl_code=str(ultra / "refl_code"),
-                       gnssrefl_orbit_source="ultra")
+    base_station = dict(cfg.station, gnssrefl_refl_code=str(ultra / "refl_code"))
 
     # gnssrefl also copies the RINEX into the current directory: use our own
     os.chdir(work)
@@ -169,17 +174,27 @@ def main() -> int:
     if not conv.success:
         print(f"RINEX conversion failed: {conv.message}")
         return 1
-    gp = GnssIrProcessor(cfg=cfg); gp.initialize()
-    res = gp.process(Path(conv.observation_file), day)
-    print(f"gnssir (ultra)    : {'ok' if res.success else 'FAILED'}, {res.num_tracks} track(s)"
-          + ("" if res.success else f" -- {getattr(res, 'message', '')}"))
+    # orbits in order: ultra-rapid multi-GNSS (often not yet published for the
+    # current day), then the broadcast orbits in the station's own data (always
+    # there; GPS only, so fewer tracks, but direction is all GNSS-IR needs)
+    used = None
+    for orb in args.orbits.split(","):
+        cfg.station = dict(base_station, gnssrefl_orbit_source=orb)
+        gp = GnssIrProcessor(cfg=cfg); gp.initialize()
+        res = gp.process(Path(conv.observation_file), day)
+        print(f"gnssir ({orb:<5})     : {'ok' if res.success else 'FAILED'}, {res.num_tracks} track(s)"
+              + ("" if res.success else f" -- {getattr(res, 'message', '')}"))
+        if res.success:
+            used = orb
+            break
     snap.unlink(missing_ok=True)
     for f in (conv.observation_file, conv.navigation_file, conv.sbas_file):
         try:
             Path(f).unlink()
         except (OSError, TypeError):
             pass
-    if not res.success:
+    if not used:
+        print("no orbit source worked -- nothing to compare this run")
         return 1
 
     # previous days from production, for a continuous spline
@@ -206,7 +221,7 @@ def main() -> int:
     m = ue >= t0
     hist = ultra / "history"
     hist.mkdir(exist_ok=True)
-    out = hist / f"ultra_{now:%Y%m%d_%H%M}.csv"
+    out = hist / f"ultra_{now:%Y%m%d_%H%M}_{used}.csv"
     out.write_text("epoch,level\n" + "".join(f"{e:.0f},{v:.4f}\n" for e, v in zip(ue[m], uv[m])))
     if m.any():
         print(f"same-day levels   : {int(m.sum())} up to {datetime.fromtimestamp(ue[m].max(), tz=timezone.utc):%H:%M}Z "
