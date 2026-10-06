@@ -24,6 +24,10 @@ import csv
 import math
 from datetime import datetime
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_datum import spline_shift, tide_model_to_navd88  # noqa: E402
 
 import numpy as np
 
@@ -54,7 +58,8 @@ def load_spline_output(path: Path):
                 continue
             times.append(dt)
             values.append(water_level)
-    return times, np.asarray(values, float)
+    # On NAVD88 whichever antenna height wrote the file (station_datum.py).
+    return times, np.asarray(values, float) + spline_shift(path)
 
 
 def load_tide_reference(path: Path, time_col: str, value_col: str):
@@ -99,6 +104,9 @@ def main():
     p.add_argument("--tide-file", required=True)
     p.add_argument("--tide-time-col", default="time")
     p.add_argument("--tide-value-col", required=True)
+    p.add_argument("--tide-datum-offset", type=float, default=None,
+                   help="m added to the tide model to put it on NAVD88 "
+                        "(default: tide_model_navd88_offset in station.json, else +0.09)")
     p.add_argument("--output", default="timeseries_export.csv")
     args = p.parse_args()
 
@@ -110,13 +118,17 @@ def main():
     tide_times, tide_values = load_tide_reference(
         Path(args.tide_file), args.tide_time_col, args.tide_value_col
     )
-    print(f"Loaded {len(tide_times)} tide model points")
+    tide_shift = (args.tide_datum_offset if args.tide_datum_offset is not None
+                  else tide_model_to_navd88())
+    tide_values = np.asarray(tide_values, float) + tide_shift
+    print(f"Loaded {len(tide_times)} tide model points (moved {tide_shift:+.3f} m onto NAVD88)")
 
     tide_at_spline_times = interpolate_reference(tide_times, tide_values, spline_times)
 
     with open(args.output, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["timestamp_utc", "gnss_ir_water_level_m", f"tide_model_{args.tide_value_col}"])
+        writer.writerow(["timestamp_utc", "gnss_ir_water_level_navd88_m",
+                         f"tide_model_{args.tide_value_col}_navd88_m"])
         for t, gnss_v, tide_v in zip(spline_times, spline_values, tide_at_spline_times):
             tide_str = f"{tide_v:.4f}" if np.isfinite(tide_v) else ""
             writer.writerow([t.strftime("%Y-%m-%d %H:%M:%S"), f"{gnss_v:.4f}", tide_str])

@@ -23,10 +23,13 @@ standards than the internal diagnostic plots:
     rules automatically, so the March and November changeovers need
     no intervention.
 
-  - Referenced to local mean sea level. The raw water levels sit
-    about a quarter of a metre below local mean sea level; a public
-    plot that reads systematically low without explanation is
-    misleading. The offset comes from station.json
+  - Referenced to local mean sea level. Every other product is
+    NAVD88; this public plot alone is drawn above local mean sea
+    level, because "metres above NAVD88" means nothing to most
+    readers. The water levels are NAVD88 and local mean sea level
+    sits about 0.1 m above NAVD88 here. (Before the datum was
+    corrected the raw levels sat about a quarter of a metre below
+    mean sea level.) The offset comes from station.json
     (water_level_msl_offset) rather than being hardcoded, because it
     has been revised more than once as processing was corrected, and
     a stale correction on a public page is worse than none.
@@ -89,6 +92,10 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_datum import config_to_navd88, spline_shift  # noqa: E402
+
 # The record is kept in UTC. Displayed times are converted to the
 # station's local zone so a reader sees the tide at the hour it
 # actually happens.
@@ -142,9 +149,12 @@ def load_spline(path: Path):
     """Reads gnssrefl's evenly-sampled spline output.
 
     Column 9 is the water level (orthometric height minus reflector
-    height). Rows carrying gnssrefl's 999 no-data sentinel are
-    dropped rather than plotted.
+    height), returned on NAVD88: a file written with an older antenna
+    height is shifted to the NAVD88 one (station_datum.py). Rows
+    carrying gnssrefl's 999 no-data sentinel are dropped rather than
+    plotted.
     """
+    shift = spline_shift(path)
     times, values = [], []
     with open(path, errors="replace") as f:
         for line in f:
@@ -162,7 +172,7 @@ def load_spline(path: Path):
             if abs(v) > 900:          # gnssrefl's no-data sentinel
                 continue
             times.append(dt)
-            values.append(v)
+            values.append(v + shift)
     return times, np.asarray(values, dtype=float)
 
 
@@ -194,14 +204,20 @@ def load_tide(path: Path, time_col: str, value_col: str):
 
 
 def msl_offset(project_dir: Path) -> float:
-    """Offset between this station's water levels and local mean sea
-    level, from station.json. Zero if unset -- an unset offset should
-    produce an unshifted plot, not a guess."""
+    """Height of local mean sea level on NAVD88 (m), subtracted from the
+    NAVD88 water levels to draw them above mean sea level.
+
+    water_level_msl_offset in station.json is in station.json's own
+    datum: before maintenance/migrate_to_navd88.py that is the old
+    CGVD2013 antenna height, so it is moved onto NAVD88 here exactly as
+    the water levels are (station_datum.config_to_navd88). Zero if
+    unset -- an unset offset should produce an unshifted plot, not a
+    guess."""
     path = project_dir / "station" / "resources" / "station.json"
     try:
         d = json.loads(path.read_text())
         v = d.get("water_level_msl_offset")
-        return float(v) if v is not None else 0.0
+        return float(v) + config_to_navd88(d) if v is not None else 0.0
     except Exception:
         return 0.0
 

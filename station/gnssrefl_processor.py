@@ -765,11 +765,13 @@ class GnssIrProcessor:
         # which gnssrefl substitutes its own EGM96-derived value.
         #
         # That silently cost this station 4 cm on every published
-        # water level: the surveyed CGVD2013/CGG2013a height is
-        # 18.665 m, while the EGM96 fallback gave 18.625 m. Both are
-        # legitimate orthometric heights differing only by geoid
-        # model, but a 4 cm systematic offset is not negligible when
-        # the measurement's own noise floor is around 7.5 cm.
+        # water level: the configured height (then 18.665 m) was
+        # dropped for gnssrefl's EGM96 fallback, 18.625 m.
+        #
+        # The height must be NAVD88 (this system's standard; NGS OPUS
+        # with GEOID18 gives 19.014 m here). 18.665 m was the CSRS-PPP
+        # CGVD2013 height and left every water level 0.349 m low --
+        # see analysis_tools/station_datum.py.
         orthometric_height = station_section.get("gnssrefl_orthometric_height")
         if orthometric_height is not None:
             kwargs["Hortho"] = [float(orthometric_height)]

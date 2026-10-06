@@ -26,7 +26,6 @@ Usage:
     python3 plot_filtered_vs_spline.py \\
         --filtered-file products/refl_code/Files/usgs/usgs_2026_subdaily_edit.txt \\
         --spline-file products/refl_code/Files/usgs/usgs_spline_out.txt \\
-        --hortho 18.625 \\
         --doy1 205 --doy2 225 \\
         --output filtered_vs_spline.png
 """
@@ -36,6 +35,10 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_datum import navd88_hortho, spline_shift  # noqa: E402
 
 import matplotlib
 matplotlib.use("Agg")
@@ -113,19 +116,25 @@ def load_spline_output(path: Path, doy1: int, doy2: int, year: int):
                 times.append(dt)
                 values.append(water_level)
 
-    return times, np.asarray(values, float)
+    # On NAVD88 whichever antenna height wrote the file (station_datum.py).
+    return times, np.asarray(values, float) + spline_shift(path)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--filtered-file", required=True)
     p.add_argument("--spline-file", required=True)
-    p.add_argument("--hortho", type=float, required=True)
+    p.add_argument("--hortho", type=float, default=None,
+                   help="antenna height, m NAVD88 (default: station.json, on NAVD88)")
     p.add_argument("--doy1", type=int, required=True)
     p.add_argument("--doy2", type=int, required=True)
     p.add_argument("--year", type=int, default=2026)
     p.add_argument("--output", default="filtered_vs_spline.png")
     args = p.parse_args()
+    if args.hortho is None:
+        args.hortho = navd88_hortho()
+    if args.hortho is None:
+        p.error("--hortho is required: station.json has no gnssrefl_orthometric_height")
 
     filt_times, filt_values = load_filtered_results(
         Path(args.filtered_file), args.hortho, args.doy1, args.doy2

@@ -57,13 +57,16 @@ import numpy as np
 PROJECT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT))
 sys.path.insert(0, str(PROJECT / "station"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_datum import spline_shift  # noqa: E402
 
 
 def read_spline(path: Path):
-    """gnssrefl spline file -> (epochs, levels)."""
+    """gnssrefl spline file -> (epochs, levels), levels on NAVD88."""
     ep, lv = [], []
     if not path.exists():
         return np.array([]), np.array([])
+    shift = spline_shift(path, quiet=True)
     for line in path.read_text(errors="replace").splitlines():
         if line.startswith("%") or not line.strip():
             continue
@@ -78,7 +81,7 @@ def read_spline(path: Path):
             continue
         if abs(v) > 900:                      # gnssrefl gap marker
             continue
-        ep.append(t.timestamp()); lv.append(v)
+        ep.append(t.timestamp()); lv.append(v + shift)
     o = np.argsort(ep)
     return np.asarray(ep)[o], np.asarray(lv)[o]
 

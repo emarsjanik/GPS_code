@@ -222,7 +222,15 @@ production results directory is affected.
 
 | Field | Type | Description |
 |---|---|---|
-| `gnssrefl_orthometric_height` | number (meters) | Your antenna's height above a specific vertical datum (e.g. NAVD88, a local tide gauge datum). If set, gnssrefl reports real, absolute water level relative to this datum instead of just a relative reflector height. Meaningful for coastal sites; not typically applicable to interior lakes/rivers with no established local datum. |
+| `gnssrefl_orthometric_height` | number (meters) | Your antenna's height above a specific vertical datum. If set, gnssrefl reports real, absolute water level (Hortho minus reflector height) on this datum instead of just a relative reflector height. **This system's standard is NAVD88**: use an NGS OPUS solution (NAVD88 with GEOID18). Do NOT use the orthometric height from a CSRS-PPP report -- that is CGVD2013, the Canadian height system, and at Marconi it is 0.349 m below NAVD88 (18.665 vs 19.014 m). |
+| `vertical_datum` | string | The datum `gnssrefl_orthometric_height` (and so every water level) is on, e.g. `"NAVD88 (GEOID18)"`. Read by `analysis_tools/station_datum.py`; set by `maintenance/migrate_to_navd88.py`. |
+| `water_level_msl_offset` | number (meters) | Height of local mean sea level in the same datum as the water levels (about +0.1 m NAVD88 here). The public 7-day plot subtracts it to draw levels above mean sea level; every other product stays NAVD88. Moves with `gnssrefl_orthometric_height` if that ever changes datum. |
+| `tide_model_navd88_offset` | number (meters) | Added to tide-model heights to put them on NAVD88 (default +0.09: the model ensemble sits ~0.09 m below NAVD88 here). |
+
+All water-level products are NAVD88. `analysis_tools/station_datum.py`
+is the single place that is defined; a spline file written with an
+older antenna height is moved onto NAVD88 when it is read or archived,
+using the `Hortho (m) is` line gnssrefl writes into its header.
 
 ### Refraction model
 
@@ -262,8 +270,9 @@ Convert the window to water levels before trusting it:
 
     water level = gnssrefl_orthometric_height - reflector height
 
-At this station (Hortho 18.665 m) a 17-23 m window meant a ceiling of
-+1.665 m, against an observed maximum of +1.565 m. Ten centimetres of
+At this station (Hortho then 18.665 m, the old CGVD2013 height) a
+17-23 m window meant a ceiling of +1.665 m, against an observed maximum
+of +1.565 m. Ten centimetres of
 headroom. A modest storm surge would have truncated the record
 exactly when it mattered, and the plot would simply have shown a gap.
 
@@ -360,7 +369,8 @@ changed), showing which fields a real deployment actually used:
     "gnssrefl_elevation_max": 15.0,
     "gnssrefl_reflector_height_min": -0.5,
     "gnssrefl_reflector_height_max": 5.0,
-    "gnssrefl_orthometric_height": 18.665,
+    "gnssrefl_orthometric_height": 19.014,
+    "vertical_datum": "NAVD88 (GEOID18)",
     "gnssrefl_max_arc_minutes": 40.0,
     "gnssrefl_elevation_span_tolerance": 1.0,
     "gnssrefl_direct_signal_poly_order": 2,
