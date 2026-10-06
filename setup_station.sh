@@ -284,9 +284,11 @@ amplitude_min=$(prompt_optional_numeric "Minimum amplitude") || exit 1
 
 echo ""
 echo "--- Orthometric height reference ---"
-echo "If you know your antenna's height above a specific vertical"
-echo "datum (e.g. NAVD88, MSL), enter it here to get real, absolute"
-echo "water level values instead of just relative reflector height."
+echo "Your antenna's height above NAVD88 -- this system's standard"
+echo "datum -- from an NGS OPUS solution (GEOID18). Enter it here to get"
+echo "real, absolute water levels instead of just reflector height."
+echo "Not the CSRS-PPP orthometric height: that is CGVD2013, 0.349 m"
+echo "lower at Marconi."
 orthometric_height=$(prompt_optional_numeric "Orthometric height (meters)") || exit 1
 
 echo ""
@@ -432,6 +434,7 @@ if as_float(amplitude_min) is not None:
     data["gnssrefl_amplitude_min"] = as_float(amplitude_min)
 if as_float(orthometric_height) is not None:
     data["gnssrefl_orthometric_height"] = as_float(orthometric_height)
+    data["vertical_datum"] = "NAVD88 (GEOID18)"
 if as_int(refraction_model) is not None:
     data["gnssrefl_refraction_model"] = as_int(refraction_model)
 if as_float(max_arc_minutes) is not None:

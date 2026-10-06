@@ -80,17 +80,19 @@ region they cover and which vertical datum they report.
 
 Works anywhere in the world, needs a free account, and returns
 results in minutes to hours. It reports both an ellipsoidal height
-and a CGVD2013 orthometric height, which is convenient because
-GNSS-IR needs both. This is the service this project's own station
-used.
+and a CGVD2013 orthometric height. Use it for the coordinates and the
+ellipsoidal height only: CGVD2013 is the Canadian height system, not
+NAVD88, and at this station it is 0.349 m lower. This project's
+station first took its orthometric height from here, and every water
+level was 0.349 m low until it was replaced with the OPUS value.
 
 **OPUS** (US National Geodetic Survey) --
 <https://geodesy.noaa.gov/OPUS/>
 
-United States only. Reports NAVD88 orthometric heights, which is
-the datum most US tide gauges and flood studies use. If your work
-will be compared against NOAA or USGS water level data, OPUS may
-save you a datum conversion later.
+United States only. Reports NAVD88 orthometric heights (GEOID18),
+the datum most US tide gauges and flood studies use, and the standard
+for every product of this system. **Take `gnssrefl_orthometric_height`
+from here.**
 
 **AUSPOS** (Geoscience Australia) --
 <https://gnss.ga.gov.au/auspos>
@@ -146,7 +148,7 @@ sits above the geoid by roughly 30 m, so a station 19 m above the
 water can have an ellipsoidal height of about -10 m. A negative
 number here is normal and does not indicate an error.
 
-### Orthometric height -> `gnssrefl_orthometric_height`
+### Orthometric height (CGVD2013) -- not for `gnssrefl_orthometric_height`
 
 ```
 Orthometric Height
@@ -154,10 +156,21 @@ CGVD2013 (CGG2013a)
 18.665 m
 ```
 
-This goes in `gnssrefl_orthometric_height`. It is the height above a
-geoid-based vertical datum -- roughly, height above mean sea level --
-and it is what converts a reflector height into an actual water
-level.
+**Do not put this number in `gnssrefl_orthometric_height`.** It is
+CGVD2013 -- the Canadian height system CSRS-PPP reports in -- not
+NAVD88, the standard for every product of this system. At Marconi the
+same antenna is 19.014 m NAVD88 (NGS OPUS, GEOID18), so 18.665 m put
+every water level 0.349 m low. The ellipsoidal heights of the two
+solutions agree to 2 mm; only the height system differs.
+
+`gnssrefl_orthometric_height` is the height above a geoid-based
+vertical datum -- roughly, height above mean sea level -- and it is
+what converts a reflector height into an actual water level. Take it
+from an NGS OPUS solution (https://geodesy.noaa.gov/OPUS/, at least
+2 h of static data, 24 h preferred), which reports NAVD88 computed
+with GEOID18, and set `"vertical_datum": "NAVD88 (GEOID18)"` beside it.
+Keep the CSRS-PPP report for the ellipsoidal height and the
+coordinates above.
 
 **These two heights are not interchangeable.** Putting the
 ellipsoidal height in the orthometric field, or the reverse, produces

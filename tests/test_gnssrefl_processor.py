@@ -430,7 +430,7 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.assertEqual(call["azlist2"], [353.0, 360.0, 0.0, 173.0])
 
     def test_orthometric_height_passed_through_when_configured(self) -> None:
-        self.cfg.station["gnssrefl_orthometric_height"] = 18.665
+        self.cfg.station["gnssrefl_orthometric_height"] = 19.014
 
         self.processor.initialize()
 
@@ -448,7 +448,7 @@ class TestInitialize(GnssIrProcessorTestCase):
         # published water level 4 cm low, invisibly, for months.
         #
         # Do not "simplify" this back to a float.
-        self.assertEqual(call["Hortho"], [18.665])
+        self.assertEqual(call["Hortho"], [19.014])
         self.assertIsInstance(call["Hortho"], list)
 
     def test_refraction_model_passed_through_when_configured(self) -> None:

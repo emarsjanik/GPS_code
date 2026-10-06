@@ -12,7 +12,7 @@ since the residuals are pure random noise, more arcs should tighten
 the result. But higher elevation means the reflection point sits
 CLOSER to the antenna:
 
-    elevation    specular point distance (H = 18.665 m)
+    elevation    specular point distance (antenna ~18.7 m above the water)
         5 deg        213 m
        15 deg         70 m      <- current upper limit
        20 deg         51 m
@@ -45,8 +45,7 @@ are some bearings systematically worse?
 Usage:
     python3 elevation_quality.py \\
         --subdaily products/refl_code/Files/usgs/usgs_2026_subdaily_edit.txt \\
-        --spline products/refl_code/Files/usgs/usgs_spline_out.txt \\
-        --hortho 18.665
+        --spline products/refl_code/Files/usgs/usgs_spline_out.txt
 """
 
 from __future__ import annotations
@@ -55,6 +54,10 @@ import argparse
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_datum import navd88_hortho, spline_shift  # noqa: E402
 
 import numpy as np
 
@@ -111,7 +114,8 @@ def load_spline(path: Path):
                 times.append(dt)
             except (ValueError, IndexError):
                 continue
-    return times, np.asarray(values, float)
+    # On NAVD88 whichever antenna height wrote the file (station_datum.py).
+    return times, np.asarray(values, float) + spline_shift(path)
 
 
 def report_bins(label: str, keys: np.ndarray, resid: np.ndarray,
@@ -144,8 +148,13 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--subdaily", required=True)
     p.add_argument("--spline", required=True)
-    p.add_argument("--hortho", type=float, required=True)
+    p.add_argument("--hortho", type=float, default=None,
+                   help="antenna height, m NAVD88 (default: station.json, on NAVD88)")
     args = p.parse_args()
+    if args.hortho is None:
+        args.hortho = navd88_hortho()
+    if args.hortho is None:
+        p.error("--hortho is required: station.json has no gnssrefl_orthometric_height")
 
     recs = load_subdaily(Path(args.subdaily), args.hortho)
     st, sv = load_spline(Path(args.spline))

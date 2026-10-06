@@ -262,6 +262,30 @@ else:
                 : # not applicable to this station, no output needed
                 ;;
         esac
+
+        # Every product of this system is NAVD88. The antenna height
+        # was once taken from a CSRS-PPP report (CGVD2013, 18.665 m),
+        # which left every water level 0.349 m low for months while
+        # being labelled NAVD88. See analysis_tools/station_datum.py.
+        datum_check=$(python3 -c "
+import json
+d = json.load(open('$STATION_JSON'))
+h = d.get('gnssrefl_orthometric_height')
+vd = str(d.get('vertical_datum') or '')
+if h is None:
+    print('SKIP')
+elif abs(float(h) - 18.665) < 0.0015:
+    print(f'WARN gnssrefl_orthometric_height {h} m is the CGVD2013 (CSRS-PPP) height, 0.349 m below NAVD88. Run: python3 maintenance/migrate_to_navd88.py')
+elif not vd.upper().startswith('NAVD88'):
+    print(f'WARN vertical_datum is not NAVD88 (got {vd!r}); every water level is labelled NAVD88. Set vertical_datum to NAVD88 (GEOID18) once the antenna height is confirmed to be NAVD88.')
+else:
+    print(f'OK antenna height {h} m on {vd}')
+")
+        case "${datum_check%% *}" in
+            OK)   report_pass "${datum_check#* }" ;;
+            WARN) report_warn "Vertical datum:"
+                  echo "         ${datum_check#* }" ;;
+        esac
     else
         report_fail "station.json exists but is not valid JSON"
         echo "         Re-run ./setup_station.sh to regenerate it, or fix"

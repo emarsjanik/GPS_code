@@ -55,6 +55,10 @@ import argparse
 import math
 from datetime import datetime
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_datum import spline_shift  # noqa: E402
 
 import numpy as np
 
@@ -76,7 +80,8 @@ def load_spline(path: Path):
                 continue
             times.append(dt)
             values.append(v)
-    return times, np.asarray(values, float)
+    # On NAVD88 whichever antenna height wrote the file (station_datum.py).
+    return times, np.asarray(values, float) + spline_shift(path)
 
 
 def load_tide(path: Path, time_col: str, value_col: str):

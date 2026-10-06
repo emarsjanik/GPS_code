@@ -39,8 +39,9 @@
     "gnssrefl_reflector_height_min": null,
     "gnssrefl_reflector_height_max": null,
 
-    "_comment_hortho": "Optional but recommended for coastal sites: your antenna's real height above a vertical datum (e.g. NAVD88, a local tide gauge datum). Enables absolute water level rather than just relative reflector height.",
+    "_comment_hortho": "Optional but recommended for coastal sites: your antenna's real height above NAVD88 (this system's standard datum), from an NGS OPUS solution with GEOID18 -- NOT the orthometric height on a CSRS-PPP report, which is CGVD2013 (0.349 m lower at Marconi). Enables absolute water level rather than just relative reflector height.",
     "gnssrefl_orthometric_height": null,
+    "vertical_datum": "NAVD88 (GEOID18)",
 
     "_comment_mask": "Site-specific. Elevation window and azimuth regions define which part of the sky is analyzed -- i.e. where on the ground the reflections actually come from. Defaults below are a reasonable starting point; see STATION_JSON_REFERENCE.md and use validate_station.py --checks reflection-zone to confirm your footprint actually lands on your target surface.",
     "gnssrefl_elevation_min": 5.0,

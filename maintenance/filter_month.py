@@ -22,9 +22,18 @@ Comment lines (starting with %) are preserved verbatim at the top of
 each output file -- they carry the column descriptions and the
 gnssrefl version, which a future reader of an archived file needs.
 
+VERTICAL DATUM: NAVD88. A spline written with the old CGVD2013 antenna
+height (0.349 m low) is converted on the way out: its water levels
+are moved onto NAVD88 and its "Hortho (m) is" header line rewritten,
+so every archived month is NAVD88 whichever height made it (see
+analysis_tools/station_datum.py). The subdaily file holds reflector
+heights only and is copied unchanged.
+
 Optionally also writes a merged CSV pairing the GNSS-IR water level
 with an interpolated tide-model value, using the same logic as
-analysis_tools/export_timeseries.py.
+analysis_tools/export_timeseries.py. Both columns are NAVD88 metres
+(gnss_ir_water_level_navd88_m, tide_model_<col>_navd88_m); the tide
+model is moved onto NAVD88 by tide_model_navd88_offset.
 
 Usage:
     python3 filter_month.py --year 2026 --month 8 \\
@@ -44,8 +53,16 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis_tools"))
+from station_datum import (load_station, navd88_hortho, spline_shift,  # noqa: E402
+                           tide_model_to_navd88)
+
+_FIELD = re.compile(r"[^,\s]+")
 
 
 MONTH_NAMES = {
@@ -59,17 +76,46 @@ def month_folder(year: int, month: int) -> str:
     return f"{MONTH_NAMES[month]}{year}"
 
 
+def shift_field(line: str, col: int, shift: float) -> str:
+    """line with its col-th field (0-indexed, comma or space separated,
+    as gnssrefl writes either) moved by shift, in the same width and
+    three decimals. gnssrefl's 999 no-data sentinel is left alone."""
+    spans = list(_FIELD.finditer(line))
+    if len(spans) <= col:
+        return line
+    m = spans[col]
+    try:
+        v = float(m.group())
+    except ValueError:
+        return line
+    if abs(v) > 900:
+        return line
+    new = f"{v + shift:.3f}".rjust(len(m.group()))
+    return line[:m.start()] + new + line[m.end():]
+
+
 def filter_by_columns(src: Path, dest: Path, year: int, month: int,
-                      year_col: int, month_col: int) -> int:
+                      year_col: int, month_col: int,
+                      level_col: int | None = None, level_shift: float = 0.0,
+                      hortho: float | None = None) -> int:
     """
     Copies src to dest, keeping comment lines and only those data
     rows whose year/month columns match. Returns the number of data
     rows kept.
+
+    With level_shift, the water level in level_col is moved by that
+    much and the header's "Hortho (m) is" line rewritten to hortho:
+    how a spline written with the old CGVD2013 antenna height is put on
+    NAVD88. gnssrefl's level is Hortho - RH and RH does not depend on
+    Hortho, so this is exactly the file gnssrefl would have written.
     """
     kept = 0
     with open(src, errors="replace") as fin, open(dest, "w") as fout:
         for line in fin:
             if line.startswith("%"):
+                if level_shift and hortho is not None and "Hortho (m) is" in line:
+                    head = line.rsplit("is", 1)[0]
+                    line = f"{head}is {hortho:8.3f} (NAVD88, GEOID18) \n"
                 fout.write(line)
                 continue
             cols = line.split()
@@ -81,12 +127,16 @@ def filter_by_columns(src: Path, dest: Path, year: int, month: int,
             except ValueError:
                 continue
             if row_year == year and row_month == month:
+                if level_shift and level_col is not None:
+                    line = shift_field(line, level_col, level_shift)
                 fout.write(line)
                 kept += 1
     return kept
 
 
 def load_spline(path: Path):
+    """(times, levels) from a spline file, levels on NAVD88."""
+    shift = spline_shift(path, quiet=True)
     times, values = [], []
     with open(path, errors="replace") as f:
         for line in f:
@@ -100,7 +150,8 @@ def load_spline(path: Path):
                     int(float(cols[2])), int(float(cols[3])), int(float(cols[4])),
                     int(float(cols[5])), int(float(cols[6])), int(float(cols[7])),
                 )
-                values.append(float(cols[8]))
+                v = float(cols[8])
+                values.append(v if abs(v) > 900 else v + shift)
                 times.append(dt)
             except (ValueError, IndexError):
                 continue
@@ -181,6 +232,7 @@ def main():
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    cfg = load_station()
     label = month_folder(args.year, args.month)
     print(f"Filtering to {label}")
     print()
@@ -192,7 +244,9 @@ def main():
     if spline_src.exists():
         dest = outdir / f"{args.station_code}_spline_out_{label}.txt"
         n = filter_by_columns(spline_src, dest, args.year, args.month,
-                              year_col=2, month_col=3)
+                              year_col=2, month_col=3, level_col=8,
+                              level_shift=spline_shift(spline_src),
+                              hortho=navd88_hortho(cfg))
         if n > 0:
             print(f"  {dest.name}: {n} rows")
             wrote_any = True
@@ -226,13 +280,17 @@ def main():
         if sel:
             tide_times, tide_values = load_tide(
                 Path(args.tide_file), args.tide_time_col, args.tide_value_col)
+            tide_shift = tide_model_to_navd88(cfg)
+            tide_values = [v + tide_shift for v in tide_values]
             tide_at = interp_tide(tide_times, tide_values, [t for t, _ in sel])
 
+            # Both columns NAVD88 metres; the tide model moved onto
+            # NAVD88 by tide_model_navd88_offset (station_datum.py).
             dest = outdir / f"{args.station_code}_timeseries_{label}.csv"
             with open(dest, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["timestamp_utc", "gnss_ir_water_level_m",
-                            f"tide_model_{args.tide_value_col}"])
+                w.writerow(["timestamp_utc", "gnss_ir_water_level_navd88_m",
+                            f"tide_model_{args.tide_value_col}_navd88_m"])
                 for (t, v), tv in zip(sel, tide_at):
                     w.writerow([t.strftime("%Y-%m-%d %H:%M:%S"),
                                 f"{v:.4f}",

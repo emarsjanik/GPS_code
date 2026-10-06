@@ -52,6 +52,10 @@ import json
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from station_datum import spline_shift  # noqa: E402
 
 import numpy as np
 
@@ -113,7 +117,8 @@ def load_spline(path: Path):
                 continue
             times.append(dt)
             values.append(v)
-    return times, np.asarray(values, dtype=float)
+    # On NAVD88 whichever antenna height wrote the file (station_datum.py).
+    return times, np.asarray(values, float) + spline_shift(path)
 
 
 def best_lag(gnss_t, gnss_v, gage_t, gage_v, max_minutes=180, step=5):
@@ -275,12 +280,11 @@ def main() -> int:
         print("  as narrowing the datum question, not settling it.")
         print()
         print("  The gage is referenced to NAVD88, surveyed to 0.02 ft.")
-        print("  This station's water levels are relative to a CGVD2013")
-        print("  orthometric height from CSRS-PPP. The mean above therefore")
-        print("  mixes a genuine datum difference with the real difference")
-        print("  in mean water level between two sites 27 km apart in")
-        print("  different tidal regimes -- it is a starting point for the")
-        print("  datum question, not an answer to it.")
+        print("  This station's water levels are NAVD88 too, through the")
+        print("  OPUS antenna height (GEOID18, +/-0.061 m). The mean above")
+        print("  is therefore mostly the real difference in mean water level")
+        print("  between two sites 27 km apart in different tidal regimes,")
+        print("  plus the antenna-height uncertainty -- not a datum offset.")
 
     print()
     print("=" * 68)
