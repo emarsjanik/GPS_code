@@ -129,7 +129,8 @@ for attempt in $(seq 1 "$MAIL_ATTEMPTS"); do
         --attach "$PLOTS_DIR/${STATION_CODE}_vs_tide.png" \
         --attach "$PLOTS_DIR/7_day_plot.png" \
         --attach "/mnt/I2Rgus_Data/waterline/elevation_map_c1_7day.png" \
-        --attach "/mnt/I2Rgus_Data/waterline/elevation_map_c2_7day.png"
+        --attach "/mnt/I2Rgus_Data/waterline/elevation_map_c2_7day.png" \
+        --attach "/mnt/I2Rgus_Data/waterline/dem_intertidal_7day_dem.png"
     mail_exit=$?
 
     if [ "$mail_exit" -eq 0 ]; then

@@ -16,6 +16,8 @@ import argparse
 import json
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -159,6 +161,26 @@ def deviation_stats() -> str:
     return recent_note + "\n".join(lines).strip()
 
 
+# An attached picture that has stopped updating looks just like a fresh
+# one in the email -- the DEM, for instance, is kept as it was when the
+# waterline cron refuses a GNSS-R record. So the body lists when each was
+# last written, and flags any older than this.
+STALE_HOURS = 36
+
+
+def attachment_ages(paths) -> str:
+    now = time.time()
+    width = max(len(p.name) for p in paths)
+    out = []
+    for p in paths:
+        mtime = p.stat().st_mtime
+        when = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        age_h = (now - mtime) / 3600
+        flag = (f"   <-- not updated for {age_h / 24:.1f} days" if age_h > STALE_HOURS else "")
+        out.append(f"  {p.name:<{width}}  updated {when}Z{flag}")
+    return "\n".join(out)
+
+
 # Images larger than this are downscaled before attaching. The GNSS
 # plots are around 200 KB and are left alone; the waterline
 # elevation maps are several megabytes and are not.
@@ -225,6 +247,8 @@ def main() -> int:
         else:
             missing.append(path)
 
+    if attached:
+        body += "\n\nAttached:\n" + attachment_ages(attached) + "\n"
     if missing:
         body += "\n(not attached, file missing: " + ", ".join(missing) + ")\n"
 
