@@ -25,12 +25,13 @@
 # re-uploading is cheap even on a slow link -- unlike the RINEX
 # archives, which are hundreds of MB each and must never be re-sent.
 #
-# By default only the current month is processed. --backfill walks
-# every month present in the data, which is what you want once, to
-# populate months that predate this script.
+# By default only the current month (and, for its first 10 days, the
+# previous one) is processed. --backfill walks every month present in
+# the data, which is what you want once, to populate months that
+# predate this script.
 #
 # Usage:
-#   ./s3UploadTimeseries.sh             (current month only)
+#   ./s3UploadTimeseries.sh             (current month, + previous to the 10th)
 #   ./s3UploadTimeseries.sh --backfill  (every month in the record)
 
 set -uo pipefail
@@ -95,8 +96,8 @@ fi
 BACKFILL=false
 [ "${1:-}" = "--backfill" ] && BACKFILL=true
 
-COUNT_FILE="/mnt/I2Rgus_Data/gnss_timeseries_upload_count.txt"
-LOCK_FILE="/mnt/I2Rgus_Data/gnss_timeseries_upload_count.lock"
+COUNT_FILE="${TIMESERIES_COUNT_FILE:-/mnt/I2Rgus_Data/gnss_timeseries_upload_count.txt}"
+LOCK_FILE="${COUNT_FILE%.txt}.lock"
 
 if [ ! -f "$FILTER_SCRIPT" ]; then
     echo "filter_month.py not found at $FILTER_SCRIPT"
@@ -120,6 +121,15 @@ month_name() {
     esac
 }
 
+# Years analysis_tools/gnss_record.py has just frozen leave
+# fit/s3_upload_year_<year>: every month of such a year is uploaded once
+# more, so the archive holds the year's final levels rather than the ones
+# of ~10 days after each month. The mark goes when all uploads succeeded.
+year_marks=()
+for m in "$PRODUCTS_DIR"/fit/s3_upload_year_*; do
+    [ -f "$m" ] && year_marks+=("$m")
+done
+
 # Which year/month pairs to process.
 if $BACKFILL; then
     # Every distinct year/month actually present in the spline file
@@ -131,7 +141,20 @@ if $BACKFILL; then
     )
     echo "Backfill: found ${#periods[@]} month(s) in the record."
 else
-    periods=("$(date -u +'%Y %-m')")
+    # This month, and the previous one for its first 10 days. The nightly
+    # run (22:30 local) is already the next UTC day, and a month's last
+    # days are only filled in two days later (orbits) -- so December is
+    # still being completed in early January.
+    # Plus every month of a year analysis_tools/gnss_record.py has just
+    # frozen (see year_marks above).
+    mapfile -t periods < <(
+        {
+            for back in 10 0; do date -u -d "-$back days" +'%Y %-m'; done
+            for m in ${year_marks[@]+"${year_marks[@]}"}; do
+                grep -v "^%" "$SPLINE" | awk -v y="${m##*_}" '$3 == y {printf "%d %d\n", $3, $4}'
+            done
+        } | sort -u -k1,1n -k2,2n
+    )
 fi
 
 uploaded_count=0
@@ -190,4 +213,7 @@ if [ "$uploaded_count" -gt 0 ]; then
 fi
 
 [ "$failed_count" -gt 0 ] && exit 1
+for m in ${year_marks[@]+"${year_marks[@]}"}; do
+    rm -f "$m" && echo "Frozen year ${m##*_}: every month re-uploaded"
+done
 exit 0

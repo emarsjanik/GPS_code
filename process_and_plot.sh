@@ -48,47 +48,10 @@ section() {
 # and found to hang under some conditions -- not used here.
 # ----------------------------------------------------------------
 
-# For steps with no useful intermediate output of their own (e.g. a
-# single gnssrefl subdaily call) -- shows a spinner and captures
-# output, printing it only on failure.
-run_with_spinner() {
-    local message="$1"
-    shift
-
-    "$@" > /tmp/process_and_plot_step.$$ 2>&1 &
-    local pid=$!
-
-    local frames='|/-\'
-    local i=0
-
-    printf "  [..]   %s " "$message"
-    while kill -0 "$pid" 2>/dev/null; do
-        i=$(( (i + 1) % 4 ))
-        printf "\r  [%s]   %s " "${frames:$i:1}" "$message"
-        sleep 0.2
-    done
-
-    wait "$pid"
-    local exit_code=$?
-
-    if [ "$exit_code" -eq 0 ]; then
-        printf "\r  [OK]   %s\n" "$message"
-    else
-        printf "\r  [FAIL] %s\n" "$message"
-        echo "  ---- output ----"
-        cat /tmp/process_and_plot_step.$$
-        echo "  -----------------"
-    fi
-
-    rm -f /tmp/process_and_plot_step.$$
-    return "$exit_code"
-}
-
 # For steps that produce one real output file per unit of work
-# (e.g. one results/<doy>.txt per day processed) -- same safe
-# background-and-poll structure as above, but shows real,
-# incremental progress against a known total instead of a plain
-# spinner.
+# (e.g. one results/<doy>.txt per day processed) -- the safe
+# background-and-poll structure above, showing real, incremental
+# progress against a known total.
 run_with_progress_count() {
     local message="$1"
     local watch_dir="$2"
@@ -165,14 +128,25 @@ if [ -z "$STATION_CODE" ]; then
     exit 1
 fi
 
-YEAR=$(date +%Y)
+# Only for the progress count in Step 2. Results go to the year of the
+# data, and Steps 3-4 use every year (analysis_tools/gnss_record.py).
+YEAR=$(date -u +%Y)
 
 export REFL_CODE="$PROJECT_DIR/products/refl_code"
 export ORBITS="$REFL_CODE/orbits"
 export EXE="$REFL_CODE/exe"
 
 RESULTS_DIR="$REFL_CODE/$YEAR/results/$STATION_CODE"
-mkdir -p "$RESULTS_DIR"
+GNSS_RECORD=(python3 "$PROJECT_DIR/analysis_tools/gnss_record.py"
+             --refl-code "$REFL_CODE" --station "$STATION_CODE")
+# Optional "gnss_record_first_day": "YYYY-MM-DD" in station.json -- results
+# before it (installation tests, a different antenna setup) are left out of
+# the water-level record. Every year's results folder counts otherwise.
+RECORD_FIRST_DAY=$(python3 -c "
+import json
+print(json.load(open('$STATION_JSON')).get('gnss_record_first_day') or '')
+" 2>/dev/null)
+[ -n "$RECORD_FIRST_DAY" ] && GNSS_RECORD+=(--since "$RECORD_FIRST_DAY")
 
 echo "  Station code: $STATION_CODE   Year: $YEAR"
 
@@ -183,7 +157,18 @@ echo "  Station code: $STATION_CODE   Year: $YEAR"
 section "Step 1: Recovering previously missed days (if any)"
 
 if [ -f "$PROJECT_DIR/maintenance/recover_missing_days.sh" ]; then
-    bash "$PROJECT_DIR/maintenance/recover_missing_days.sh"
+    # Last year too, so a late-December day is still recoverable in
+    # January -- but only once the record has a last year: RINEX older
+    # than the station's own results (tests, another setup) is never
+    # pulled in by this.
+    this_year=$(date -u +%Y)
+    for recover_year in $(( this_year - 1 )) "$this_year"; do
+        if [ "$recover_year" -ne "$this_year" ] \
+           && [ ! -d "$REFL_CODE/$recover_year/results/$STATION_CODE" ]; then
+            continue
+        fi
+        RECOVER_YEAR="$recover_year" bash "$PROJECT_DIR/maintenance/recover_missing_days.sh"
+    done
 else
     echo "  recover_missing_days.sh not found -- skipping this step."
     echo "  (This is only needed if you use external storage for"
@@ -250,14 +235,17 @@ if summary.errors:
 fi
 
 # ----------------------------------------------------------------
-# Step 3: find the real range of available results
+# Step 3: find the available results -- every year of them
 # ----------------------------------------------------------------
 
 section "Step 3: Checking available results"
 
-day_files=$(find "$RESULTS_DIR" -maxdepth 1 -name "*.txt" -exec basename {} .txt \; 2>/dev/null | sort -n)
-
-if [ -z "$day_files" ]; then
+"${GNSS_RECORD[@]}" summary
+summary_exit=$?
+if [ "$summary_exit" -ne 0 ] && [ "$summary_exit" -ne 3 ]; then
+    echo "  Could not list the results -- see the error above."
+    exit 1
+elif [ "$summary_exit" -eq 3 ]; then
     echo "  No results found yet -- nothing to plot."
     echo ""
     echo "  If you expected results here, run ./test_installation.sh"
@@ -266,25 +254,19 @@ if [ -z "$day_files" ]; then
     exit 0
 fi
 
-day_count=$(echo "$day_files" | wc -l)
-echo "  Found results for $day_count day(s) of year:"
-for d in $day_files; do
-    track_count=$(grep -vc "^%" "$RESULTS_DIR/$d.txt" 2>/dev/null || echo 0)
-    echo "    Day $d: $track_count track(s)"
-done
-
-min_day=$(echo "$day_files" | head -1)
-max_day=$(echo "$day_files" | tail -1)
-
 # ----------------------------------------------------------------
-# Step 4: generate the plot
+# Step 4: fit the water level and update the whole-record spline
 # ----------------------------------------------------------------
 
-section "Step 4: Generating plot (days $min_day-$max_day)"
+section "Step 4: Fitting the water level"
 
-echo "  This runs gnssrefl's own subdaily analysis: combining every"
-echo "  day's results, fitting a smooth curve through them, and"
-echo "  saving several diagnostic plots plus the main result plot."
+echo "  gnssrefl's subdaily combines the days' results and fits a smooth"
+echo "  curve through them. It fits from 1 January of the oldest year not"
+echo "  yet frozen to the newest day, across the year boundary, and the"
+echo "  frozen years are added to it, so the spline always holds the"
+echo "  whole record (see analysis_tools/gnss_record.py). About a"
+echo "  minute per year of data; subdaily's own output goes to"
+echo "  $REFL_CODE/Files/$STATION_CODE/fit/subdaily.log."
 echo ""
 
 # Confirmed via direct testing: -knots 4 (gnssrefl's own suggested
@@ -305,31 +287,26 @@ echo ""
 # (+0.10 m bias); 35-125 deg only 0.221 / 0.276 m (+0.03 m), keeping 81% of
 # arcs. subdaily applies this to the stored results, so no reprocessing is
 # needed. To revert, set both to empty: SUBDAILY_AZIM1="" SUBDAILY_AZIM2="".
+# A change here refits the frozen years too, once (gnss_record.py).
 SUBDAILY_AZIM1=35
 SUBDAILY_AZIM2=125
-azim_args=()
+SUBDAILY_SETTINGS="-rhdot True -knots 8"
 if [ -n "$SUBDAILY_AZIM1" ] && [ -n "$SUBDAILY_AZIM2" ]; then
-    azim_args=(-azim1 "$SUBDAILY_AZIM1" -azim2 "$SUBDAILY_AZIM2")
+    SUBDAILY_SETTINGS="$SUBDAILY_SETTINGS -azim1 $SUBDAILY_AZIM1 -azim2 $SUBDAILY_AZIM2"
 fi
 
-if run_with_spinner \
-    "Generating plots" \
-    subdaily "$STATION_CODE" "$YEAR" -doy1 "$min_day" -doy2 "$max_day" -rhdot True -knots 8 \
-        ${azim_args[@]+"${azim_args[@]}"} \
-   || { [ ${#azim_args[@]} -gt 0 ] && echo "  subdaily failed with the azimuth window -- retrying without it" \
-        && run_with_spinner "Generating plots (all azimuths)" \
-           subdaily "$STATION_CODE" "$YEAR" -doy1 "$min_day" -doy2 "$max_day" -rhdot True -knots 8; }; then
-
-    PLOTS_DIR="$REFL_CODE/Files/$STATION_CODE"
+# Without the azimuth window as a fallback (a year with too few arcs in
+# the window makes subdaily crash); a fallback fit is never frozen.
+if "${GNSS_RECORD[@]}" update --settings "$SUBDAILY_SETTINGS" \
+        --fallback-settings "-rhdot True -knots 8"; then
     echo ""
-    echo "  Plots saved to:"
-    echo "    $PLOTS_DIR"
-    echo ""
-    echo "  The main result is usually the file ending in _last.png"
-    echo "  in that directory."
+    echo "  Water level: $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
+    echo "  gnssrefl's own plots (the main one ends in _last.png):"
+    echo "    $REFL_CODE/Files/$STATION_CODE/fit"
 else
     echo ""
-    echo "  Plot generation reported a problem -- see the output above."
+    echo "  The fit reported a problem -- see the output above. The"
+    echo "  water-level file keeps the previous night's record."
 fi
 
 # ----------------------------------------------------------------
@@ -461,8 +438,8 @@ fi
 section "Done"
 
 echo "Summary:"
-echo "  Results available for days $min_day-$max_day ($day_count day(s))"
-echo "  Plots directory: $REFL_CODE/Files/$STATION_CODE"
+echo "  Water level (whole record): $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
+echo "  gnssrefl plots: $REFL_CODE/Files/$STATION_CODE/fit"
 if [ -f "$REFL_CODE/Files/$STATION_CODE/7_day_plot.png" ]; then
     echo "  7-day public plot: $REFL_CODE/Files/$STATION_CODE/7_day_plot.png"
 fi

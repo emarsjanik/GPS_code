@@ -226,6 +226,7 @@ production results directory is affected.
 | `vertical_datum` | string | The datum `gnssrefl_orthometric_height` (and so every water level) is on, e.g. `"NAVD88 (GEOID18)"`. Read by `analysis_tools/station_datum.py`; set by `maintenance/migrate_to_navd88.py`. |
 | `water_level_msl_offset` | number (meters) | Height of local mean sea level in the same datum as the water levels (about +0.1 m NAVD88 here). The public 7-day plot subtracts it to draw levels above mean sea level; every other product stays NAVD88. Moves with `gnssrefl_orthometric_height` if that ever changes datum. |
 | `tide_model_navd88_offset` | number (meters) | Added to tide-model heights to put them on NAVD88 (default +0.09: the model ensemble sits ~0.09 m below NAVD88 here). |
+| `gnss_record_first_day` | string `"YYYY-MM-DD"` | Optional. Results before this day are left out of the whole-record water level (`analysis_tools/gnss_record.py`), e.g. installation tests or an earlier antenna setup in an older `$REFL_CODE/<year>` folder. Unset: every year's results count. Changing it can shorten the record, which `gnss_record.py` (and the waterline cron) refuse until told -- see `--allow-shrink`. |
 
 All water-level products are NAVD88. `analysis_tools/station_datum.py`
 is the single place that is defined; a spline file written with an

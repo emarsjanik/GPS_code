@@ -169,19 +169,16 @@ fi
 # ----------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------
-# Year and station code derived rather than hardcoded: the year
-# was previously fixed at 2026, which would have silently
-# reported "0 days" from January 1st onward.
-_year=$(date -u +%Y)
+# Station code derived rather than hardcoded; days counted over every
+# year, so 1 January does not report "0 days".
 _station=$(python3 -c "
 import json
 d = json.load(open('$PROJECT_DIR/station/resources/station.json'))
 code = d.get('gnssrefl_station_code') or d.get('station_id', '')[:4]
 print(code.lower())
 " 2>/dev/null || echo "")
-RESULTS_DIR="$PROJECT_DIR/products/refl_code/$_year/results/$_station"
-if [ -d "$RESULTS_DIR" ]; then
-    day_count=$(find "$RESULTS_DIR" -maxdepth 1 -name "*.txt" | wc -l)
+if [ -n "$_station" ] && [ -d "$PROJECT_DIR/products/refl_code" ]; then
+    day_count=$(find "$PROJECT_DIR/products/refl_code" -path "*/results/$_station/*.txt" | wc -l)
     log "Results now available for $day_count day(s)."
 fi
 

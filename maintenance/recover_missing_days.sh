@@ -68,7 +68,11 @@ set -uo pipefail
 PROJECT_DIR="$HOME/GNSS/v4.1"
 STATION_CODE="usgs"           # 4-character code, used for GNSS-IR analysis
 STATION_CODE_LONG="usgs00usa" # 9-character code, used for RINEX-related steps
-YEAR="2026"                   # bump this once a year
+# The year whose days are recovered: this UTC year unless RECOVER_YEAR
+# says otherwise. process_and_plot.sh runs it for last year as well, so
+# a late-December day can still be recovered in January:
+#   RECOVER_YEAR=2026 ./recover_missing_days.sh 364 365
+YEAR="${RECOVER_YEAR:-$(date -u +%Y)}"
 EXTERNAL_PRODUCTS_DIR="/mnt/I2Rgus_Data/GPS_Data/Products"
 LOCAL_RESULTS_DIR="$PROJECT_DIR/products/refl_code/$YEAR/results/$STATION_CODE"
 
