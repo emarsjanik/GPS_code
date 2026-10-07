@@ -278,8 +278,11 @@ def write_atomic(path: Path, lines) -> None:
 
 
 def copy_atomic(src: Path, dest: Path) -> None:
+    """write_atomic for a copy: the same one-step replace, 0644 and fsync."""
     tmp = dest.with_name(f".{dest.name}.tmp")
     shutil.copyfile(src, tmp)
+    with open(tmp, "rb") as f:
+        os.fsync(f.fileno())
     os.chmod(tmp, 0o644)
     os.replace(tmp, dest)
 

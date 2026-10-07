@@ -480,10 +480,31 @@ class GnssRecordTests(unittest.TestCase):
         self.assertEqual(self.night(), 0)
 
     def test_leap_year_2028(self):
-        results_range(self.refl, date(2028, 12, 1), date(2028, 12, 31))
+        # 2028 has 366 days: 31 December is doy 366, and 25 December
+        # (the start of the pad once 2028 is frozen) is doy 360.
+        results_range(self.refl, date(2028, 12, 1), date(2028, 12, 30))
+
+        # 31 Dec 2028 22:30 local (results to 30 Dec, doy 365)
+        self.assertEqual(self.night(), 0)
+        self.assertIn("usgs 2028 -doy1 336 -year_end 2028 -doy2 365 ", self.last_call())
+        self.assert_whole_record(date(2028, 12, 1), date(2028, 12, 30))
+
+        # 1 Jan 2029: 31 Dec (doy 366) processed, the 2029 folder empty
+        write_result(self.refl, date(2028, 12, 31))
+        (self.refl / "2029" / "results" / STA).mkdir(parents=True)
         self.assertEqual(self.night(), 0)
         self.assertIn("usgs 2028 -doy1 336 -year_end 2028 -doy2 366 ", self.last_call())
-        results_range(self.refl, date(2029, 1, 1), date(2029, 1, 14))
+        self.assert_whole_record(date(2028, 12, 1), date(2028, 12, 31))
+
+        # 2 Jan 2029: the first 2029 day, fitted across the boundary
+        write_result(self.refl, date(2029, 1, 1))
+        self.assertEqual(self.night(), 0)
+        self.assertIn("usgs 2028 -doy1 336 -year_end 2029 -doy2 1 ", self.last_call())
+        self.assert_whole_record(date(2028, 12, 1), date(2029, 1, 1))
+        self.assertTrue(any(r[1:4] == (2028, 12, 31) for r in self.record()), "doy 366 kept")
+
+        # 14 days in: 2028 frozen; the next night fits 2029 from 25 Dec (doy 360)
+        results_range(self.refl, date(2029, 1, 2), date(2029, 1, 14))
         self.assertEqual(self.night(), 0)
         self.assertTrue(gr.frozen_path(self.files, STA, 2028).exists())
         write_result(self.refl, date(2029, 1, 15))
@@ -632,7 +653,7 @@ class RealSubdailyTests(unittest.TestCase):
         with unittest.mock.patch("builtins.print"):
             return gr.cmd_update(self.refl, STA, SETTINGS, FALLBACK, False)
 
-    def check(self, first: date, last: date):
+    def check(self, first: date, last: date, new_year: date | None = date(2027, 1, 1)):
         np = self.np
         a = np.loadtxt(self.files / f"{STA}_spline_out.txt", comments="%")
         days = [date(int(r[2]), int(r[3]), int(r[4])) for r in (a[0], a[-1])]
@@ -641,7 +662,9 @@ class RealSubdailyTests(unittest.TestCase):
         self.assertTrue(np.all(steps >= 30) and np.all(steps % 30 == 0), "30-min grid, no repeats")
         err = a[:, 8] - self.truth(a[:, 0])
         self.assertLess(np.sqrt(np.mean(err ** 2)), 0.08)
-        near = np.abs(a[:, 0] - 61406.0) <= 0.5               # +-12 h of 2027-01-01T00Z
+        if new_year is None:                                  # the boundary is the record's end
+            return a
+        near = np.abs(a[:, 0] - (new_year - MJD0).days) <= 0.5   # +-12 h of 1 January 00Z
         if near.any():
             self.assertLess(np.sqrt(np.mean(err[near] ** 2)), 0.08)
         return a
@@ -684,6 +707,29 @@ class RealSubdailyTests(unittest.TestCase):
         self.assertEqual(self.night(), 0)
         self.check(date(2026, 12, 1), date(2027, 1, 2))
         self.assertFalse(json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())["fallback"])
+
+    def test_leap_year_boundary_with_real_subdaily(self):
+        """31 December 2028 is doy 366: the nights of 1 and 2 January 2029."""
+        self.results(date(2028, 12, 10), date(2028, 12, 31))
+        (self.refl / "2029" / "results" / STA).mkdir(parents=True)
+        np = self.np
+        mjd_2029 = (date(2029, 1, 1) - MJD0).days
+        self.assertEqual(self.night(), 0)                         # 1 Jan 2029
+        # 31 Dec is the record's newest end tonight: its last hours are
+        # provisional (mirrored at the edge; up to ~0.2 m off, refitted the
+        # next night), so only the first half of doy 366 is held to the
+        # interior accuracy here
+        a = self.check(date(2028, 12, 10), date(2028, 12, 31), None)
+        doy366 = (a[:, 0] >= mjd_2029 - 1) & (a[:, 0] < mjd_2029 - 0.5)
+        err = a[doy366, 8] - self.truth(a[doy366, 0])
+        self.assertGreater(doy366.sum(), 20)
+        self.assertLess(np.sqrt(np.mean(err ** 2)), 0.08)
+        self.results(date(2029, 1, 1), date(2029, 1, 1))
+        self.assertEqual(self.night(), 0)                         # 2 Jan 2029
+        a = self.check(date(2028, 12, 10), date(2029, 1, 1), date(2029, 1, 1))
+        self.assertTrue(np.any(np.isclose(a[:, 0], mjd_2029 - 1 / 48, rtol=0, atol=1e-4)),
+                        "23:30 on doy 366")
+        self.assertTrue(np.any(np.isclose(a[:, 0], mjd_2029, rtol=0, atol=1e-4)), "00:00 on 1 January")
 
     def test_ultra_rapid_window_on_1_january(self):
         self.results(date(2026, 12, 30), date(2027, 1, 1))
