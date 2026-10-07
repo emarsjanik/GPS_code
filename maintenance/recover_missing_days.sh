@@ -73,6 +73,20 @@ STATION_CODE_LONG="usgs00usa" # 9-character code, used for RINEX-related steps
 # a late-December day can still be recovered in January:
 #   RECOVER_YEAR=2026 ./recover_missing_days.sh 364 365
 YEAR="${RECOVER_YEAR:-$(date -u +%Y)}"
+# RECOVER_SINCE=YYYY-MM-DD (process_and_plot.sh passes station.json's
+# gnss_record_first_day): the automatic search skips days before it --
+# they are not part of the water-level record. Days given by hand are
+# always tried.
+RECOVER_SINCE="${RECOVER_SINCE:-}"
+since_doy=0
+if [[ "$RECOVER_SINCE" =~ ^([0-9]{4})-[0-9]{2}-[0-9]{2}$ ]]; then
+    since_year=$((10#${BASH_REMATCH[1]}))
+    if [ "$since_year" -gt "$YEAR" ]; then
+        since_doy=367
+    elif [ "$since_year" -eq "$YEAR" ] && since_j=$(date -u -d "$RECOVER_SINCE" +%j 2>/dev/null); then
+        since_doy=$((10#$since_j))
+    fi
+fi
 EXTERNAL_PRODUCTS_DIR="/mnt/I2Rgus_Data/GPS_Data/Products"
 LOCAL_RESULTS_DIR="$PROJECT_DIR/products/refl_code/$YEAR/results/$STATION_CODE"
 
@@ -126,8 +140,13 @@ if [ "$#" -eq 0 ]; then
     fi
 
     days_to_recover=()
+    skipped_before_since=0
     for doy_padded in $recoverable_doys; do
         doy=$((10#$doy_padded))  # force base-10 so e.g. "008" isn't read as invalid octal
+        if [ "$doy" -lt "$since_doy" ]; then
+            skipped_before_since=$((skipped_before_since + 1))
+            continue
+        fi
         local_results_file="$LOCAL_RESULTS_DIR/${doy_padded}.txt"  # gnssrefl zero-pads (008.txt)
         local_no_data_marker="$LOCAL_RESULTS_DIR/${doy}.no_data"
         # A day is only still "missing" if it has neither a real
@@ -143,6 +162,10 @@ if [ "$#" -eq 0 ]; then
             days_to_recover+=("$doy")
         fi
     done
+
+    if [ "$skipped_before_since" -gt 0 ]; then
+        echo "Skipped $skipped_before_since day(s) of $YEAR before $RECOVER_SINCE (gnss_record_first_day)."
+    fi
 
     if [ "${#days_to_recover[@]}" -eq 0 ]; then
         echo "Every recoverable day already has local results -- nothing to do."

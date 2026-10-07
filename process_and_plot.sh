@@ -51,13 +51,13 @@ section() {
 # For steps that produce one real output file per unit of work
 # (e.g. one results/<doy>.txt per day processed) -- the safe
 # background-and-poll structure above, showing real, incremental
-# progress against a known total.
+# progress against a known total. count_fn names a function that
+# prints how many such files there are now.
 run_with_progress_count() {
     local message="$1"
-    local watch_dir="$2"
-    local watch_pattern="$3"
-    local total="$4"
-    shift 4
+    local count_fn="$2"
+    local total="$3"
+    shift 3
 
     "$@" > /tmp/process_and_plot_step.$$ 2>&1 &
     local pid=$!
@@ -68,7 +68,7 @@ run_with_progress_count() {
     while kill -0 "$pid" 2>/dev/null; do
         i=$(( (i + 1) % 4 ))
         local current
-        current=$(find "$watch_dir" -maxdepth 1 -name "$watch_pattern" 2>/dev/null | wc -l)
+        current=$("$count_fn")
         printf "\r  [%s]   %s (%d/%d files)   " "${frames:$i:1}" "$message" "$current" "$total"
         sleep 0.3
     done
@@ -77,7 +77,7 @@ run_with_progress_count() {
     local exit_code=$?
 
     local final_count
-    final_count=$(find "$watch_dir" -maxdepth 1 -name "$watch_pattern" 2>/dev/null | wc -l)
+    final_count=$("$count_fn")
 
     if [ "$exit_code" -eq 0 ]; then
         printf "\r  [OK]   %s (%d/%d files)   \n" "$message" "$final_count" "$total"
@@ -128,27 +128,31 @@ if [ -z "$STATION_CODE" ]; then
     exit 1
 fi
 
-# Only for the progress count in Step 2. Results go to the year of the
-# data, and Steps 3-4 use every year (analysis_tools/gnss_record.py).
-YEAR=$(date -u +%Y)
-
 export REFL_CODE="$PROJECT_DIR/products/refl_code"
 export ORBITS="$REFL_CODE/orbits"
 export EXE="$REFL_CODE/exe"
 
-RESULTS_DIR="$REFL_CODE/$YEAR/results/$STATION_CODE"
+# Results files of this station, every year: each day's goes to the
+# folder of its own year (the 31 December run is already 1 January in
+# UTC), so the Step 2 progress count looks at all of them.
+count_results() {
+    find "$REFL_CODE"/[0-9][0-9][0-9][0-9]/results/"$STATION_CODE" -maxdepth 1 -name "*.txt" 2>/dev/null | wc -l
+}
+
+# gnss_record.py reads station.json's optional "gnss_record_first_day"
+# ("YYYY-MM-DD") itself: results before it (installation tests, a
+# different antenna setup) are left out of the water-level record, and
+# setting it later shortens the record on purpose. Every year's results
+# folder counts otherwise. Step 1 does not recover days before it.
 GNSS_RECORD=(python3 "$PROJECT_DIR/analysis_tools/gnss_record.py"
-             --refl-code "$REFL_CODE" --station "$STATION_CODE")
-# Optional "gnss_record_first_day": "YYYY-MM-DD" in station.json -- results
-# before it (installation tests, a different antenna setup) are left out of
-# the water-level record. Every year's results folder counts otherwise.
+             --refl-code "$REFL_CODE" --station "$STATION_CODE" --station-json "$STATION_JSON")
 RECORD_FIRST_DAY=$(python3 -c "
 import json
 print(json.load(open('$STATION_JSON')).get('gnss_record_first_day') or '')
 " 2>/dev/null)
-[ -n "$RECORD_FIRST_DAY" ] && GNSS_RECORD+=(--since "$RECORD_FIRST_DAY")
 
-echo "  Station code: $STATION_CODE   Year: $YEAR"
+echo "  Station code: $STATION_CODE"
+[ -n "$RECORD_FIRST_DAY" ] && echo "  Water-level record from: $RECORD_FIRST_DAY (gnss_record_first_day)"
 
 # ----------------------------------------------------------------
 # Step 1: auto-recover any previously-missed days
@@ -158,16 +162,24 @@ section "Step 1: Recovering previously missed days (if any)"
 
 if [ -f "$PROJECT_DIR/maintenance/recover_missing_days.sh" ]; then
     # Last year too, so a late-December day is still recoverable in
-    # January -- but only once the record has a last year: RINEX older
-    # than the station's own results (tests, another setup) is never
-    # pulled in by this.
+    # January -- but only once the record has a last year (its results
+    # folder exists), and never before gnss_record_first_day: those days
+    # are not part of the record, and each recovered day is a ~400 MB
+    # copy plus rinex2snr and gnssir.
     this_year=$(date -u +%Y)
+    first_year=0
+    [[ "$RECORD_FIRST_DAY" =~ ^[0-9]{4}- ]] && first_year=$((10#${RECORD_FIRST_DAY:0:4}))
     for recover_year in $(( this_year - 1 )) "$this_year"; do
         if [ "$recover_year" -ne "$this_year" ] \
            && [ ! -d "$REFL_CODE/$recover_year/results/$STATION_CODE" ]; then
             continue
         fi
-        RECOVER_YEAR="$recover_year" bash "$PROJECT_DIR/maintenance/recover_missing_days.sh"
+        if [ "$recover_year" -lt "$first_year" ]; then
+            echo "  $recover_year: before gnss_record_first_day ($RECORD_FIRST_DAY) -- not recovered."
+            continue
+        fi
+        RECOVER_YEAR="$recover_year" RECOVER_SINCE="$RECORD_FIRST_DAY" \
+            bash "$PROJECT_DIR/maintenance/recover_missing_days.sh"
     done
 else
     echo "  recover_missing_days.sh not found -- skipping this step."
@@ -194,13 +206,12 @@ else
     echo "  conditions (orbit data is downloaded automatically)."
     echo ""
 
-    results_before=$(find "$RESULTS_DIR" -maxdepth 1 -name "*.txt" 2>/dev/null | wc -l)
+    results_before=$(count_results)
     expected_after=$((results_before + raw_file_count))
 
     run_with_progress_count \
         "Running pipeline" \
-        "$RESULTS_DIR" \
-        "*.txt" \
+        count_results \
         "$expected_after" \
         python3 -c "
 import sys
@@ -301,8 +312,8 @@ if "${GNSS_RECORD[@]}" update --settings "$SUBDAILY_SETTINGS" \
         --fallback-settings "-rhdot True -knots 8"; then
     echo ""
     echo "  Water level: $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
-    echo "  gnssrefl's own plots (the main one ends in _last.png):"
-    echo "    $REFL_CODE/Files/$STATION_CODE/fit"
+    echo "  gnssrefl's main plot: $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_last.png"
+    echo "  (the rest of tonight's gnssrefl output: $REFL_CODE/Files/$STATION_CODE/fit)"
 else
     echo ""
     echo "  The fit reported a problem -- see the output above. The"
@@ -439,7 +450,7 @@ section "Done"
 
 echo "Summary:"
 echo "  Water level (whole record): $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
-echo "  gnssrefl plots: $REFL_CODE/Files/$STATION_CODE/fit"
+echo "  gnssrefl's main plot: $REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_last.png (the rest in fit/)"
 if [ -f "$REFL_CODE/Files/$STATION_CODE/7_day_plot.png" ]; then
     echo "  7-day public plot: $REFL_CODE/Files/$STATION_CODE/7_day_plot.png"
 fi

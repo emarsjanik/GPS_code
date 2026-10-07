@@ -341,8 +341,15 @@ def check_water_level_record(station_code: str, since=None) -> None:
     elif st.get("fallback"):
         record(WARN, "record", f"last update used the fallback settings '{st.get('settings')}' "
                               f"(no azimuth window) for the whole live year")
+    if st.get("missing_edit"):
+        record(WARN, "record", f"subdaily wrote no {station_code}_<year>_subdaily_edit.txt for "
+                              f"{', '.join(map(str, st['missing_edit']))}: filter_month.py skips "
+                              f"those months (a renamed gnssrefl output?)")
     try:
-        span = (datetime.fromisoformat(str(st["fit_end"])) - datetime.fromisoformat(str(st["fit_start"]))).days
+        # from 1 January of the first year still not frozen after the update
+        # (live_from), so the night that refreezes a year is not counted
+        span = (datetime.fromisoformat(str(st["fit_end"]))
+                - datetime.fromisoformat(str(st.get("live_from") or st["fit_start"]))).days
         if span > gnss_record.LIVE_SPAN_WARN_DAYS:
             record(WARN, "record", f"the nightly fit spans {span} days: a past year is not "
                                   f"being frozen")
@@ -539,8 +546,7 @@ def main() -> int:
             d = json.loads(station_json.read_text())
             station_code = (d.get("gnssrefl_station_code")
                             or (d.get("station_id") or "")[:4]).lower() or "usgs"
-            if d.get("gnss_record_first_day"):
-                since = datetime.fromisoformat(d["gnss_record_first_day"]).date()
+            since = gnss_record.record_first_day(station_json)
         except Exception:
             pass
 

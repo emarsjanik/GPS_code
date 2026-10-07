@@ -69,10 +69,13 @@ def spline_text(first: date, last: date, hortho: float, rh_offset: float = 0.0) 
 
 
 # A stand-in for gnssrefl's subdaily: reads the same arguments and writes
-# <sta>_spline_out.txt and the per-year edit files into $REFL_CODE/Files/<subdir>,
-# covering exactly the results days it was asked for. FAKE_SUBDAILY=silent
-# exits 0 without writing (what subdaily does when it finds no results);
-# FAKE_SUBDAILY=crash_azim exits 1 when an azimuth window is given.
+# <sta>_spline_out.txt, the per-year edit files and the main plot (named as
+# gnssrefl names it) into $REFL_CODE/Files/<subdir>, covering exactly the
+# results days it was asked for. FAKE_SUBDAILY=silent exits 0 without
+# writing (what subdaily does when it finds no results); =crash_azim exits 1
+# when an azimuth window is given; =window exits 1 when the window leaves a
+# year of the range with no arcs (what the real one does); =rename_edit
+# writes the edit files under another name (a gnssrefl upgrade).
 FAKE_SUBDAILY = r'''#!/usr/bin/env python3
 import os, sys
 from datetime import date, timedelta
@@ -96,6 +99,18 @@ while d <= last:
     if os.path.exists(f"{refl}/{d.year}/results/{sta}/{d.timetuple().tm_yday:03d}.txt"):
         days.append(d)
     d += timedelta(days=1)
+if mode == "window" and "-azim1" in opt:
+    lo, hi = float(opt["-azim1"]), float(opt["-azim2"])
+    for y in range(y1, y2 + 1):
+        n = 0
+        for d in days:
+            if d.year == y:
+                for l in open(f"{refl}/{d.year}/results/{sta}/{d.timetuple().tm_yday:03d}.txt"):
+                    if not l.startswith("%") and lo <= float(l.split()[5]) <= hi:
+                        n += 1
+        if n == 0:
+            print("ValueError: min() arg is an empty sequence")
+            sys.exit(1)
 out = os.path.join(refl, "Files", opt.get("-subdir", sta))
 os.makedirs(out, exist_ok=True)
 h = float(os.environ.get("FAKE_HORTHO", "19.014"))
@@ -104,9 +119,12 @@ text = spline_text(days[0], days[-1], h, float(os.environ.get("FAKE_RH_OFFSET", 
 with open(f"{out}/{sta}_spline_out.txt", "w") as f:
     f.writelines(l for l in text.splitlines(True)
                  if l.startswith("%") or tuple(int(x) for x in l.split()[2:5]) in have)
+edit = "_subdaily_edit_v5.txt" if mode == "rename_edit" else "_subdaily_edit.txt"
 for y in sorted({d.year for d in days}):
-    with open(f"{out}/{sta}_{y}_subdaily_edit.txt", "w") as f:
+    with open(f"{out}/{sta}_{y}{edit}", "w") as f:
         f.write("% edit\n" + "".join(f"{d.year} {d.timetuple().tm_yday} 5.0\n" for d in days if d.year == y))
+with open(f"{out}/{sta}_{y1}_last.png" if y1 == y2 else f"{out}/{sta}_{y1}_{y2}_last.png", "w") as f:
+    f.write(f"plot {y1} {y2}\n")
 '''
 
 
@@ -582,6 +600,327 @@ class GnssRecordTests(unittest.TestCase):
         self.assertFalse(mark.exists(), "done once")
         self.assertTrue((self.tmp / "count.txt").exists())
 
+    # ---- review round 2 ---------------------------------------------------
+
+    def status(self):
+        return json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+
+    def health(self, sh):
+        sh.findings.clear()
+        with unittest.mock.patch.object(sh, "PROJECT_DIR", self.tmp):
+            sh.check_water_level_record(STA)
+        return [f for f in sh.findings if f[1] == "record"]
+
+    def link_products(self):
+        sys.path.insert(0, str(ROOT / "diagnostics"))
+        import station_health as sh
+        (self.tmp / "products").mkdir()
+        (self.tmp / "products" / "refl_code").symlink_to(self.refl)
+        return sh
+
+    def test_first_day_in_station_json_shortens_the_record_without_allow_shrink(self):
+        # the station's old calendar-year spline starts at the first 2026
+        # results day; a later gnss_record_first_day used to be refused every
+        # night ("would start later") -- gnss_record.py now reads it itself
+        results_range(self.refl, date(2026, 7, 1), date(2026, 10, 5))
+        self.assertEqual(self.night(), 0)
+        sj = self.tmp / "station.json"
+        sj.write_text(json.dumps({"station_id": "USGS00USA", "gnss_record_first_day": "2026-07-10"}))
+        update = [sys.executable, str(ROOT / "analysis_tools" / "gnss_record.py"),
+                  "--refl-code", str(self.refl), "--station", STA, "--station-json", str(sj),
+                  "update", "--settings", SETTINGS, "--fallback-settings", FALLBACK]
+        r = subprocess.run(update, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("usgs 2026 -doy1 191 -year_end 2026 -doy2 278 ", self.last_call())
+        self.assert_whole_record(date(2026, 7, 10), date(2026, 10, 5))
+        self.assertEqual(self.status()["first_day"], "2026-07-10")
+        self.assertEqual(subprocess.run(update, capture_output=True).returncode, 0)   # every night after
+        # a later start that is not the configured first day is still refused
+        for k in range(10, 16):
+            (self.refl / "2026" / "results" / STA / f"{date(2026, 7, k).timetuple().tm_yday:03d}.txt").unlink()
+        r = subprocess.run(update, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("later than the current one (2026-07-10)", r.stdout)
+        self.assertIn("gnss_record_first_day", r.stdout)
+        self.assert_whole_record(date(2026, 7, 10), date(2026, 10, 5))
+
+    def test_operator_command_from_a_plain_shell(self):
+        # the one-time command of the station steps: cd to the project, the
+        # venv active, no REFL_CODE in the environment
+        proj = self.tmp / "v4.1"
+        (proj / "analysis_tools").mkdir(parents=True)
+        shutil.copy(ROOT / "analysis_tools" / "gnss_record.py", proj / "analysis_tools")
+        (proj / "station" / "resources").mkdir(parents=True)
+        (proj / "station" / "resources" / "station.json").write_text(
+            json.dumps({"gnss_record_first_day": "2026-12-03"}))
+        refl = proj / "products" / "refl_code"
+        results_range(refl, date(2026, 12, 1), date(2027, 1, 3))
+        env = {k: v for k, v in os.environ.items() if k != "REFL_CODE"}
+        cmd = [sys.executable, "analysis_tools/gnss_record.py", "--refl-code", "products/refl_code",
+               "--station", STA, "update", "--settings", SETTINGS, "--fallback-settings", FALLBACK,
+               "--allow-shrink"]
+        r = subprocess.run(cmd, cwd=proj, env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rec = rows(refl / "Files" / STA / f"{STA}_spline_out.txt")
+        self.assertEqual(rec[0][1:4], (2026, 12, 3), "station.json read without being named")
+        self.assertEqual(rec[-1][1:4], (2027, 1, 3))
+        # with no --refl-code either: the project's products/refl_code
+        r = subprocess.run([sys.executable, str(proj / "analysis_tools" / "gnss_record.py"),
+                            "--station", STA, "summary"], cwd=self.tmp, env=env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("2026-12-03 to 2027-01-03", r.stdout)
+        # without the venv: a plain message, not a traceback, and nothing touched
+        before = (refl / "Files" / STA / f"{STA}_spline_out.txt").read_text()
+        r = subprocess.run(cmd, cwd=proj, env=dict(env, PATH="/usr/bin:/bin"),
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("source gnssrefl_venv/bin/activate", r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual((refl / "Files" / STA / f"{STA}_spline_out.txt").read_text(), before)
+
+    def test_thin_first_year_is_fitted_by_itself_and_frozen(self):
+        # the record's first year is one 31 December whose arcs all lie outside
+        # 35-125 deg: subdaily crashes on every fit holding it, and the whole
+        # record was refitted without the window every night, never frozen
+        os.environ["FAKE_SUBDAILY"] = "window"
+        write_result(self.refl, date(2026, 12, 31), n=8, az=250.0)
+        results_range(self.refl, date(2027, 1, 1), date(2027, 1, 5))
+        self.assertEqual(self.night(), 0)
+        self.assertEqual(self.calls.read_text().splitlines(), [
+            f"{STA} 2026 -doy1 365 -year_end 2026 -doy2 365 -subdir usgs/fit {SETTINGS}",   # crashes
+            f"{STA} 2026 -doy1 365 -year_end 2026 -doy2 365 -subdir usgs/fit {FALLBACK}",
+            f"{STA} 2027 -doy1 1 -year_end 2027 -doy2 5 -subdir usgs/fit {SETTINGS}"])
+        st = self.status()
+        self.assertFalse(st["fallback"], st)
+        self.assertEqual(st["frozen"], [2026])
+        frozen = gr.frozen_path(self.files, STA, 2026)
+        self.assertIn(f"2026 by itself with '{FALLBACK}' (0 arc(s) in the azimuth window)",
+                      frozen.read_text())
+        r = self.record()
+        self.assertEqual((r[0][1:4], r[-1][1:4]), ((2026, 12, 31), (2027, 1, 5)))
+        self.assertTrue((self.files / f"{STA}_2026_subdaily_edit.txt").exists())
+        dec31 = [x for x in r if x[1] == 2026]
+        # the next nights fit 2027 only, with the window; 2026 stays as frozen
+        self.calls.unlink()
+        write_result(self.refl, date(2027, 1, 6))
+        self.assertEqual(self.night(), 0)
+        self.assertEqual(self.calls.read_text().splitlines(),
+                         [f"{STA} 2027 -doy1 1 -year_end 2027 -doy2 6 -subdir usgs/fit {SETTINGS}"])
+        self.assertEqual([x for x in self.record() if x[1] == 2026], dec31)
+        self.assertFalse(self.status()["fallback"])
+
+    def test_thin_year_that_cannot_be_fitted_by_itself_stays_in_the_fit(self):
+        os.environ["FAKE_SUBDAILY"] = "window"
+        write_result(self.refl, date(2026, 12, 31), n=8, az=250.0)
+        results_range(self.refl, date(2027, 1, 1), date(2027, 1, 5))
+        self.assertEqual(self.night(fallback=None), 1)          # no fallback: nothing can work
+        self.assertEqual(self.last_call(),
+                         f"{STA} 2026 -doy1 365 -year_end 2027 -doy2 5 -subdir usgs/fit {SETTINGS}")
+        self.assertFalse(self.status()["ok"])
+
+    def test_thin_stray_year_before_a_year_without_results_is_still_refused(self):
+        # a stray file years before the record, however thin, is not made
+        # part of it: the update refuses loudly until gnss_record_first_day
+        write_result(self.refl, date(2024, 5, 1), n=5, az=250.0)
+        results_range(self.refl, date(2026, 12, 1), date(2027, 1, 2))
+        self.assertEqual(self.night(), 1)
+        self.assertIn("no results at all in [2025]", self.status()["message"])
+        self.assertFalse(self.calls.exists(), "subdaily not run")
+
+    def test_refreeze_night_does_not_warn_of_a_year_not_being_frozen(self):
+        sh = self.link_products()
+        results_range(self.refl, date(2026, 12, 1), date(2027, 1, 20))
+        self.assertEqual(self.night(), 0)                         # freezes 2026
+        results_range(self.refl, date(2027, 1, 21), date(2027, 8, 10))
+        self.assertEqual(self.night(), 0)
+        write_result(self.refl, date(2026, 9, 15))                # a 2026 day recovered in August 2027
+        with unittest.mock.patch("builtins.print") as out:
+            self.assertEqual(gr.cmd_update(self.refl, STA, SETTINGS, FALLBACK, False), 0)
+        printed = "\n".join(str(c.args[0]) for c in out.call_args_list if c.args)
+        self.assertIn("usgs 2026 -doy1 258 -year_end 2027 -doy2 222 ", self.last_call())  # 329 days
+        self.assertIn("froze 2026", printed)
+        self.assertNotIn("not being frozen", printed)
+        self.assertEqual(self.status()["live_from"], "2027-01-01")
+        self.assertEqual([f[0] for f in self.health(sh)], ["OK"])
+        # a year that really is not frozen (a fallback fit every night) still warns
+        os.environ["FAKE_SUBDAILY"] = "crash_azim"
+        results_range(self.refl, date(2027, 8, 11), date(2028, 3, 15))
+        with unittest.mock.patch("builtins.print") as out:
+            self.assertEqual(gr.cmd_update(self.refl, STA, SETTINGS, FALLBACK, False), 0)
+        printed = "\n".join(str(c.args[0]) for c in out.call_args_list if c.args)
+        self.assertIn("the live fit spans 439 days from 2027-01-01", printed)
+        self.assertTrue(any("a past year is not being frozen" in f[2] for f in self.health(sh)))
+
+    def test_missing_edit_file_is_reported(self):
+        # a gnssrefl upgrade that renames the edit files: filter_month.py would
+        # skip the months without a word
+        sh = self.link_products()
+        results_range(self.refl, date(2026, 12, 20), date(2027, 1, 3))
+        os.environ["FAKE_SUBDAILY"] = "rename_edit"
+        self.assertEqual(self.night(), 0)
+        self.assertEqual(self.status()["missing_edit"], [2026, 2027])
+        found = self.health(sh)
+        self.assertEqual([f[0] for f in found], ["WARN"])
+        self.assertIn("usgs_<year>_subdaily_edit.txt for 2026, 2027", found[0][2])
+        os.environ["FAKE_SUBDAILY"] = ""
+        self.assertEqual(self.night(), 0)
+        self.assertEqual(self.status()["missing_edit"], [])
+        self.assertEqual([f[0] for f in self.health(sh)], ["OK"])
+
+    def test_fit_folder_holds_one_run_and_the_main_plot_has_one_name(self):
+        results_range(self.refl, date(2026, 12, 1), date(2026, 12, 31))
+        self.assertEqual(self.night(), 0)
+        last = self.files / f"{STA}_last.png"
+        self.assertEqual(last.read_text(), "plot 2026 2026\n")
+        results_range(self.refl, date(2027, 1, 1), date(2027, 1, 14))
+        self.assertEqual(self.night(), 0)                         # also freezes 2026
+        fit = self.files / "fit"
+        self.assertEqual([p.name for p in fit.glob("*.png")], [f"{STA}_2026_2027_last.png"])
+        self.assertEqual(last.read_text(), "plot 2026 2027\n")
+        (fit / "outliers.spline.txt").write_text("an earlier run's\n")
+        write_result(self.refl, date(2027, 1, 15))
+        self.assertEqual(self.night(), 0)
+        self.assertFalse((fit / "outliers.spline.txt").exists())
+        for kept in ("s3_upload_year_2026", gr.STATUS_NAME, ".lock", gr.FIT_LOG):
+            self.assertTrue((fit / kept).exists(), kept)
+
+    def test_ultra_rapid_check_skips_a_thin_first_of_january(self):
+        import ultra_rapid_check as urc
+        results_range(self.refl, date(2026, 12, 30), date(2026, 12, 31))
+        write_result(self.refl, date(2027, 1, 1), n=6, az=250.0)    # 1 Jan so far: outside the window
+        self.assertTrue(urc.new_year_too_thin(gr.results_days(self.refl, STA)))
+        write_result(self.refl, date(2027, 1, 1), n=40)
+        self.assertFalse(urc.new_year_too_thin(gr.results_days(self.refl, STA)))
+        # on any other day a thin today is fitted as before
+        shutil.rmtree(self.refl / "2027")
+        write_result(self.refl, date(2026, 12, 31), n=6, az=250.0)
+        self.assertFalse(urc.new_year_too_thin(gr.results_days(self.refl, STA)))
+
+    def test_process_and_plot_step1_and_progress_count(self):
+        proj = self.tmp / "proj"
+        (proj / "maintenance").mkdir(parents=True)
+        shutil.copy(ROOT / "process_and_plot.sh", proj)
+        shutil.copytree(ROOT / "analysis_tools", proj / "analysis_tools")
+        log = self.tmp / "recover.log"
+        (proj / "maintenance" / "recover_missing_days.sh").write_text(
+            f'echo "$RECOVER_YEAR [$RECOVER_SINCE]" >> {log}\n')
+        (proj / "station" / "resources").mkdir(parents=True)
+        bindir = self.tmp / "ppbin"
+        bindir.mkdir()
+        (bindir / "convbin").write_text("#!/bin/sh\nexit 0\n")
+        (bindir / "date").write_text(
+            "#!/bin/bash\nargs=()\nhave_d=0\nwhile [ $# -gt 0 ]; do\n"
+            "  if [ \"$1\" = -d ]; then args+=(-d \"$FAKE_NOW $2\"); have_d=1; shift 2\n"
+            "  else args+=(\"$1\"); shift; fi\ndone\n"
+            "[ $have_d = 1 ] || args+=(-d \"$FAKE_NOW\")\n"
+            "exec /bin/date \"${args[@]}\"\n")
+        for f in ("convbin", "date"):
+            (bindir / f).chmod(0o755)
+        (proj / "gnssrefl_venv" / "bin").mkdir(parents=True)
+        (proj / "gnssrefl_venv" / "bin" / "activate").write_text(f'export PATH="{bindir}:$PATH"\n')
+        refl = proj / "products" / "refl_code"
+        write_result(refl, date(2025, 12, 1))                     # a stray older-year results folder
+        results_range(refl, date(2026, 7, 1), date(2026, 10, 6))  # 98 days
+        (proj / "raw").mkdir()
+        (proj / "raw" / "station_20261007.um980").write_text("x")
+
+        def run(first_day, now):
+            (proj / "station" / "resources" / "station.json").write_text(json.dumps(
+                {"station_id": "USGS00USA", **({"gnss_record_first_day": first_day} if first_day else {})}))
+            log.unlink(missing_ok=True)
+            env = {k: v for k, v in os.environ.items() if k != "REFL_CODE"}
+            r = subprocess.run(["bash", str(proj / "process_and_plot.sh")], cwd=proj,
+                               env=dict(env, FAKE_NOW=now), capture_output=True, text=True, timeout=600)
+            return r.stdout, log.read_text().splitlines()
+
+        out, rec = run(None, "2026-10-08 02:30 UTC")
+        self.assertEqual(rec, ["2025 []", "2026 []"])
+        out, rec = run("2026-07-10", "2026-10-08 02:30 UTC")
+        self.assertEqual(rec, ["2026 [2026-07-10]"], "2025 is before the record: not recovered")
+        self.assertIn("2025: before gnss_record_first_day (2026-07-10) -- not recovered", out)
+        # the 31 December run, already 1 January in UTC: the count is of every
+        # year's results (1 + 98), not of the empty 2027 folder
+        out, rec = run("2026-07-10", "2027-01-01 03:30 UTC")
+        self.assertEqual(rec, ["2026 [2026-07-10]", "2027 [2026-07-10]"])
+        self.assertIn("(99/100 files)", out)
+        self.assertIn("Water-level record from: 2026-07-10", out)
+
+    def test_qc_spike_test_finds_neighbours_in_the_sorted_epochs(self):
+        # water_level_qc.run_qc reads the whole record, which now grows every
+        # year: its spike test looks neighbours up in the sorted epochs instead
+        # of comparing every reading with all others, with the same result
+        import numpy as np
+        import water_level_qc as qc
+        rng = np.random.default_rng(5)
+        ep = 1.8e9 + 1800.0 * np.arange(120 * 48)
+        keep = np.ones(len(ep), bool)
+        for i in rng.integers(0, len(ep), 25):                # gaps
+            keep[i:i + rng.integers(2, 100)] = False
+        ep = ep[keep]
+        lv = 1.3 * np.cos(2 * np.pi * ep / 44714.0) + rng.normal(0, 0.05, len(ep))
+        sp = rng.random(len(ep)) < 0.01
+        lv[sp] += rng.choice([-1, 1], sp.sum()) * rng.uniform(0.4, 1.5, sp.sum())
+        lv[rng.integers(0, len(ep), 5)] = 9.0                 # gross: never a neighbour
+        rep = rng.integers(1, len(ep) - 1, 10)                # a repeated epoch
+        ep, lv = np.insert(ep, rep, ep[rep]), np.insert(lv, rep, lv[rep])
+
+        def brute_force(ep, lv):                              # the old loop, all pairs
+            ok = ~((lv < qc.GROSS_MIN) | (lv > qc.GROSS_MAX))
+            out = set()
+            for i in np.flatnonzero(ok):
+                near = ok & (np.abs(ep - ep[i]) <= qc.SPIKE_WINDOW_S)
+                near[i] = False
+                if (near & (ep < ep[i])).sum() < 2 or (near & (ep > ep[i])).sum() < 2:
+                    continue
+                coef = np.polyfit((ep[near] - ep[i]) / 3600.0, lv[near], 2)
+                if abs(lv[i] - coef[2]) > qc.SPIKE_LIMIT:
+                    out.add(int(i))
+            return out
+
+        for order in (np.arange(len(ep)), rng.permutation(len(ep))):   # sorted, shuffled
+            e, v = ep[order], lv[order]
+            _, reasons, _ = qc.run_qc(e, v)
+            got = {i for i, r in enumerate(reasons) if "spike" in r.split(";")}
+            self.assertGreater(len(got), 20)
+            self.assertEqual(got, brute_force(e, v))
+
+    def test_recover_missing_days_skips_days_before_the_first_day(self):
+        proj = self.tmp / "v4.1"
+        (proj / "maintenance").mkdir(parents=True)
+        export = self.tmp / "Products" / "2026-07-20"
+        export.mkdir(parents=True)
+        for doy in range(185, 196):                               # 4-14 July
+            (export / f"USGS00USA_R_2026{doy:03d}0000_01D_01S_MO.rnx").write_text("rinex\n")
+        src = (ROOT / "maintenance" / "recover_missing_days.sh").read_text()
+        for a, b in (('PROJECT_DIR="$HOME/GNSS/v4.1"', f'PROJECT_DIR="{proj}"'),
+                     ('EXTERNAL_PRODUCTS_DIR="/mnt/I2Rgus_Data/GPS_Data/Products"',
+                      f'EXTERNAL_PRODUCTS_DIR="{self.tmp / "Products"}"')):
+            self.assertIn(a, src)
+            src = src.replace(a, b)
+        script = proj / "maintenance" / "recover_missing_days.sh"
+        script.write_text(src)
+        bindir = self.tmp / "rbin"
+        bindir.mkdir()
+        (bindir / "rinex2snr").write_text(f'#!/bin/sh\necho "$3" >> {self.tmp}/rinex2snr.log\n')
+        (bindir / "gnssir").write_text('#!/bin/sh\nd="$REFL_CODE/$2/results/$1"; mkdir -p "$d"\n'
+                                       'echo "2026 $3 5.0" > "$d/$(printf %03d "$3").txt"\n')
+        for f in ("rinex2snr", "gnssir"):
+            (bindir / f).chmod(0o755)
+        (proj / "gnssrefl_venv" / "bin").mkdir(parents=True)
+        (proj / "gnssrefl_venv" / "bin" / "activate").write_text(f'export PATH="{bindir}:$PATH"\n')
+        r = subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                           env=dict(os.environ, RECOVER_YEAR="2026", RECOVER_SINCE="2026-07-10"))
+        self.assertEqual((self.tmp / "rinex2snr.log").read_text().split(),
+                         ["191", "192", "193", "194", "195"])
+        self.assertIn("Skipped 6 day(s) of 2026 before 2026-07-10", r.stdout)
+        # a first day in a later year: nothing of 2026 at all
+        (self.tmp / "rinex2snr.log").unlink()
+        shutil.rmtree(proj / "products")
+        r = subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                           env=dict(os.environ, RECOVER_YEAR="2026", RECOVER_SINCE="2027-01-03"))
+        self.assertFalse((self.tmp / "rinex2snr.log").exists(), r.stdout)
+
 
 
 def _gnssrefl_installed() -> bool:
@@ -706,6 +1045,33 @@ class RealSubdailyTests(unittest.TestCase):
         self.results(date(2027, 1, 2), date(2027, 1, 2))
         self.assertEqual(self.night(), 0)
         self.check(date(2026, 12, 1), date(2027, 1, 2))
+        self.assertFalse(json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())["fallback"])
+
+    def test_thin_first_year_with_real_subdaily(self):
+        """The record's first year is one 31 December whose 8 arcs all lie
+        outside 35-125 deg. Every fit holding it crashed, and the whole record
+        was refitted without the window each night and never frozen. Now that
+        year is fitted by itself (the fallback, said so in its header) and
+        frozen, and 2027 is fitted with the window."""
+        np = self.np
+        self.results(date(2026, 12, 31), date(2026, 12, 31), arcs=8, az=(200, 300))
+        self.results(date(2027, 1, 1), date(2027, 1, 5))
+        self.assertEqual(self.night(), 0)
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+        self.assertFalse(st["fallback"], st)
+        self.assertEqual(st["frozen"], [2026])
+        self.assertIn(f"2026 by itself with '{FALLBACK}'",
+                      gr.frozen_path(self.files, STA, 2026).read_text())
+        a = np.loadtxt(self.files / f"{STA}_spline_out.txt", comments="%")
+        self.assertEqual([date(int(r[2]), int(r[3]), int(r[4])) for r in (a[0], a[-1])],
+                         [date(2026, 12, 31), date(2027, 1, 5)])
+        y27 = a[:, 2] == 2027
+        err = a[y27, 8] - self.truth(a[y27, 0])
+        self.assertLess(np.sqrt(np.mean(err ** 2)), 0.08)
+        self.results(date(2027, 1, 6), date(2027, 1, 6))
+        self.assertEqual(self.night(), 0)                         # 2027 only, with the window
+        b = np.loadtxt(self.files / f"{STA}_spline_out.txt", comments="%")
+        np.testing.assert_array_equal(b[b[:, 2] == 2026], a[~y27])
         self.assertFalse(json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())["fallback"])
 
     def test_leap_year_boundary_with_real_subdaily(self):

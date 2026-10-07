@@ -217,8 +217,9 @@ orbit-data-dependent analysis, per file) — this is expected, not a
 sign that anything has stalled.
 
 When it finishes, it tells you exactly where the plots were saved. The
-main result is usually the file ending in `_last.png`, in
-`products/refl_code/Files/<station>/fit/`. The water level itself, every
+main result is gnssrefl's last plot, copied to
+`products/refl_code/Files/<station>/<station>_last.png` (the rest of the
+night's gnssrefl output is in `fit/`). The water level itself, every
 year of it, is `products/refl_code/Files/<station>/<station>_spline_out.txt`
 (see `analysis_tools/gnss_record.py`); how the last nightly update went is
 in `fit/record_status.json`, and the daily health mail reports it.
