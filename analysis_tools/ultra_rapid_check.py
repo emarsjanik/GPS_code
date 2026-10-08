@@ -59,6 +59,24 @@ sys.path.insert(0, str(PROJECT))
 sys.path.insert(0, str(PROJECT / "station"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from station_datum import spline_shift  # noqa: E402
+from gnss_record import (MIN_EDGE_ARCS, arcs_in_window, azimuth_window,  # noqa: E402
+                         results_days, subdaily_range)
+
+# the same as process_and_plot.sh
+SUBDAILY_SETTINGS = "-rhdot True -knots 8 -azim1 35 -azim2 125"
+
+
+def new_year_too_thin(days: dict, settings: str = SUBDAILY_SETTINGS) -> bool:
+    """True when the fit would span the year boundary (1 January UTC) and
+    the new year -- today so far -- has under MIN_EDGE_ARCS arcs in the
+    azimuth window: subdaily crashes when its window empties a year of the
+    range. On any other day a thin today just gives few same-day points.
+    `days` is {date: results file}, oldest first."""
+    if not days or min(days).year == max(days).year:
+        return False
+    newest = max(days).year
+    window = azimuth_window(settings)
+    return sum(arcs_in_window(p, window) for d, p in days.items() if d.year == newest) < MIN_EDGE_ARCS
 
 
 def read_spline(path: Path):
@@ -211,15 +229,30 @@ def main() -> int:
             shutil.copy2(src, dst)
 
     env = dict(os.environ, REFL_CODE=str(refl), ORBITS=str(refl / "orbits"), EXE=str(refl / "exe"))
-    d1 = (day - timedelta(days=args.days_back)).timetuple().tm_yday
-    d2 = day.timetuple().tm_yday
-    cmd = ["subdaily", station, str(day.year), "-doy1", str(d1), "-doy2", str(d2),
-           "-rhdot", "True", "-knots", "8", "-azim1", "35", "-azim2", "125"]
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if r.returncode != 0:
-        print("subdaily failed:\n" + (r.stderr or r.stdout)[-1500:])
+    # the days actually there, across the year boundary on 1-2 January
+    # (a single-year call with doy1 > doy2 makes subdaily exit 0 and write nothing)
+    days = {d: f for d, f in results_days(refl, station).items()
+            if day - timedelta(days=args.days_back) <= d <= day}
+    try:
+        y1, d1, y2, d2 = subdaily_range(days)
+    except ValueError as exc:
+        print(f"nothing to fit: {exc}")
         return 1
-    ue, uv = read_spline(refl / "Files" / station / f"{station}_spline_out.txt")
+    if new_year_too_thin(days):
+        print(f"same-day levels   : none yet (too little of today's data in the azimuth window "
+              f"to fit across the year boundary; under {MIN_EDGE_ARCS} arcs) -- not run")
+        print()
+        compare(ultra, prod_spline)
+        return 0
+    spline = refl / "Files" / station / f"{station}_spline_out.txt"
+    spline.unlink(missing_ok=True)                # so last run's spline is never read as this one's
+    cmd = ["subdaily", station, str(y1), "-doy1", str(d1), "-year_end", str(y2), "-doy2", str(d2)
+           ] + SUBDAILY_SETTINGS.split()
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if r.returncode != 0 or not spline.exists():
+        print(f"subdaily wrote no spline (exit status {r.returncode}):\n" + (r.stderr or r.stdout)[-1500:])
+        return 1
+    ue, uv = read_spline(spline)
     t0 = datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp()
     m = ue >= t0
     hist = ultra / "history"

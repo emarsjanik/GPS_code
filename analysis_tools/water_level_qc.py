@@ -354,12 +354,20 @@ def run_qc(ep, lv, reference=None, waves=None):
                     mark(i, FAIL, "reference")
 
     ok = flags < FAIL
+    # Only readings within SPIKE_WINDOW_S can be neighbours: they are looked
+    # up in the sorted epochs (the record now holds every year, and testing
+    # every reading against all others grew as n^2). The +1 s margin only
+    # widens the candidates; the window test itself is the exact one, and
+    # the neighbours keep their order, so the fit is the same as before.
+    order = np.argsort(ep, kind="stable")
+    lo = np.searchsorted(ep[order], ep - (SPIKE_WINDOW_S + 1.0), side="left")
+    hi = np.searchsorted(ep[order], ep + (SPIKE_WINDOW_S + 1.0), side="right")
     for i in range(n):
         if not ok[i]:
             continue
-        near = ok & (np.abs(ep - ep[i]) <= SPIKE_WINDOW_S)
-        near[i] = False
-        if (near & (ep < ep[i])).sum() < 2 or (near & (ep > ep[i])).sum() < 2:
+        cand = np.sort(order[lo[i]:hi[i]])
+        near = cand[ok[cand] & (np.abs(ep[cand] - ep[i]) <= SPIKE_WINDOW_S) & (cand != i)]
+        if (ep[near] < ep[i]).sum() < 2 or (ep[near] > ep[i]).sum() < 2:
             continue                                # not evaluated at edges and gaps
         coef = np.polyfit((ep[near] - ep[i]) / 3600.0, lv[near], 2)
         if abs(lv[i] - coef[2]) > SPIKE_LIMIT:      # coef[2] = curve value at t_i

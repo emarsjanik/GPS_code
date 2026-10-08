@@ -50,6 +50,9 @@ from pathlib import Path
 # level up. Tolerates being run from the root itself.
 _here = Path(__file__).resolve().parent
 PROJECT_DIR = _here.parent if _here.name == "diagnostics" else _here
+sys.path.insert(0, str(PROJECT_DIR / "analysis_tools"))
+import gnss_record  # noqa: E402
+from gnss_record import results_days  # noqa: E402
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 
@@ -120,14 +123,14 @@ def _is_future_day_message(text: str) -> bool:
     """
     if not text or "No results file produced" not in text:
         return False
-    m = re.search(r"/(\d{1,3})\.txt", text)
+    m = re.search(r"/(\d{4})/results/[^/\s]+/(\d{1,3})\.txt", text)
     if not m:
         return False
-    doy = int(m.group(1))
-    today_doy = int(utcnow().strftime("%j"))
+    day = datetime(int(m.group(1)), 1, 1).date() + timedelta(days=int(m.group(2)) - 1)
     # Today and yesterday are both legitimately incomplete: yesterday's
     # UTC day only closes at 00:00 today, and is processed that evening.
-    return doy >= today_doy - 1
+    # Compared as dates, so 31 December still counts as yesterday on 1 January.
+    return day >= utcnow().date() - timedelta(days=1)
 
 
 def _failure_since_resolved(text: str) -> bool:
@@ -245,29 +248,24 @@ def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
 # ------------------------------------------------------------------
 # 2. Is processing keeping up?
 # ------------------------------------------------------------------
-def check_processing_currency(station_code: str) -> None:
-    results_dir = None
+def check_processing_currency(station_code: str, since=None) -> None:
     base = PROJECT_DIR / "products" / "refl_code"
-    if base.is_dir():
-        for year_dir in sorted(base.glob("[0-9][0-9][0-9][0-9]"), reverse=True):
-            candidate = year_dir / "results" / station_code
-            if candidate.is_dir():
-                results_dir = candidate
-                break
-
-    if results_dir is None:
+    # Every year's results: on 1-2 January the newest day is still in
+    # last year's folder while this year's is empty. Days before
+    # gnss_record_first_day (station.json) are not part of the record:
+    # neither counted nor reported as gaps.
+    if not any(base.glob(f"[0-9][0-9][0-9][0-9]/results/{station_code}")):
         record(WARN, "processing", "No results directory found yet")
         return
 
-    days = sorted(int(p.stem) for p in results_dir.glob("*.txt")
-                  if p.stem.isdigit())
+    days = list(results_days(base, station_code, since))
     if not days:
-        record(FAIL, "processing", "Results directory exists but contains no days")
+        record(FAIL, "processing", "Results directories exist but contain no days"
+                                   + (f" from gnss_record_first_day ({since})" if since else ""))
         return
 
-    today_doy = int(utcnow().strftime("%j"))
     newest = days[-1]
-    lag = today_doy - newest
+    lag = (utcnow().date() - newest).days
 
     # A two-day lag is this pipeline's normal steady state, not a
     # symptom. A UTC day cannot be processed until it has finished
@@ -276,28 +274,92 @@ def check_processing_currency(station_code: str) -> None:
     # routinely two day-numbers behind "today".
     if lag <= 2:
         record(OK, "processing",
-               f"{len(days)} days processed, newest is doy {newest} "
+               f"{len(days)} days processed, newest is {newest} "
                f"({lag}d behind, which is normal for a nightly run)")
     elif lag <= 4:
         record(WARN, "processing",
-               f"Newest result is doy {newest}, {lag} days behind today "
-               f"({today_doy}) -- a run may have been missed")
+               f"Newest result is {newest}, {lag} days behind today "
+               f"-- a run may have been missed")
     else:
         record(FAIL, "processing",
-               f"Newest result is doy {newest}, {lag} days behind today ({today_doy}) "
+               f"Newest result is {newest}, {lag} days behind today "
                f"-- processing appears stalled")
 
-    # Interior gaps, ignoring days explicitly marked as having no
-    # usable data.
+    # Interior gaps over the last year, across the year boundary,
+    # ignoring days explicitly marked as having no usable data.
+    recent = [d for d in days if d > newest - timedelta(days=365)]
     gaps = []
-    for a, b in zip(days, days[1:]):
-        for missing in range(a + 1, b):
-            if not (results_dir / f"{missing}.no_data").exists():
+    for a, b in zip(recent, recent[1:]):
+        for k in range(1, (b - a).days):
+            missing = a + timedelta(days=k)
+            marker = (base / str(missing.year) / "results" / station_code
+                      / f"{missing.timetuple().tm_yday}.no_data")
+            if not marker.exists():
                 gaps.append(missing)
     if gaps:
         shown = ", ".join(str(g) for g in gaps[:8])
         more = f" (+{len(gaps) - 8} more)" if len(gaps) > 8 else ""
-        record(WARN, "processing", f"Gap(s) in the record: doy {shown}{more}")
+        record(WARN, "processing", f"Gap(s) in the record: {shown}{more}")
+
+
+# ------------------------------------------------------------------
+# 2b. Does the water-level record hold every results day?
+#     (analysis_tools/gnss_record.py; the waterline DEM drops every
+#     camera frame the record does not cover, so a truncated or stale
+#     record must show up here, not only days later on the camera side.)
+# ------------------------------------------------------------------
+def check_water_level_record(station_code: str, since=None) -> None:
+    base = PROJECT_DIR / "products" / "refl_code"
+    days = list(results_days(base, station_code, since))
+    if not days:
+        return
+    files = base / "Files" / station_code
+    rec = files / f"{station_code}_spline_out.txt"
+    try:
+        _, rows = gnss_record.read_spline(rec)
+    except OSError:
+        record(FAIL, "record", f"{rec.name} not found")
+        return
+    if not rows:
+        record(FAIL, "record", f"{rec.name} has no readings")
+        return
+    first = gnss_record.row_date(rows[0][1])
+    last = gnss_record.row_date(rows[-1][1])
+    behind = (days[-1] - last).days
+    if first > days[0] + timedelta(days=1):
+        record(FAIL, "record", f"water level starts {first} but results start {days[0]}: "
+                              f"every camera frame in between has no water level")
+    if behind > 3:
+        record(FAIL, "record", f"water level ends {last}, {behind} days before the newest "
+                              f"results day {days[-1]}: the nightly fit is not updating it")
+    elif behind > 1:
+        record(WARN, "record", f"water level ends {last}, {behind} days before the newest "
+                              f"results day {days[-1]}")
+    try:
+        st = json.loads((files / gnss_record.FIT_SUBDIR / gnss_record.STATUS_NAME).read_text())
+    except (OSError, ValueError):
+        st = {}
+    if st and not st.get("ok", True):
+        record(FAIL, "record", f"last update ({st.get('time')}) failed: {st.get('message')}")
+    elif st.get("fallback"):
+        record(WARN, "record", f"last update used the fallback settings '{st.get('settings')}' "
+                              f"(no azimuth window) for the whole live year")
+    if st.get("missing_edit"):
+        record(WARN, "record", f"subdaily wrote no {station_code}_<year>_subdaily_edit.txt for "
+                              f"{', '.join(map(str, st['missing_edit']))}: filter_month.py skips "
+                              f"those months (a renamed gnssrefl output?)")
+    try:
+        # from 1 January of the first year still not frozen after the update
+        # (live_from), so the night that refreezes a year is not counted
+        span = (datetime.fromisoformat(str(st["fit_end"]))
+                - datetime.fromisoformat(str(st.get("live_from") or st["fit_start"]))).days
+        if span > gnss_record.LIVE_SPAN_WARN_DAYS:
+            record(WARN, "record", f"the nightly fit spans {span} days: a past year is not "
+                                  f"being frozen")
+    except (KeyError, ValueError):
+        pass
+    if not any(f[1] == "record" and f[0] != OK for f in findings):
+        record(OK, "record", f"water level {first} to {last} ({len(days)} results days)")
 
 
 # ------------------------------------------------------------------
@@ -480,12 +542,14 @@ def main() -> int:
     args = p.parse_args()
 
     station_code = "usgs"
+    since = None
     station_json = PROJECT_DIR / "station" / "resources" / "station.json"
     if station_json.exists():
         try:
             d = json.loads(station_json.read_text())
             station_code = (d.get("gnssrefl_station_code")
                             or (d.get("station_id") or "")[:4]).lower() or "usgs"
+            since = gnss_record.record_first_day(station_json)
         except Exception:
             pass
 
@@ -497,7 +561,8 @@ def main() -> int:
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
     check_recent_errors(db, args.days)
-    check_processing_currency(station_code)
+    check_processing_currency(station_code, since)
+    check_water_level_record(station_code, since)
     check_raw_backlog()
     check_cron_ran()
     check_recording(db)
