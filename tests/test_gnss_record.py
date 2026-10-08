@@ -921,6 +921,66 @@ class GnssRecordTests(unittest.TestCase):
                            env=dict(os.environ, RECOVER_YEAR="2026", RECOVER_SINCE="2027-01-03"))
         self.assertFalse((self.tmp / "rinex2snr.log").exists(), r.stdout)
 
+    # ---- review round 3 ---------------------------------------------------
+
+    def test_station_health_leaves_out_results_before_the_first_day(self):
+        # stray results (a 2025 day, a June test) before gnss_record_first_day:
+        # the processing check counted them and reported every day from them to
+        # the record's start as a gap, next to the record's OK, every day for a
+        # year. The station steps check the record with
+        # `station_health.py --verbose | grep -F '] record:'`
+        import contextlib
+        import io
+        import sqlite3
+        sh = self.link_products()
+        sys.path.insert(0, str(ROOT / "station"))
+        import database
+        write_result(self.refl, date(2025, 12, 30))
+        results_range(self.refl, date(2026, 6, 2), date(2026, 6, 4))
+        results_range(self.refl, date(2026, 7, 10), date(2026, 10, 6))
+        with unittest.mock.patch("builtins.print"):
+            self.assertEqual(gr.cmd_update(self.refl, STA, SETTINGS, FALLBACK, False,
+                                           since=date(2026, 7, 10)), 0)
+        (self.tmp / "station" / "resources").mkdir(parents=True)
+        (self.tmp / "station" / "resources" / "station.json").write_text(json.dumps(
+            {"station_id": "USGS00USA", "gnssrefl_station_code": STA,
+             "gnss_record_first_day": "2026-07-10"}))
+        (self.tmp / "database").mkdir()
+        db = sqlite3.connect(self.tmp / "database" / "station.db")
+        database._migration_v1(db)
+        db.commit()
+        db.close()
+        now = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+        out = io.StringIO()
+        with unittest.mock.patch.object(sh, "PROJECT_DIR", self.tmp), \
+             unittest.mock.patch.object(sh, "utcnow", return_value=now), \
+             unittest.mock.patch.object(sys, "argv", ["station_health.py", "--verbose"]), \
+             contextlib.redirect_stdout(out):
+            sh.findings.clear()
+            sh.main()
+        printed = out.getvalue()
+        self.assertNotIn("Gap(s)", printed)
+        self.assertIn("[OK  ] processing: 89 days processed, newest is 2026-10-06", printed)
+        self.assertEqual([s for s in printed.splitlines() if "] record:" in s],
+                         ["  [OK  ] record: water level 2026-07-10 to 2026-10-06 (89 results days)"])
+        # a real gap inside the record is still reported
+        (self.refl / "2026" / "results" / STA / f"{date(2026, 8, 1).timetuple().tm_yday:03d}.txt").unlink()
+        with unittest.mock.patch.object(sh, "PROJECT_DIR", self.tmp), \
+             unittest.mock.patch.object(sh, "utcnow", return_value=now):
+            sh.findings.clear()
+            sh.check_processing_currency(STA, date(2026, 7, 10))
+            self.assertEqual([f[:2] for f in sh.findings], [("OK", "processing"), ("WARN", "processing")])
+            self.assertEqual(sh.findings[1][2], "Gap(s) in the record: 2026-08-01")
+            # with no first day set, the stray days are part of it as before
+            sh.findings.clear()
+            sh.check_processing_currency(STA)
+            self.assertIn("Gap(s) in the record: 2025-12-31, ", sh.findings[-1][2])
+            # a first day after every result is said so
+            sh.findings.clear()
+            sh.check_processing_currency(STA, date(2026, 10, 7))
+            self.assertEqual(sh.findings, [("FAIL", "processing", "Results directories exist but "
+                                            "contain no days from gnss_record_first_day (2026-10-07)")])
+
 
 
 def _gnssrefl_installed() -> bool:

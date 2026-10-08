@@ -248,17 +248,20 @@ def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
 # ------------------------------------------------------------------
 # 2. Is processing keeping up?
 # ------------------------------------------------------------------
-def check_processing_currency(station_code: str) -> None:
+def check_processing_currency(station_code: str, since=None) -> None:
     base = PROJECT_DIR / "products" / "refl_code"
     # Every year's results: on 1-2 January the newest day is still in
-    # last year's folder while this year's is empty.
+    # last year's folder while this year's is empty. Days before
+    # gnss_record_first_day (station.json) are not part of the record:
+    # neither counted nor reported as gaps.
     if not any(base.glob(f"[0-9][0-9][0-9][0-9]/results/{station_code}")):
         record(WARN, "processing", "No results directory found yet")
         return
 
-    days = list(results_days(base, station_code))
+    days = list(results_days(base, station_code, since))
     if not days:
-        record(FAIL, "processing", "Results directories exist but contain no days")
+        record(FAIL, "processing", "Results directories exist but contain no days"
+                                   + (f" from gnss_record_first_day ({since})" if since else ""))
         return
 
     newest = days[-1]
@@ -558,7 +561,7 @@ def main() -> int:
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
     check_recent_errors(db, args.days)
-    check_processing_currency(station_code)
+    check_processing_currency(station_code, since)
     check_water_level_record(station_code, since)
     check_raw_backlog()
     check_cron_ran()
