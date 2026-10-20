@@ -363,6 +363,155 @@ def check_water_level_record(station_code: str, since=None) -> None:
 
 
 # ------------------------------------------------------------------
+# 2c. Is the public plot being redrawn, and does the tide prediction
+#     cover it? process_and_plot.sh reports success when the 7-day plot
+#     fails, so a stale 7_day_plot.png is still uploaded and attached;
+#     and when the tide spreadsheet (tide_model_file) runs out, the
+#     predicted tide and every departure marker vanish from the plot
+#     without a word (plot_7day.load_tide).
+# ------------------------------------------------------------------
+PLOT_STALE_HOURS = 36    # the plot is redrawn nightly
+TIDE_AHEAD_DAYS = 2      # warn this long before the tide prediction runs out
+PLOT_DAYS = 7            # plot_7day.py's default window
+
+
+def _newest_spline_time(station_code: str) -> datetime | None:
+    """Newest water-level time (naive UTC, as plot_7day uses it)."""
+    rec = (PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+           / f"{station_code}_spline_out.txt")
+    try:
+        _, rows = gnss_record.read_spline(rec)
+    except OSError:
+        return None
+    if not rows:
+        return None
+    return datetime(1858, 11, 17) + timedelta(days=rows[-1][0])
+
+
+def check_public_plot(station_code: str) -> None:
+    files = PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+    plot = files / "7_day_plot.png"
+    try:
+        mtime = plot.stat().st_mtime
+    except OSError:
+        record(WARN, "plot", f"{plot.name} not found")
+        return
+    when = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    age_h = (utcnow() - when).total_seconds() / 3600
+    if age_h > PLOT_STALE_HOURS:
+        record(WARN, "plot", f"{plot.name} last drawn {when:%Y-%m-%d %H:%M}Z, "
+                             f"{age_h / 24:.1f} days ago: the public plot is not updating "
+                             f"(see logs/daily_gnss.log, Step 5)")
+        return
+    try:
+        rec_mtime = (files / f"{station_code}_spline_out.txt").stat().st_mtime
+    except OSError:
+        rec_mtime = None
+    # The plot is drawn right after the record is written each night.
+    if rec_mtime is not None and rec_mtime - mtime > 3600:
+        record(WARN, "plot", f"{plot.name} ({when:%Y-%m-%d %H:%M}Z) is older than the "
+                             f"water-level record it is drawn from: last night's plot failed")
+        return
+    record(OK, "plot", f"{plot.name} drawn {when:%Y-%m-%d %H:%M}Z")
+
+
+def _xlsx_column_range(path: Path, column: str):
+    """(first, last) datetime in `column` of the first sheet, read as
+    plot_7day.load_tide reads it. Uses openpyxl when this python has it,
+    else reads the xlsx (a zip of XML) directly: cron runs this script
+    under the system python, which may not."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return _xlsx_column_range_stdlib(path, column)
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = wb[wb.sheetnames[0]].iter_rows(values_only=True)
+        index = list(next(rows)).index(column)
+        times = [r[index] for r in rows
+                 if len(r) > index and isinstance(r[index], datetime)]
+    finally:
+        wb.close()
+    return (min(times), max(times)) if times else None
+
+
+def _xlsx_column_range_stdlib(path: Path, column: str):
+    import zipfile
+    import xml.etree.ElementTree as ET
+    m = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    r_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    with zipfile.ZipFile(path) as z:
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(f"{m}si"):
+                shared.append("".join(t.text or "" for t in si.iter(f"{m}t")))
+        # the first sheet, through the workbook's relationships
+        first = next(ET.fromstring(z.read("xl/workbook.xml")).iter(f"{m}sheet"))
+        rid = first.get(f"{r_ns}id")
+        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        target = next(r.get("Target") for r in rels if r.get("Id") == rid)
+        target = target.lstrip("/")
+        sheet = ET.fromstring(z.read(target if target.startswith("xl/") else "xl/" + target))
+    col, times = None, []
+    for row in sheet.iter(f"{m}row"):
+        for c in row.iter(f"{m}c"):
+            letters = re.match(r"[A-Z]+", c.get("r", "")).group(0)
+            kind = c.get("t")
+            v = c.find(f"{m}v")
+            if col is None:
+                text = (shared[int(v.text)] if kind == "s" and v is not None
+                        else "".join(t.text or "" for t in c.iter(f"{m}t")) if kind == "inlineStr"
+                        else v.text if v is not None else None)
+                if text == column:
+                    col = letters
+            elif letters == col and kind in (None, "n") and v is not None:
+                # an Excel date: days since 1899-12-30
+                times.append(datetime(1899, 12, 30) + timedelta(days=float(v.text)))
+        if col is None:
+            raise ValueError(f"no '{column}' column in the first row")
+    return (min(times), max(times)) if times else None
+
+
+def check_tide_coverage(station_code: str, cfg: dict) -> None:
+    tide_file = cfg.get("tide_model_file")
+    if not tide_file:
+        record(OK, "tide", "no tide_model_file set: the 7-day plot has no predicted tide")
+        return
+    path = Path(tide_file)
+    if not path.is_absolute() and not path.exists():
+        path = PROJECT_DIR / path
+    if not path.exists():
+        record(WARN, "tide", f"tide model file {tide_file} not found: the 7-day plot "
+                             f"has no predicted tide or departure markers")
+        return
+    column = cfg.get("tide_model_time_column") or "time"
+    try:
+        span = _xlsx_column_range(path, column)
+    except Exception as exc:
+        record(WARN, "tide", f"could not read {path.name}: {exc}")
+        return
+    if span is None:
+        record(WARN, "tide", f"{path.name} has no times in its '{column}' column")
+        return
+    start, end = span
+    newest = _newest_spline_time(station_code) or utcnow().replace(tzinfo=None)
+    need_from = newest - timedelta(days=PLOT_DAYS)
+    need_to = newest + timedelta(days=TIDE_AHEAD_DAYS)
+    if end < need_to:
+        state = ("are already missing from" if end < newest
+                 else f"disappear from it within {TIDE_AHEAD_DAYS} days of")
+        record(WARN, "tide", f"{path.name} ends {end:%Y-%m-%d %H:%M}, the 7-day plot needs it "
+                             f"to {need_to:%Y-%m-%d} (newest water level + {TIDE_AHEAD_DAYS} "
+                             f"days): the predicted tide and departure markers {state} "
+                             f"7_day_plot.png -- extend the tide prediction")
+    elif start > need_from:
+        record(WARN, "tide", f"{path.name} starts {start:%Y-%m-%d %H:%M}, after the 7-day "
+                             f"plot's window starts ({need_from:%Y-%m-%d %H:%M})")
+    else:
+        record(OK, "tide", f"{path.name} covers {start:%Y-%m-%d} to {end:%Y-%m-%d}")
+
+
+# ------------------------------------------------------------------
 # 3. Is anything piling up unprocessed?
 # ------------------------------------------------------------------
 def check_raw_backlog() -> None:
@@ -543,6 +692,7 @@ def main() -> int:
 
     station_code = "usgs"
     since = None
+    d = {}
     station_json = PROJECT_DIR / "station" / "resources" / "station.json"
     if station_json.exists():
         try:
@@ -563,6 +713,8 @@ def main() -> int:
     check_recent_errors(db, args.days)
     check_processing_currency(station_code, since)
     check_water_level_record(station_code, since)
+    check_public_plot(station_code)
+    check_tide_coverage(station_code, d if isinstance(d, dict) else {})
     check_raw_backlog()
     check_cron_ran()
     check_recording(db)
