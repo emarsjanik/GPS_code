@@ -452,12 +452,34 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.assertIsInstance(call["Hortho"], list)
 
     def test_refraction_model_passed_through_when_configured(self) -> None:
+        # gnssrefl 4.1.5: refraction is the on/off bool, refr_model the
+        # model as a string. A model number in `refraction` is truthy
+        # and leaves refr_model at "1", so 6 (MPF) silently ran Bennett.
+        self.cfg.station["gnssrefl_refraction_model"] = 6
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertEqual(call["refr_model"], "6")
+        self.assertNotIn("refraction", call)
+
+    def test_refraction_model_zero_turns_refraction_off(self) -> None:
         self.cfg.station["gnssrefl_refraction_model"] = 0
 
         self.processor.initialize()
 
         call = calls["make_gnssir_input"][0]
-        self.assertEqual(call["refraction"], 0)
+        self.assertIs(call["refraction"], False)
+        self.assertEqual(call["refr_model"], "0")
+
+    def test_refraction_left_to_gnssrefl_when_unset(self) -> None:
+        self.cfg.station.pop("gnssrefl_refraction_model", None)
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertNotIn("refraction", call)
+        self.assertNotIn("refr_model", call)
 
     def test_max_arc_minutes_passed_through_when_configured(self) -> None:
         self.cfg.station["gnssrefl_max_arc_minutes"] = 40.0

@@ -237,7 +237,7 @@ using the `Hortho (m) is` line gnssrefl writes into its header.
 
 | Field | Type | Description |
 |---|---|---|
-| `gnssrefl_refraction_model` | integer | Which tropospheric refraction correction to apply. `1` (gnssrefl's own default) is the standard Bennett correction. Leave unset unless you have a specific, understood reason to change it. |
+| `gnssrefl_refraction_model` | integer | Which tropospheric refraction correction to apply, 0-6. It is passed to gnssrefl as `refr_model` (a string); `0` turns the correction off (`refraction: false`). `1` (gnssrefl's own default) is the standard Bennett correction; `6` is MPF (Williams & Nievinski 2017). gnssrefl exits on a number above 6. Leave unset unless you have a specific, understood reason to change it. |
 
 ### Maximum arc length
 

@@ -776,12 +776,21 @@ class GnssIrProcessor:
         if orthometric_height is not None:
             kwargs["Hortho"] = [float(orthometric_height)]
 
-        # Refraction model (gnssrefl's own param: refraction) -- 1 is
-        # the Bennett correction (gnssrefl's own default); matters
-        # more for very tall or very short sites.
+        # Refraction model (gnssrefl's own params: refraction and
+        # refr_model) -- 1 is the Bennett correction (gnssrefl's own
+        # default); matters more for very tall or very short sites.
+        #
+        # In gnssrefl 4.1.5 `refraction` is only the on/off switch and
+        # the model number is the separate STRING argument refr_model.
+        # Passing the number as `refraction` left any non-zero model
+        # truthy and refr_model at "1": asking for 6 (MPF) silently
+        # kept Bennett. 0 turns the correction off.
         refraction_model = station_section.get("gnssrefl_refraction_model")
         if refraction_model is not None:
-            kwargs["refraction"] = int(refraction_model)
+            refraction_model = int(refraction_model)
+            kwargs["refr_model"] = str(refraction_model)
+            if refraction_model == 0:
+                kwargs["refraction"] = False
 
         # Maximum arc length in minutes (gnssrefl's own param: delTmax)
         # -- library default is 75 minutes, documented as too long for
