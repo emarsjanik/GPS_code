@@ -472,6 +472,23 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.assertIs(call["refraction"], False)
         self.assertEqual(call["refr_model"], "0")
 
+    def test_refraction_model_by_name_reaches_gnssrefl(self) -> None:
+        # gnssrefl takes NITE and MPF by name; int() used to stop
+        # initialize() with a bare ValueError.
+        self.cfg.station["gnssrefl_refraction_model"] = "MPF"
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertEqual(call["refr_model"], "MPF")
+        self.assertNotIn("refraction", call)
+
+    def test_refraction_model_not_a_model_is_a_processor_error(self) -> None:
+        self.cfg.station["gnssrefl_refraction_model"] = "Bennett"
+
+        with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
+            self.processor.initialize()
+
     def test_refraction_left_to_gnssrefl_when_unset(self) -> None:
         self.cfg.station.pop("gnssrefl_refraction_model", None)
 

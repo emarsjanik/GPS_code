@@ -785,11 +785,24 @@ class GnssIrProcessor:
         # Passing the number as `refraction` left any non-zero model
         # truthy and refr_model at "1": asking for 6 (MPF) silently
         # kept Bennett. 0 turns the correction off.
+        #
+        # gnssrefl also takes the names NITE (5) and MPF (6), which
+        # int() turned into a bare ValueError that stopped initialize()
+        # outside the error handling below; a name is now passed as
+        # it is, for gnssrefl to check like a number.
         refraction_model = station_section.get("gnssrefl_refraction_model")
         if refraction_model is not None:
-            refraction_model = int(refraction_model)
-            kwargs["refr_model"] = str(refraction_model)
-            if refraction_model == 0:
+            try:
+                model = str(int(refraction_model))
+            except (TypeError, ValueError):
+                model = str(refraction_model).strip()
+                if model.upper() not in ("NITE", "MPF"):
+                    raise GnssIrProcessorError(
+                        f"gnssrefl_refraction_model {refraction_model!r} is not "
+                        f"a model number (0-6) or NITE/MPF"
+                    )
+            kwargs["refr_model"] = model
+            if model == "0":
                 kwargs["refraction"] = False
 
         # Maximum arc length in minutes (gnssrefl's own param: delTmax)
