@@ -321,6 +321,68 @@ class GnssRecordTests(unittest.TestCase):
         self.assert_whole_record(date(2026, 12, 1), date(2027, 1, 20))
         self.assertFalse(gr.frozen_path(self.files, STA, 2026).exists())
 
+    # ---- opt-in arc QC from the gnssir json (station.json, G-B9) --------
+
+    def write_gnssir_json(self, **subdaily):
+        """The station's gnssir json as gnssrefl writes it: subdaily_* null
+        unless given (station.json's gnssrefl_subdaily_* put them there)."""
+        p = self.refl / "input" / STA / f"{STA}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        cfg = {"station": STA, "freqs": [1, 20], "reqAmp": [5.0, 5.0],
+               "subdaily_alt_sigma": None, "subdaily_knots": None,
+               "subdaily_spline_outlier1": None, "subdaily_spline_outlier2": None}
+        cfg.update({f"subdaily_{k}": v for k, v in subdaily.items()})
+        p.write_text(json.dumps(cfg, indent=4))
+
+    def test_json_arc_qc_goes_on_the_command_line_and_refits_frozen_years_once(self):
+        results_range(self.refl, date(2026, 12, 1), date(2027, 1, 20))
+        self.write_gnssir_json()                         # every key null: the default
+        self.assertEqual(self.night(), 0)
+        self.assertTrue(self.last_call().endswith(SETTINGS), self.last_call())
+        frozen = gr.frozen_path(self.files, STA, 2026)
+        self.assertTrue(frozen.exists())
+        self.assertEqual(self.night(), 0)                # 2026 frozen: 2027 only
+        self.assertIn("usgs 2026 -doy1 359 ", self.last_call())
+
+        # subdaily 4.1.5 never reads alt_sigma from its json, so it must be
+        # on the command line -- and there it is part of the frozen check
+        self.write_gnssir_json(alt_sigma=True, spline_outlier1=0.4, spline_outlier2=0.3)
+        qc = "-alt_sigma True -spline_outlier1 0.4 -spline_outlier2 0.3"
+        self.assertEqual(self.night(), 0)                # 2026 refitted with them
+        self.assertIn("usgs 2026 -doy1 335 ", self.last_call())
+        self.assertTrue(self.last_call().endswith(f"{SETTINGS} {qc}"), self.last_call())
+        self.assertIn(f"{gr.SETTINGS_TAG} {SETTINGS} {qc}", frozen.read_text())
+        self.assertEqual(self.night(), 0)                # and frozen again: once
+        self.assertIn("usgs 2026 -doy1 359 ", self.last_call())
+
+    def test_json_arc_qc_is_in_the_fallback_fit_too(self):
+        results_range(self.refl, date(2026, 12, 1), date(2027, 1, 3))
+        self.write_gnssir_json(spline_outlier1=0.5)
+        os.environ["FAKE_SUBDAILY"] = "crash_azim"
+        self.assertEqual(self.night(), 0)
+        self.assertTrue(self.last_call().endswith(f"{FALLBACK} -spline_outlier1 0.5"),
+                        self.last_call())
+
+    def test_json_arc_qc_already_in_the_settings_is_not_given_twice(self):
+        self.write_gnssir_json(alt_sigma=True, spline_outlier2=0.25)
+        self.assertEqual(gr.json_qc_options(self.refl, STA),
+                         "-alt_sigma True -spline_outlier2 0.25")
+        self.assertEqual(gr.with_json_qc("-rhdot True -alt_sigma False", self.refl, STA),
+                         "-rhdot True -alt_sigma False -spline_outlier2 0.25")
+        self.assertEqual(gr.with_json_qc(SETTINGS, self.refl / "nowhere", STA), SETTINGS)
+        self.write_gnssir_json(alt_sigma=False)          # subdaily's own default
+        self.assertEqual(gr.with_json_qc(SETTINGS, self.refl, STA), SETTINGS)
+
+    def test_status_settings_are_last_nights_unless_the_fallback_ran(self):
+        results_range(self.refl, date(2026, 12, 1), date(2026, 12, 10))
+        self.assertIsNone(gr.status_settings(self.refl, STA))
+        self.assertEqual(self.night(), 0)
+        self.assertEqual(gr.status_settings(self.refl, STA), SETTINGS)
+        os.environ["FAKE_SUBDAILY"] = "crash_azim"
+        write_result(self.refl, date(2026, 12, 11))
+        self.assertEqual(self.night(), 0)
+        self.assertIsNone(gr.status_settings(self.refl, STA))
+
     def test_record_that_would_start_later_is_refused(self):
         results_range(self.refl, date(2026, 12, 1), date(2027, 1, 3))
         self.assertEqual(self.night(), 0)

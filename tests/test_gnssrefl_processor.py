@@ -21,6 +21,7 @@ Run with:
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
 import sys
 import tempfile
@@ -56,6 +57,10 @@ def _reset_behavior() -> None:
 calls: dict[str, list] = {"make_gnssir_input": [], "rinex2snr": [], "gnssir": []}
 
 
+# The frequencies gnssrefl 4.1.5 writes for allfreq=True, in its order.
+FAKE_FREQS = [1, 5, 20, 101, 102, 201, 205, 206, 207, 208, 301, 302, 305, 306, 307, 308]
+
+
 def _fake_make_gnssir_input(station, lat=0, lon=0, height=0, **kwargs):
     calls["make_gnssir_input"].append(
         {"station": station, "lat": lat, "lon": lon, "height": height, **kwargs}
@@ -67,6 +72,17 @@ def _fake_make_gnssir_input(station, lat=0, lon=0, height=0, **kwargs):
         raise RuntimeError("simulated make_gnssir_input failure")
     if mode == "sys_exit":
         raise SystemExit(1)
+
+    # the json, where and as the real one writes it (json.dump, indent=4):
+    # one reqAmp per frequency, all the same, and the subdaily_* keys
+    path = Path(os.environ["REFL_CODE"]) / "input" / station / f"{station}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    strategy = {"station": station, "freqs": FAKE_FREQS,
+                "reqAmp": [kwargs.get("ampl", 5.0)] * len(FAKE_FREQS)}
+    for key in ("subdaily_alt_sigma", "subdaily_spline_outlier1", "subdaily_spline_outlier2"):
+        strategy[key] = kwargs.get(key)
+    with open(path, "w+") as f:
+        json.dump(strategy, f, indent=4)
 
 
 def _fake_rinex2snr(station, year, doy, **kwargs):
@@ -504,6 +520,89 @@ class TestInitialize(GnssIrProcessorTestCase):
 
         call = calls["make_gnssir_input"][0]
         self.assertEqual(call["polyV"], 2)
+
+    # ---- opt-in arc-level QC (known finding G-B9) -------------------
+
+    def _gnssir_json_path(self) -> Path:
+        return self.root / "products" / "refl_code" / "input" / "usgs" / "usgs.json"
+
+    def test_arc_qc_left_to_gnssrefl_when_unset(self) -> None:
+        # Unset (the default): not one more argument, so gnssrefl writes
+        # exactly the json it wrote before these keys existed.
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        for key in ("subdaily_alt_sigma", "subdaily_spline_outlier1",
+                    "subdaily_spline_outlier2"):
+            self.assertNotIn(key, call)
+        written = json.loads(self._gnssir_json_path().read_text())
+        self.assertEqual(written["reqAmp"], [5.0] * len(FAKE_FREQS))
+
+    def test_subdaily_arc_qc_passed_through_when_configured(self) -> None:
+        self.cfg.station["gnssrefl_subdaily_alt_sigma"] = True
+        self.cfg.station["gnssrefl_subdaily_spline_outlier1_m"] = 0.4
+        self.cfg.station["gnssrefl_subdaily_spline_outlier2_m"] = "0.3"
+
+        self.processor.initialize()
+
+        call = calls["make_gnssir_input"][0]
+        self.assertIs(call["subdaily_alt_sigma"], True)
+        self.assertEqual(call["subdaily_spline_outlier1"], 0.4)
+        self.assertEqual(call["subdaily_spline_outlier2"], 0.3)
+
+    def test_alt_sigma_as_a_quoted_false_is_false(self) -> None:
+        # bool("false") is True: a quoted value must be read, not coerced
+        self.cfg.station["gnssrefl_subdaily_alt_sigma"] = "false"
+
+        self.processor.initialize()
+
+        self.assertIs(calls["make_gnssir_input"][0]["subdaily_alt_sigma"], False)
+
+    def test_bad_arc_qc_values_are_refused(self) -> None:
+        for key, value in (("gnssrefl_subdaily_alt_sigma", "maybe"),
+                           ("gnssrefl_subdaily_spline_outlier1_m", 0),
+                           ("gnssrefl_subdaily_spline_outlier2_m", "three sigma"),
+                           ("gnssrefl_amplitude_min_by_frequency", [6.0, 5.0]),
+                           ("gnssrefl_amplitude_min_by_frequency", {"1": -2})):
+            with self.subTest(key=key, value=value):
+                self.cfg.station = {key: value}
+                processor = gnssrefl_processor.GnssIrProcessor(cfg=self.cfg)
+                with self.assertRaises(gnssrefl_processor.GnssIrProcessorError):
+                    processor.initialize()
+
+    def test_amplitude_by_frequency_rewrites_req_amp_in_frequency_order(self) -> None:
+        # make_gnssir_input can only write one value for every frequency;
+        # gnssir applies reqAmp[i] to freqs[i], so the listed frequencies
+        # get theirs at their own position and the rest keep gnssrefl's.
+        self.cfg.station["gnssrefl_amplitude_min"] = 5.0
+        self.cfg.station["gnssrefl_amplitude_min_by_frequency"] = {
+            "1": 7.5, "20": "4.5", 308: 6,
+        }
+
+        self.processor.initialize()
+
+        written = json.loads(self._gnssir_json_path().read_text())
+        expected = [5.0] * len(FAKE_FREQS)
+        expected[FAKE_FREQS.index(1)] = 7.5
+        expected[FAKE_FREQS.index(20)] = 4.5
+        expected[FAKE_FREQS.index(308)] = 6.0
+        self.assertEqual(written["reqAmp"], expected)
+        self.assertEqual(written["freqs"], FAKE_FREQS)
+        self.assertEqual(written["station"], "usgs")
+        # gnssrefl's own layout: the same file, rewritten whole
+        self.assertTrue(self._gnssir_json_path().read_text().startswith('{\n    "station"'))
+
+    def test_amplitude_for_a_frequency_not_analysed_is_ignored(self) -> None:
+        # GPS L2P (2) is not in gnssrefl's allfreq list
+        self.cfg.station["gnssrefl_amplitude_min_by_frequency"] = {"2": 9.0, "1": 6.0}
+
+        with self.assertLogs("station.gnssir", level="WARNING") as logs:
+            self.processor.initialize()
+
+        written = json.loads(self._gnssir_json_path().read_text())
+        self.assertEqual(written["reqAmp"][0], 6.0)
+        self.assertEqual(len(written["reqAmp"]), len(FAKE_FREQS))
+        self.assertTrue(any("[2]" in line for line in logs.output))
 
     def test_status_before_initialize(self) -> None:
         status = self.processor.status()
