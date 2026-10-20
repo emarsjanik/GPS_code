@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -116,11 +116,33 @@ class TestInProgressDaySkipped(unittest.TestCase):
         path = self._raw("station_20261019.um980", mtime=self.now.timestamp() - 3600)
         self.assertIsNone(_in_progress_reason(path, now=self.now))
 
-    def test_recently_written_file_is_in_progress_whatever_its_name(self) -> None:
+    def test_recently_written_undated_file_is_in_progress(self) -> None:
         path = self._raw("test_recording.um980", mtime=time.time() - 60)
         self.assertIsNotNone(_in_progress_reason(path))
-        path = self._raw("station_20261019.um980", mtime=time.time() - 60)
-        self.assertIsNotNone(_in_progress_reason(path))
+        path = self._raw("test_recording2.um980", mtime=time.time() - 3600)
+        self.assertIsNone(_in_progress_reason(path))
+
+    def test_day_just_closed_is_finished_at_the_rollover_run(self) -> None:
+        # station_manager runs the pipeline at 00:00 UTC, straight after
+        # the day's last chunk: yesterday's file was written seconds ago
+        # and is complete. Left as in progress, the inline run (the one
+        # that processes the record) did that day a night late.
+        rollover = datetime(2026, 10, 20, 0, 0, 5, tzinfo=timezone.utc)
+        path = self._raw("station_20261019.um980", mtime=rollover.timestamp() - 3)
+        self.assertIsNone(_in_progress_reason(path, now=rollover))
+        today = self._raw("station_20261020.um980", mtime=rollover.timestamp() - 3)
+        self.assertIsNotNone(_in_progress_reason(today, now=rollover))
+
+    def test_rollover_run_scans_the_day_just_closed(self) -> None:
+        now = datetime.now(timezone.utc)
+        yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
+        self._raw(f"station_{yesterday}.um980", mtime=time.time() - 2)
+        self._raw(f"station_{now:%Y%m%d}.um980", mtime=time.time() - 2)
+
+        pipeline, _ = self._pipeline()
+
+        self.assertEqual([p.name for p in pipeline._scan_raw_directory()],
+                         [f"station_{yesterday}.um980"])
 
     def test_missing_file_with_old_date_is_not_in_progress(self) -> None:
         self.assertIsNone(_in_progress_reason(self.raw_dir / "station_20261001.um980"))
