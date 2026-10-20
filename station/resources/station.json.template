@@ -53,6 +53,12 @@
     "gnssrefl_elevation_span_tolerance": null,
     "gnssrefl_direct_signal_poly_order": null,
 
+    "_comment_arc_qc": "Opt-in arc-level QC, unset by default (nothing changes). Score them on your own results with analysis_tools/evaluate_qc_variants.py before switching any on; see STATION_JSON_REFERENCE.md, 'Arc-level QC (opt-in)'. Outlier limits are in METRES, not sigmas.",
+    "gnssrefl_subdaily_alt_sigma": null,
+    "gnssrefl_subdaily_spline_outlier1_m": null,
+    "gnssrefl_subdaily_spline_outlier2_m": null,
+    "gnssrefl_amplitude_min_by_frequency": null,
+
     "_comment_optional": "All optional. external_storage_path enables automatic daily export; the tide_model_* fields enable automatic tide comparison in process_and_plot.sh. Leave unset to disable.",
     "external_storage_path": null,
     "tide_model_file": null,

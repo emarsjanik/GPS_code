@@ -217,6 +217,183 @@ production results directory is affected.
 |---|---|---|
 | `gnssrefl_peak2noise` | number | Minimum peak-to-noise ratio for a retrieval to be accepted. gnssrefl's own default is roughly 2.8. Raising this is stricter (fewer, higher-confidence retrievals); lowering it is more permissive. |
 | `gnssrefl_amplitude_min` | number | Minimum signal amplitude for a retrieval to be accepted. gnssrefl's own default is roughly 5.0. |
+| `gnssrefl_amplitude_min_by_frequency` | object, frequency code → number | Optional, unset by default. One amplitude threshold per GNSS frequency, e.g. `{"1": 6.5, "20": 4.5}`; frequencies not listed keep `gnssrefl_amplitude_min`. See "Arc-level QC (opt-in)" below. |
+
+### Arc-level QC (opt-in)
+
+All four keys here are unset by default. Unset, the json gnssrefl writes
+is byte for byte what it was before they existed, and the water level is
+unchanged. **Try them with `analysis_tools/evaluate_qc_variants.py`
+before switching any on** (below). They change the water levels in
+storms, but never the format of any plot.
+
+**Why they exist** (known finding G-B9). This project's own QC
+(`water_level_qc.py`, and the waterline pipeline's `gnssr_qc.py`) sees
+only gnssrefl's 30-minute spline, never the individual arcs. Inside
+gnssrefl, every arc test is relative to the data themselves:
+
+- gnssir's amplitude and peak-to-noise limits;
+- subdaily's 2.5-sigma clip per UTC day (the day's spread is mostly tide,
+  so it rarely fires);
+- a 3-sigma clip against a first spline, where sigma is one plain
+  standard deviation over the whole ~10-month fit.
+
+A rough sea lowers the coherent reflected power, roughly by
+exp(-4k²s²sin²e) for a surface height spread s (Strandberg et al. 2019).
+Purnell et al. (2020) find that the dynamic sea surface dominates the
+error budget, and Sepúlveda et al. (2023) see errors rise abruptly at
+high waves. So in a storm, arcs drop below the amplitude limit, and the
+ones that survive can be the biased ones. In the 25–27 Sep 2026 storm
+the spline read up to ~3 m above what the Chatham gauge implied.
+
+A synthetic reproduction of that storm with gnssrefl's real subdaily
+found that a *sustained* bias is not removed by absolute spline limits
+(0.30/0.25 m) plus `alt_sigma`. The storm high-water error stayed at
++1.65 m against +1.68 m, and 12% of calm arcs were lost: the limits are
+relative to a spline that follows the bias. Whether these keys help on
+this station's *real* arcs is the question the evaluation script answers.
+
+| Field | Type | Description |
+|---|---|---|
+| `gnssrefl_subdaily_alt_sigma` | boolean | subdaily's part-1 clip (2.5 sigma per UTC day) uses the median and 1.4826 × the median absolute deviation, a robust sigma that gnssrefl credits to Felipe Geremia-Nievinski, instead of the mean and standard deviation (gnssrefl `-alt_sigma`). |
+| `gnssrefl_subdaily_spline_outlier1_m` | number (metres) | Fixed limit for the clip against the FIRST spline (before the RHdot and inter-frequency corrections), instead of 3 × the whole fit's residual RMS (gnssrefl `-spline_outlier1`). This clip sets which arcs the published spline is fitted on. **Metres, not sigmas**: `3` would mean 3 m, i.e. no QC at all. |
+| `gnssrefl_subdaily_spline_outlier2_m` | number (metres) | The same for the second clip, after the RHdot and inter-frequency corrections (`-spline_outlier2`). It decides the edit and outlier files and where gaps fall; the published spline is fitted on the arcs that survived the first clip. |
+| `gnssrefl_amplitude_min_by_frequency` | object | One LSP amplitude threshold per frequency in the gnssir json's `reqAmp`. gnssir keeps an arc only if its amplitude is *above* its frequency's value. `make_gnssir_input` can only write one value for every frequency. The amplitudes of different signals are not comparable (transmit power, antenna gain at low elevation and receiver tracking differ by constellation and band), and gnssrefl itself calls the threshold "receiver and elevation angle region dependent". Keys are gnssrefl frequency codes: 1 GPS L1, 20 L2C, 5 L5, 101/102 GLONASS, 201–208 Galileo, 301–308 BeiDou. A code the station does not analyse is ignored with a warning. |
+
+How they reach gnssrefl:
+
+- The three `gnssrefl_subdaily_*` keys are written into the gnssir json's
+  `subdaily_*` fields (`station/gnssrefl_processor.py`, at every
+  initialize). `analysis_tools/gnss_record.py` reads them back and puts
+  them on subdaily's command line each night.
+  - That is needed: gnssrefl 4.1.5's subdaily never reads `alt_sigma`
+    from its json. `subdaily()` defaults it to `False`, and the json is
+    consulted only when it is `None` (confirmed against the source and a
+    run). The spline-outlier fields are read, `alt_sigma` silently is not.
+  - On the command line they are also part of the settings a frozen year
+    is checked against. Switching one on therefore refits the whole
+    record once, frozen years included.
+  - `ultra_rapid_check.py` does the same.
+- `gnssrefl_amplitude_min_by_frequency` rewrites `reqAmp` after
+  `make_gnssir_input` has written the file. It acts in gnssir, so only on
+  days processed from then on. Days already processed keep the threshold
+  they were made with, until gnssir is re-run on them:
+  `gnssir usgs <year> <doy> -doy_end <doy>`, with gnssrefl_venv active,
+  while their SNR files are still there.
+  - A raised threshold drops arcs at once, so `station_health.py`'s arc
+    check may warn of a drop in arcs for up to a week afterwards.
+- Every change takes effect at the next nightly run that processes new
+  data, because Step 2 of `process_and_plot.sh` rewrites the gnssir json.
+  - Re-running `./setup_station.sh` rebuilds station.json from its
+    questions, which drops these keys; add them back by hand afterwards.
+
+**Choosing per-frequency amplitudes.**
+`analysis_tools/amplitude_thresholds.py` reads each frequency's
+amplitude (column 7 of `results/<doy>.txt`) over a calm window, inside
+the azimuth window the water level uses. It proposes
+
+    threshold_f = fraction × median(Amp_f)
+
+That keeps an arc if its amplitude is at least that fraction of what its
+own signal gives in calm weather, which is the same relative damping for
+every signal.
+
+- The default fraction is the station's present overall strictness,
+  (current threshold) / (median amplitude of every frequency together).
+  The thresholds are redistributed between signals, not tightened as a
+  whole. `--fraction` sets a different value.
+- A frequency with fewer than 30 arcs in the window keeps its current
+  value.
+- The results file holds only arcs above today's threshold, so its
+  histogram is cut off there. gnssrefl 4.1.5 also writes every rejected
+  arc to `results/<sta>/failQC/<doy>.txt`, and the arcs there that failed
+  on amplitude alone complete the histogram. They are the ones with a
+  computed amplitude and peak-to-noise ratio, a peak-to-noise above the
+  json's limit, a peak not within 0.10 m of the reflector-height limits,
+  and an amplitude at or below the threshold. `--no-failqc` leaves them
+  out.
+
+```bash
+python3 analysis_tools/amplitude_thresholds.py --station usgs \
+    --from 2026-09-08 --to 2026-09-14 --json thresholds.json
+```
+
+**Trying them first: `analysis_tools/evaluate_qc_variants.py`.** This
+runs gnssrefl's real subdaily once per variant, each in its own gnssrefl
+`-extension` and in a private REFL_CODE (`products/refl_code_qc_eval`).
+The production REFL_CODE is only read.
+
+- **What each run sees.** Each run uses the production results, the
+  production gnssir json plus the variant's keys, and last night's
+  subdaily settings (from `record_status.json`). By default it covers the
+  span the nightly fit covers, so the 3-sigma limits are the ones
+  production has. A per-frequency amplitude variant gets exactly the arcs
+  gnssir would have kept with those thresholds: stricter limits drop
+  arcs, and looser ones bring back failQC arcs that failed on amplitude
+  alone.
+- **The windows.** The storm defaults to 25–27 Sep 2026. The calm week
+  is either given with `--calm`, or the 7 results days with the lowest
+  mean buoy Hs within 60 days of the storm and at least 3 days away from
+  it.
+- **The reference.** Every variant is scored against one reference:
+  level = a × Chatham gauge(t − lag) + b, fitted with
+  `water_level_qc.fit_reference` on the baseline in the calm week. If
+  there is no gauge data, the tide model in `tide_model_file` is used
+  the same way.
+- **What it reports, per window:**
+  - readings, RMSE and bias, and `water_level_qc.run_qc`'s flags;
+  - the arcs at each step: in the azimuth window, after part 1, after
+    the first spline clip, after the second;
+  - in the storm, also the RMS of what Stockdon et al. (2006) wave setup
+    cannot explain, the bias at high water and the longest gap.
+- **The variants:**
+  - `baseline` (production);
+  - `alt_sigma`;
+  - `abs_outliers`: 3 × the robust scatter of the baseline's arcs about
+    its spline in the calm week, i.e. what 3 sigma is when no storm is
+    in it;
+  - `review_outliers` (0.30/0.25 m);
+  - `amp_by_freq` (the rule above);
+  - `amp_half` (half each signal's calm median);
+  - `combined`.
+- **The recommendation.** A variant is recommended only if all of these
+  hold:
+  - its calm RMSE is within 5 mm of the baseline's;
+  - it keeps ≥ 90% of the calm arcs;
+  - it keeps ≥ 90% of the storm readings;
+  - it opens no new gap of 6 h or more (a break in the plot);
+  - it cuts the storm RMS beyond wave setup by ≥ 10%.
+
+  Of the variants that pass, it picks the best and prints the
+  station.json lines that switch it on. Otherwise it says to keep the
+  current settings. The summary is also written to
+  `products/refl_code_qc_eval/qc_eval_summary.json`.
+
+```bash
+cd /home/argus_user/GNSS/v4.1 && source gnssrefl_venv/bin/activate
+python3 analysis_tools/evaluate_qc_variants.py --station usgs
+# a given calm week; a faster run over the windows only (+-3 days)
+python3 analysis_tools/evaluate_qc_variants.py --station usgs \
+    --calm 2026-09-08 2026-09-14 --span windows
+rm -rf products/refl_code_qc_eval      # when done
+```
+
+Two cautions:
+
+- **One storm is a small sample.** Run the script again after the next
+  storm before relying on a setting.
+- **The gauge-scaled reference comes from the GNSS-IR itself.** The fit
+  of a, lag and b uses the station's own calm-week readings, so it
+  checks consistency rather than absolute accuracy. The question it
+  answers is "does the storm depart less from the calm-weather
+  relation?"
+
+References: Larson et al. (2017), *J. Atmos. Oceanic Technol.* 34, the
+subdaily spline and RHdot method; Larson (2024), *GPS Solutions* 28:165,
+gnssrefl; Strandberg et al. (2019), *GPS Solutions* 23; Purnell et al.
+(2020), *IEEE JSTARS* 13; Sepúlveda et al. (2023), *Earth Space Sci.*
+10; Stockdon et al. (2006), *Coastal Eng.* 53. The robust sigma is
+1.4826 × MAD, the standard normal-consistent scale.
 
 ### Orthometric height reference
 
