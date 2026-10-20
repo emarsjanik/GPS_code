@@ -87,7 +87,8 @@ class TestInProgressDaySkipped(unittest.TestCase):
     """
     The UTC day station_manager is still appending to must not be
     processed: archiving it moved the file out from under the recorder,
-    and the next night's archive overwrote the first part of the day.
+    and the rest of the day, recorded into a fresh file of the same
+    name, was never processed (the name was already done).
     """
 
     def setUp(self) -> None:

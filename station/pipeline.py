@@ -161,11 +161,13 @@ def _date_from_filename(filename: str) -> str | None:
 # appends to station_<UTC date>.um980 all day, and the 22:30 local
 # (02:30 UTC) cron run would otherwise convert the first hours of the
 # new day. If that ever succeeded (nav or ultra orbits), _archive()
-# moved the file out from under the recorder, the next chunk started a
-# fresh file, and the next night's archive overwrote the first part --
-# that part of the day was lost. A file is in progress if its name
-# carries today's UTC date, or (for any name) it was written to in the
-# last IN_PROGRESS_MTIME_S seconds.
+# moved the file out from under the recorder and the next chunk started
+# a fresh raw/station_<day>.um980. That second file was never processed:
+# its name was already in the database (UNIQUE filename) with a
+# completed queue entry, so results/<doy>.txt kept only the first ~2.5 h
+# and the rest of the day was silently missing from the record. A file
+# is in progress if its name carries today's UTC date, or (for any name)
+# it was written to in the last IN_PROGRESS_MTIME_S seconds.
 IN_PROGRESS_MTIME_S = 15 * 60
 
 
