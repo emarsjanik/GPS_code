@@ -47,7 +47,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from station_datum import spline_shift, tide_model_to_navd88  # noqa: E402
+from station_datum import spline_shift, tide_model_in_datum  # noqa: E402
 
 import numpy as np
 
@@ -160,9 +160,8 @@ def main():
     tide_times, tide_values = load_tide_reference(
         Path(args.tide_file), args.tide_time_col, args.tide_value_col
     )
-    tide_shift = (args.tide_datum_offset if args.tide_datum_offset is not None
-                  else tide_model_to_navd88())
-    tide_values = np.asarray(tide_values, float) + tide_shift
+    tide_values, tide_shift = tide_model_in_datum(np.asarray(tide_values, float), "NAVD88",
+                                                  model_offset=args.tide_datum_offset)
     print(f"Loaded {len(tide_times)} tide model points (moved {tide_shift:+.3f} m onto NAVD88)")
 
     tide_at_spline_times = interpolate_reference(tide_times, tide_values, spline_times)
