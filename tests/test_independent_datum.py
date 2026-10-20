@@ -59,6 +59,15 @@ CHATHAM_DATUMS = {
 }
 CHATHAM_META = {"count": 1, "stations": [{"id": "8447435", "name": "Chatham, Lydia Cove",
                                           "lat": 41.688508, "lng": -69.951053}]}
+# stations.json?type=datums, cut down: two listed stations, one unlisted
+# station 10 km from Marconi (a made-up ID), one far away, one broken row.
+DATUM_STATIONS = {"count": 5, "stations": [
+    {"id": "8447435", "name": "Chatham, Lydia Cove", "lat": 41.688508, "lng": -69.951053},
+    {"id": "8446121", "name": "Provincetown", "lat": 42.0483, "lng": -70.1867},
+    {"id": "8440001", "name": "Back-barrier cove", "lat": 41.9300, "lng": -70.0700},
+    {"id": "8452660", "name": "Newport", "lat": 41.505, "lng": -71.326},
+    {"id": "8440002", "name": "no position"},
+]}
 
 
 def other_station(msl_minus_navd: float) -> dict:
@@ -103,6 +112,8 @@ class Router:
             return {"t_z": str(self.vdatum_zone + {"LMSL": 0.0, "MHW": 0.70, "MLW": -0.75}[frame])}
         if "monthly_mean" in url:
             return self.monthly_answer
+        if "stations.json?type=datums" in url:
+            return DATUM_STATIONS
         station = url.split("/stations/")[1][:7]
         if station in self.http_404:
             raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
@@ -110,7 +121,7 @@ class Router:
             return CHATHAM_META if station == "8447435" else {"stations": []}
         if station == "8447435":
             return CHATHAM_DATUMS
-        return other_station({"8446121": 0.030, "8447495": -0.106}.get(station, -0.08))
+        return other_station({"8446121": 0.030, "8447495": -0.106, "8440001": 0.250}.get(station, -0.08))
 
 
 def report(router=None, online=True, cache=None, cfg=None, **kw):
@@ -166,6 +177,14 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(idt.parse_station_meta(CHATHAM_META)["name"], "Chatham, Lydia Cove")
         self.assertEqual(idt.parse_station_meta({"stations": []}), {})
 
+    def test_station_list(self) -> None:
+        got = idt.parse_station_list(DATUM_STATIONS)
+        self.assertEqual([s["id"] for s in got], ["8447435", "8446121", "8440001", "8452660"])
+        self.assertEqual(got[0], {"id": "8447435", "name": "Chatham, Lydia Cove",
+                                  "lat": 41.688508, "lon": -69.951053})
+        self.assertEqual(idt.parse_station_list({"error": {"message": "bad type"}}), [])
+        self.assertEqual(idt.parse_station_list(None), [])
+
 
 class TestGeometryAndTime(unittest.TestCase):
 
@@ -173,6 +192,12 @@ class TestGeometryAndTime(unittest.TestCase):
         self.assertAlmostEqual(idt.mean_azimuth([353, 360, 0, 130]), 61.5, delta=1.0)
         self.assertAlmostEqual(idt.mean_azimuth([350, 10]), 0.0, delta=0.5)
         self.assertAlmostEqual(idt.mean_azimuth([80, 100]), 90.0, delta=0.01)
+
+    def test_full_circle_points_nowhere(self) -> None:
+        # the template's [0, 360] (and unset) have no seaward centre
+        self.assertIsNone(idt.mean_azimuth([0, 360]))
+        self.assertIsNone(idt.mean_azimuth(None))
+        self.assertIsNone(idt.mean_azimuth([0, 180, 180, 360]))
 
     def test_reflection_zone_point(self) -> None:
         pts = idt.query_points(MARCONI)
@@ -188,6 +213,11 @@ class TestGeometryAndTime(unittest.TestCase):
     def test_no_position_uses_marconi(self) -> None:
         pts = idt.query_points({})
         self.assertEqual(pts[0][1:], (idt.MARCONI_LAT, idt.MARCONI_LON))
+        # and the documented Marconi azimuths, not north along the bluff
+        self.assertIn("at 61 deg", pts[1][0])
+        self.assertGreater(pts[1][2], pts[0][2])
+        full = idt.query_points(dict(MARCONI, gnssrefl_azimuth_regions=[0, 360]))
+        self.assertEqual(full[1][0], idt.query_points(MARCONI)[1][0])
 
     def test_epoch_and_trend(self) -> None:
         self.assertEqual(idt.epoch_midpoint("1983-2001"), 1992.5)
@@ -206,9 +236,25 @@ class TestGeometryAndTime(unittest.TestCase):
     def test_annual_anomaly_needs_twelve_whole_months(self) -> None:
         rows = idt.parse_monthly_means(monthly(LAST_12, lambda y, m: 0.10 + 0.05 * (m in (9, 10, 11))))
         # 3 autumn months at +0.15, 9 at +0.10, over Oct 2025 - Sep 2026
-        self.assertAlmostEqual(idt.annual_anomaly(rows, NOW), (3 * 0.15 + 9 * 0.10) / 12, places=6)
+        value, first, last = idt.annual_anomaly(rows, NOW)
+        self.assertAlmostEqual(value, (3 * 0.15 + 9 * 0.10) / 12, places=6)
+        self.assertEqual((first, last), ((2025, 10), (2026, 9)))
         self.assertIsNone(idt.annual_anomaly(rows[1:], NOW))
-        self.assertIsNone(idt.annual_anomaly(rows, datetime(2027, 3, 1, tzinfo=timezone.utc)))
+        # a gap anywhere in the year spoils it
+        self.assertIsNone(idt.annual_anomaly(rows[:5] + rows[6:], NOW))
+        # older than the lookback: not used
+        self.assertIsNone(idt.annual_anomaly(rows, datetime(2028, 11, 1, tzinfo=timezone.utc)))
+
+    def test_annual_anomaly_takes_the_latest_published_year(self) -> None:
+        # verified monthly means lag: Aug and Sep 2026 not out yet in Oct
+        months = [(2024, m) for m in range(9, 13)] + [(2025, m) for m in range(1, 13)] \
+            + [(2026, m) for m in range(1, 8)]
+        rows = idt.parse_monthly_means(monthly(months, lambda y, m: 0.01 * (y - 2024) + 0.10))
+        value, first, last = idt.annual_anomaly(rows, NOW)
+        self.assertEqual((first, last), ((2025, 8), (2026, 7)))
+        self.assertAlmostEqual(value, (5 * 0.11 + 7 * 0.12) / 12, places=6)
+        # the 12 months searched for may not start before the lookback
+        self.assertIsNone(idt.annual_anomaly(rows, NOW, lookback=13))
 
     def test_window_anomaly_weights_days(self) -> None:
         rows = idt.parse_monthly_means(monthly([(2026, 8), (2026, 9)],
@@ -261,7 +307,7 @@ class TestLiveReport(unittest.TestCase):
         mm = [u for u in router.calls if "monthly_mean" in u]
         self.assertEqual(len(mm), 1)
         for part in ("datum=MSL", "units=metric", "time_zone=gmt", "station=8447435",
-                     "begin_date=20250901", "end_date=20260930"):
+                     "begin_date=20241001", "end_date=20260930"):
             self.assertIn(part, mm[0])
         self.assertIn("https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/8447435/"
                       "datums.json?units=metric", router.calls)
@@ -285,6 +331,34 @@ class TestLiveReport(unittest.TestCase):
         # the plot's zero is still compared with the whole year
         self.assertAlmostEqual(by["water_level_msl_offset"]["reference"],
                                0.061 + (10 * 0.10 + 2 * 0.20) / 12, places=4)
+
+    def test_unlisted_nearby_stations_are_shown_not_counted(self) -> None:
+        rep, router = report()
+        tried = dict(rep["tried"])
+        self.assertEqual(tried["CO-OPS datum stations within 30 km"],
+                         "live: 1 not in NEARBY_STATIONS within 30 km")
+        self.assertEqual(tried["CO-OPS datums 8440001 (not listed)"], "live")
+        cove = next(s for s in rep["sources"] if s.get("station") == "8440001")
+        self.assertTrue(cove["discovered"])
+        self.assertFalse(cove["local"])
+        self.assertAlmostEqual(cove["distance_km"], 9.8, delta=0.3)
+        self.assertEqual(cove["datums"]["MSL"], 0.25)
+        # its position came with the list: no metadata request for it
+        self.assertFalse(any(u.endswith("/stations/8440001.json") for u in router.calls))
+        self.assertFalse(any(s.get("station") == "8452660" for s in rep["sources"]))   # 150 km off
+        # a station found this way is never the estimate, even alone
+        self.assertIsNone(idt.best_estimate([cove], {"value": 0.1, "sigma": 0.01}))
+        self.assertIn("not in NEARBY_STATIONS: shown, not counted", idt.format_report(rep))
+
+    def test_unlisted_search_is_capped_nearest_first(self) -> None:
+        home = (idt.MARCONI_LAT, idt.MARCONI_LON)
+        net = idt.Net(Router())
+        found, how = idt.nearby_unlisted(net, home, set(), limit=2)
+        self.assertEqual([s["id"] for s in found], ["8440001", "8447435"])
+        self.assertIn("3 not in NEARBY_STATIONS within 30 km, nearest 2 shown", how)
+        found, how = idt.nearby_unlisted(idt.Net(Router(), online=False), home, set())
+        self.assertEqual(found, [])
+        self.assertIn("--offline", how)
 
     def test_superseded_values_never_chosen(self) -> None:
         old = idt.offline_record("8447435/2000")
@@ -344,7 +418,8 @@ class TestFallbacks(unittest.TestCase):
 
     def test_partial_year_falls_back_to_the_trend(self) -> None:
         rep, _ = report(Router(monthly_answer=monthly(LAST_12[1:])))
-        self.assertEqual(rep["adjustment"]["how"], "live, but not 12 whole months; linear trend used")
+        self.assertEqual(rep["adjustment"]["how"],
+                         "live, but no 12 whole months in the last 24; linear trend used")
         self.assertIn("low", rep["adjustment"])
 
     def test_missing_cache_file_is_empty(self) -> None:

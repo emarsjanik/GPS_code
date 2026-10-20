@@ -45,7 +45,7 @@ python3 analysis_tools/independent_datum.py \
   same days, from Chatham's monthly means.
 - `--offline` uses no network at all.
 
-It takes a minute or two: about twenty small requests, each with a
+It takes a minute or two: twenty to thirty small requests, each with a
 30-second timeout. A host that does not answer is tried once, not once
 per request.
 
@@ -70,7 +70,12 @@ mark sheets:
 | 8443970 | Boston | regional picture |
 
 On the station, the tool also prints each station's name and distance
-from NOAA's own metadata, so a wrong ID shows.
+from NOAA's own metadata, so a wrong ID shows. It also asks NOAA for
+every station with published datums and lists the ones within 30 km
+that the table above leaves out (up to ten, nearest first), with their
+datums. Those are shown but not counted, because many sit inside bays
+and harbours whose mean level is not the open coast's. If one of them
+is on the open coast, add it to `NEARBY_STATIONS` in the script.
 
 **NOAA VDatum.** This is NOAA's datum-transformation model. The tool
 asks it for 0 m on LMSL, MHW and MLW, converted to NAVD88, at three
@@ -84,9 +89,13 @@ whenever it gives one.
 **The epoch.** Tidal datums are means over the National Tidal Datum
 Epoch, 1983–2001 (Gill & Schultz 2001). Sea level has risen since.
 "Present" mean sea level is the epoch value plus Chatham's mean
-monthly sea level over the last 12 whole months. Each of those monthly
-values is already a departure from the epoch mean, and averaging a
-whole year cancels the seasonal cycle.
+monthly sea level over the latest 12 consecutive months NOAA has
+published. Each of those monthly values is already a departure from
+the epoch mean, and averaging a whole year cancels the seasonal cycle.
+NOAA publishes a monthly mean only once it is verified, a month or two
+after the month ends, so the year used usually ends two or three
+months back. The tool looks back up to 24 months for one, and prints
+which months it used.
 
 When the monthly means cannot be read, a linear trend stands in. The
 default is Nantucket's 4.01 mm/yr. The range shown runs to Boston's
@@ -104,13 +113,19 @@ None of NOAA's hosts could be reached from the build sandbox:
   `tidesandcurrents`, `ngdc` and `ngs` web hosts) were refused by its
   network proxy (HTTP 403 on CONNECT).
 - A web fetch could not resolve the host names.
+- A second try some hours later, after the tool was revised, failed
+  the same way.
 
 Because of that:
 
 - **The offline values were read from NOAA's published bench mark
   sheets, through the text a web search returned.** Chatham's MSL and
   NAVD88 also agree with the values already in the camera repository
-  (`compare_gnssr_to_gauge.py`).
+  (`compare_gnssr_to_gauge.py`). Saquatucket's agree, within the
+  rounding, with NOAA's Inundation Analysis Tool page for the station,
+  which gives them in feet above MHHW to 0.01 ft. The months of the
+  superseded 3-month Chatham series could not be confirmed; that sheet
+  was published 30 Jun 2000.
 - **The request formats were checked against working clients rather
   than against the live services.** For VDatum that was NOAA's own
   `vyperdatum` package (`vdatum_rest_utils.py`) and two other
@@ -127,7 +142,7 @@ like the real ones, with no network.
 | Offline value (heights above MLLW, m) | MSL | NAVD88 | MSL − NAVD88 | MHW − NAVD88 | MLW − NAVD88 | Source |
 |---|---|---|---|---|---|---|
 | 8447435 Chatham, Sep 2015–Aug 2017 | 0.778 | 0.760 | **+0.018** | +0.704 | −0.710 | bench mark sheet, published 2020-05-20; datum error 0.012 m |
-| 8447435 Chatham, 3 months of 2000 (superseded 2003) | 0.771 | 0.816 | −0.045 | – | – | superseded sheet; shown, never used |
+| 8447435 Chatham, 3-month series, sheet of 2000 (superseded 2003) | 0.771 | 0.816 | −0.045 | – | – | superseded sheet; shown, never used |
 | 8447495 Saquatucket Harbor, May–Sep 1993 | 0.682 | 0.788 | −0.106 | +0.432 | −0.703 | bench mark sheet, published 2003-04-21 |
 
 The two Chatham determinations differ by 6 cm, and Saquatucket is 12 cm
@@ -153,7 +168,7 @@ Two things change the earlier reading of B11:
 
 - **The sea-level rise since the epoch is 10–14 cm, not "a few cm".**
   Against the epoch value alone (+0.018 m), the plot's zero looked
-  8 cm high. Against present sea level it is 3–6 cm low.
+  8 cm high. Against present sea level it is 2–6 cm low.
 - **Chatham is a back-barrier harbour.** Its inlet damps the low tides,
   which raises its mean level a few cm above the open coast. That
   pushes the Marconi value down by about the same amount.

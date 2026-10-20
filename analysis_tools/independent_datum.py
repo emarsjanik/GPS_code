@@ -39,7 +39,8 @@ Publication NOS CO-OPS 1).
            MSL - NAVD88 is the difference of the two published
            heights. NEARBY_STATIONS lists the stations; a live run
            prints each one's name and distance from its own metadata,
-           so a wrong ID shows.
+           so a wrong ID shows, and also lists every other NOAA datum
+           station within 30 km (shown, not counted).
   VDatum   NOAA's datum-transformation model at Marconi itself: 0 m on
            LMSL, MHW and MLW converted to NAVD88 (REST API /convert),
            at the antenna, at the centre of the reflection zone and
@@ -57,14 +58,15 @@ Publication NOS CO-OPS 1).
 EPOCH. A tidal datum is the epoch's mean, and sea level has risen
 since: about 3-4 mm/yr on this coast, 10-14 cm since 1992. Present
 mean sea level is the epoch value plus the mean of the reference
-station's last 12 monthly mean sea levels, requested on the MSL datum
-so that each is that month's departure from the epoch mean (CO-OPS
-monthly_mean product). Twelve whole months, so the seasonal cycle
-cancels. Offline, it is a linear sea-level trend times the years since
-the middle of the epoch (OFFLINE_TRENDS), with the spread of the
-trends of the long-term stations nearby as its uncertainty. MHW and
-MLW are moved by the same amount: the range of the tide has not
-changed measurably over that time.
+station's monthly mean sea levels over the latest whole year NOAA has
+published (verified months arrive a month or two late), requested on
+the MSL datum so that each is that month's departure from the epoch
+mean (CO-OPS monthly_mean product). Twelve consecutive whole months,
+so the seasonal cycle cancels. Offline, it is a linear sea-level
+trend times the years since the middle of the epoch (OFFLINE_TRENDS),
+with the spread of the trends of the long-term stations nearby as its
+uncertainty. MHW and MLW are moved by the same amount: the range of
+the tide has not changed measurably over that time.
 
 BEST ESTIMATE. VDatum at the reflection zone (or offshore) when it
 answers: it is a model, but of the open coast at Marconi. Otherwise
@@ -116,6 +118,10 @@ from station_datum import (NAVD88_HORTHO_M, config_to_navd88, load_station,  # n
 COOPS_DATUMS_API = ("https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/"
                     "{station}/datums.json?units=metric")
 COOPS_STATION_API = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/{station}.json"
+# Every station with published datums (id, name, lat, lng); used to show
+# the ones near Marconi that NEARBY_STATIONS does not list.
+COOPS_DATUM_STATIONS_API = ("https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json"
+                            "?type=datums")
 COOPS_MONTHLY_API = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=monthly_mean"
                      "&station={station}&begin_date={begin}&end_date={end}&datum=MSL&units=metric"
                      "&time_zone=gmt&format=json&application=gnssir_station_datum")
@@ -133,9 +139,13 @@ DATUM_NAMES = ("MHHW", "MHW", "MSL", "MTL", "MLW", "MLLW")
 SHOWN = ("MSL", "MHW", "MLW")
 VDATUM_FRAMES = {"MSL": "LMSL", "MHW": "MHW", "MLW": "MLW"}
 
-# The documented Marconi antenna (STATION_JSON_REFERENCE.md, real
-# example); used only when station.json has no position.
+# The documented Marconi antenna and azimuth regions
+# (STATION_JSON_REFERENCE.md, real example); used only when station.json
+# has no position, or no azimuth regions that point anywhere (unset, or
+# the template's full circle, whose reflection zone is a ring round the
+# antenna with no seaward centre).
 MARCONI_LAT, MARCONI_LON = 41.8928243333, -69.9633227139
+MARCONI_AZIMUTH_REGIONS = (353, 360, 0, 130)
 OFFSHORE_M = 1000.0
 
 # (id, name, local). IDs checked against NOAA's bench mark sheets and
@@ -152,6 +162,13 @@ NEARBY_STATIONS = (
     ("8443970", "Boston, MA", False),
 )
 PRIMARY_STATION = "8447435"
+# A live run also lists every NOAA datum station within this distance
+# that NEARBY_STATIONS leaves out (nearest first, at most MAX_DISCOVERED),
+# with its datums. They are shown, not counted in the estimate or its
+# spread: many are inside bays and harbours whose mean level is not the
+# open coast's. One worth counting is added to NEARBY_STATIONS by hand.
+LOCAL_RADIUS_KM = 30.0
+MAX_DISCOVERED = 10
 
 # Standard error of the published datums, NOAA "Tidal Datum Errors for
 # East Coast of the United States" (tidesandcurrents.noaa.gov/pdf/
@@ -179,7 +196,8 @@ OFFLINE_DATUMS = {
         "name": "Chatham, Lydia Cove, MA, 2000",
         "superseded": "2003-04-21",
         "epoch": NTDE,
-        "series": "3 months in 2000, control station 8449130 Nantucket",
+        "series": "3 months (sheet published 2000-06-30; the months not confirmed), "
+                  "control station 8449130 Nantucket",
         "above_mllw": {"MSL": 0.771, "NAVD88": 0.816},
         "source": "NOAA CO-OPS superseded bench mark sheet, "
                   "https://tidesandcurrents.noaa.gov/benchmarks/benchmarks_old/8447435.html",
@@ -206,6 +224,10 @@ OFFLINE_TRENDS = {
     "8443970": (2.94, 0.15, "Boston"),
 }
 DEFAULT_TREND_STATION = "8449130"     # control station of Chatham's datums
+# CO-OPS publishes a monthly mean only once the month is verified, a
+# month or two after it ends, so the 12 months just ended are rarely all
+# there. The latest whole year within this many months is used instead.
+MONTHLY_LOOKBACK = 24
 
 # ---------------------------------------------------------------------
 # CALIBRATION (co-located gauge; docs/INDEPENDENT_DATUM.md)
@@ -333,6 +355,20 @@ def parse_station_meta(obj) -> dict:
         return {}
 
 
+def parse_station_list(obj) -> list:
+    """[{"id", "name", "lat", "lon"}] from a CO-OPS stations.json
+    answer; entries without an id or a position are skipped."""
+    out = []
+    stations = obj.get("stations") if isinstance(obj, dict) else None
+    for st in stations or []:
+        try:
+            out.append({"id": str(st["id"]), "name": str(st.get("name", "")),
+                        "lat": float(st["lat"]), "lon": float(st["lng"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 def parse_monthly_means(obj) -> list:
     """[{"year", "month", "MSL", "MHW", "MLW"}] from a monthly_mean
     answer; a blank value becomes None. Raises ValueError for an error
@@ -375,12 +411,15 @@ def parse_vdatum(obj):
 # GEOMETRY AND TIME
 # ---------------------------------------------------------------------
 
-def mean_azimuth(regions) -> float:
+def mean_azimuth(regions) -> float | None:
     """Mean direction (deg) of gnssrefl azimuth regions given as the
     flat list station.json uses ([353, 360, 0, 130] is 353-360 and
-    0-130). A vector mean, so a window across north averages right."""
+    0-130). A vector mean, so a window across north averages right.
+    None when the regions point nowhere in particular -- unset, or
+    (nearly) the full circle -- since a ring has no centre."""
     vals = [float(v) for v in (regions or [0, 360])]
     x = y = 0.0
+    n = 0
     for lo, hi in zip(vals[0::2], vals[1::2]):
         if hi < lo:
             hi += 360.0
@@ -388,9 +427,10 @@ def mean_azimuth(regions) -> float:
         while a <= hi:
             x += math.cos(math.radians(a))
             y += math.sin(math.radians(a))
+            n += 1
             a += 1.0
-    if abs(x) < 1e-9 and abs(y) < 1e-9:
-        return 0.0
+    if n == 0 or math.hypot(x, y) / n < 0.1:
+        return None
     return round(math.degrees(math.atan2(y, x)), 6) % 360.0
 
 
@@ -418,7 +458,9 @@ def query_points(cfg: dict):
     The reflection point of an arc at elevation e is RH / tan(e) from
     the antenna (Roesler & Larson 2018); RH is taken as the antenna's
     NAVD88 height (water near 0 m), e as the middle of the elevation
-    mask and the azimuth as the mean of the azimuth regions."""
+    mask and the azimuth as the mean of the azimuth regions -- the
+    documented Marconi regions when station.json's point nowhere in
+    particular (MARCONI_AZIMUTH_REGIONS)."""
     lat = cfg.get("latitude")
     lon = cfg.get("longitude")
     if lat is None or lon is None:
@@ -428,6 +470,8 @@ def query_points(cfg: dict):
     e2 = float(cfg.get("gnssrefl_elevation_max") or 15.0)
     rh = navd88_hortho(cfg) or NAVD88_HORTHO_M
     az = mean_azimuth(cfg.get("gnssrefl_azimuth_regions"))
+    if az is None:
+        az = mean_azimuth(MARCONI_AZIMUTH_REGIONS)
     zone = rh / math.tan(math.radians((e1 + e2) / 2))
     return [("antenna", lat, lon),
             (f"reflection zone ({zone:.0f} m at {az:.0f} deg)",)
@@ -458,17 +502,31 @@ def _months_back(year: int, month: int, n: int):
     return out[::-1]
 
 
-def annual_anomaly(rows, now: datetime):
-    """Mean monthly MSL (departure from the epoch mean, m) over the 12
-    whole months before `now`, or None unless every one of them has a
-    value -- a partial year would carry part of the seasonal cycle."""
-    end = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
-    want = _months_back(end[0], end[1], 12)
+def last_whole_month(now: datetime):
+    """(year, month) of the last month that ended before `now`."""
+    return (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+
+
+def annual_anomaly(rows, now: datetime, lookback: int = MONTHLY_LOOKBACK):
+    """(mean, first, last): the mean monthly MSL (departure from the
+    epoch mean, m) over the latest 12 consecutive whole months before
+    `now` that all have a value, searched back `lookback` months; first
+    and last are (year, month). None if there is no such year: a
+    partial year would carry part of the seasonal cycle.
+
+    Searched back rather than insisting on the 12 months just ended,
+    because monthly means are published only once verified, a month or
+    two late (MONTHLY_LOOKBACK). A year that ended up to a year ago
+    misses about 4 mm of sea-level rise, well inside the budget."""
+    end = last_whole_month(now)
+    months = _months_back(end[0], end[1], max(lookback, 12))
     have = {(r["year"], r["month"]): r.get("MSL") for r in rows}
-    vals = [have.get(m) for m in want]
-    if any(v is None for v in vals):
-        return None
-    return sum(vals) / len(vals)
+    for i in range(len(months) - 12, -1, -1):
+        span = months[i:i + 12]
+        vals = [have.get(m) for m in span]
+        if all(v is not None for v in vals):
+            return sum(vals) / len(vals), span[0], span[-1]
+    return None
 
 
 def window_anomaly(rows, start: date, end: date):
@@ -516,9 +574,10 @@ def offline_record(key: str) -> dict:
 
 
 def coops_record(net: Net, station: str, name: str, local: bool, cache: dict,
-                 now: datetime, home) -> tuple:
+                 now: datetime, home, meta: dict | None = None) -> tuple:
     """(record or None, what happened) for one CO-OPS station: live,
-    else the cache, else OFFLINE_DATUMS."""
+    else the cache, else OFFLINE_DATUMS. `meta` ({"name", "lat",
+    "lon"}) saves the station metadata request when already known."""
     key = f"coops:{station}"
     try:
         d = parse_coops_datums(net.get(COOPS_DATUMS_API.format(station=station)))
@@ -527,10 +586,11 @@ def coops_record(net: Net, station: str, name: str, local: bool, cache: dict,
                "series": d["series"] + (f", control station {d['control']}" if d["control"] else ""),
                "local": local, "superseded": False, "datum_error": DATUM_ERRORS_M.get(station),
                "distance_km": None, "retrieved": _stamp(now)}
-        try:
-            meta = parse_station_meta(net.get(COOPS_STATION_API.format(station=station)))
-        except Unavailable:
-            meta = {}
+        if meta is None:
+            try:
+                meta = parse_station_meta(net.get(COOPS_STATION_API.format(station=station)))
+            except Unavailable:
+                meta = {}
         if meta.get("name"):
             rec["label"] = f"CO-OPS {station} {meta['name']}"
         if "lat" in meta:
@@ -547,6 +607,33 @@ def coops_record(net: Net, station: str, name: str, local: bool, cache: dict,
     if station in OFFLINE_DATUMS:
         return offline_record(station), f"failed ({why}); offline values used"
     return None, f"failed ({why}); no offline values"
+
+
+def nearby_unlisted(net: Net, home, listed, radius_km: float = LOCAL_RADIUS_KM,
+                    limit: int = MAX_DISCOVERED) -> tuple:
+    """([{"id", "name", "lat", "lon", "distance_km"}], what happened):
+    NOAA stations with published datums within radius_km of the antenna
+    that `listed` (station IDs) leaves out, nearest first.
+
+    This is how a live run checks NEARBY_STATIONS against NOAA's own
+    list: a closer open-coast station, or a renumbered one, shows here.
+    The list itself is not cached: it only informs."""
+    try:
+        stations = parse_station_list(net.get(COOPS_DATUM_STATIONS_API))
+    except Unavailable as exc:
+        return [], f"failed ({exc})"
+    found = []
+    for st in stations:
+        if st["id"] in listed:
+            continue
+        d = distance_km(home[0], home[1], st["lat"], st["lon"])
+        if d <= radius_km:
+            found.append(dict(st, distance_km=round(d, 1)))
+    found.sort(key=lambda s: s["distance_km"])
+    how = f"live: {len(found)} not in NEARBY_STATIONS within {radius_km:.0f} km"
+    if len(found) > limit:
+        how += f", nearest {limit} shown"
+    return found[:limit], how
 
 
 def vdatum_record(net: Net, label: str, lat: float, lon: float, cache: dict, now: datetime) -> tuple:
@@ -605,20 +692,23 @@ def sea_level_since_epoch(net: Net, station: str, epoch: str, now: datetime, cac
     """How far mean sea level has risen since the middle of the tidal
     epoch: {"value", "sigma", "method", "how"} (m).
 
-    Observed when it can be: the mean of `station`'s 12 monthly mean
-    sea levels before `now`, each a departure from the epoch mean. This
-    is this year's sea level, its year-to-year wobble included, which
-    is what the present-day zero should be. Otherwise a linear trend:
+    Observed when it can be: the mean of `station`'s monthly mean sea
+    levels over the latest whole year published (annual_anomaly), each
+    a departure from the epoch mean. This is the recent year's sea
+    level, its year-to-year wobble included, which is what the
+    present-day zero should be. Otherwise a linear trend:
     OFFLINE_TRENDS[trend_station] times the years since the epoch's
     middle, +/- half the spread the long-term stations' trends give."""
     end_month = date(now.year, now.month, 1) - timedelta(days=1)
-    begin = date(end_month.year - 1, end_month.month, 1)
+    first = _months_back(end_month.year, end_month.month, MONTHLY_LOOKBACK)[0]
+    begin = date(first[0], first[1], 1)
     rows, how = monthly_rows(net, station, begin, end_month, cache)
-    anomaly = annual_anomaly(rows, now)
-    if anomaly is not None:
+    found = annual_anomaly(rows, now)
+    if found is not None:
+        anomaly, (y1, m1), (y2, m2) = found
         return {"value": round(anomaly, 4), "sigma": None, "how": how,
                 "method": f"observed: mean of {station}'s monthly mean sea level, "
-                          f"{begin:%Y-%m} to {end_month:%Y-%m}, against the {epoch} mean"}
+                          f"{y1}-{m1:02d} to {y2}-{m2:02d}, against the {epoch} mean"}
     mid = epoch_midpoint(epoch) or epoch_midpoint(NTDE)
     years = decimal_year(now) - mid
     rate = OFFLINE_TRENDS[trend_station][0]
@@ -628,7 +718,7 @@ def sea_level_since_epoch(net: Net, station: str, epoch: str, now: datetime, cac
             "low": round(min(rates) / 1000.0 * years, 4),
             "high": round(max(rates) / 1000.0 * years, 4),
             "how": how + "; linear trend used" if how != "live" else
-                   "live, but not 12 whole months; linear trend used",
+                   f"live, but no 12 whole months in the last {MONTHLY_LOOKBACK}; linear trend used",
             "method": (f"trend: {rate:.2f} mm/yr ({OFFLINE_TRENDS[trend_station][2]}, NOAA) x "
                        f"{years:.1f} yr since {mid:.1f}; "
                        + ", ".join(f"{n} {r:.2f}" for r, _, n in OFFLINE_TRENDS.values())
@@ -647,13 +737,15 @@ def best_estimate(sources, adjustment: dict) -> dict | None:
     Choice: VDatum at the reflection zone, then offshore, then at the
     antenna (it models the open coast at the site), then Chatham, then
     any other local station, then any station. Superseded
-    determinations are never chosen.
+    determinations, and stations found by nearby_unlisted, are never
+    chosen.
 
     Budget: the chosen datum's published error; the epoch correction's
     uncertainty; and the transfer from source to site, taken as half
     the spread of MSL - NAVD88 over the local sources (VDatum points
     and the stations within ~30 km)."""
-    usable = [s for s in sources if s and not s.get("superseded") and "MSL" in s["datums"]]
+    usable = [s for s in sources if s and not s.get("superseded") and not s.get("discovered")
+              and "MSL" in s["datums"]]
     if not usable:
         return None
     vd = [s for s in usable if s["kind"] == "vdatum"]
@@ -735,7 +827,8 @@ def calibration_plan(target: float, sigma_tie: float, sigma_daily: float = DAILY
 # ---------------------------------------------------------------------
 
 def build_report(cfg: dict, net: Net, cache: dict, now: datetime,
-                 stations=NEARBY_STATIONS, window=None, vdatum: bool = True) -> dict:
+                 stations=NEARBY_STATIONS, window=None, vdatum: bool = True,
+                 discover: bool = True) -> dict:
     """Everything the tool prints, as a dict (also what --json writes)."""
     points = query_points(cfg)
     home = (points[0][1], points[0][2])
@@ -745,6 +838,15 @@ def build_report(cfg: dict, net: Net, cache: dict, now: datetime,
         tried.append((f"CO-OPS datums {station}", how))
         if rec:
             sources.append(rec)
+    if discover:
+        found, how = nearby_unlisted(net, home, {s for s, _, _ in stations})
+        tried.append((f"CO-OPS datum stations within {LOCAL_RADIUS_KM:.0f} km", how))
+        for st in found:
+            rec, how = coops_record(net, st["id"], st["name"], False, cache, now, home, meta=st)
+            tried.append((f"CO-OPS datums {st['id']} (not listed)", how))
+            if rec:
+                rec["discovered"] = True
+                sources.append(rec)
     if vdatum:
         for label, lat, lon in points:
             rec, how = vdatum_record(net, label, lat, lon, cache, now)
@@ -810,7 +912,8 @@ def format_report(rep: dict) -> str:
                  f"{_f(d.get('MLW'))}")
         L += _wrap(f"epoch {s.get('epoch') or '?'}{'; ' + s['series'] if s.get('series') else ''}"
                    + (f"; SUPERSEDED {s['superseded']}, shown for comparison only"
-                      if s.get("superseded") else ""))
+                      if s.get("superseded") else "")
+                   + ("; not in NEARBY_STATIONS: shown, not counted" if s.get("discovered") else ""))
         L += _wrap(s["provenance"])
     a = rep["adjustment"]
     L += ["", f"Sea level since the epoch: {a['value']:+.3f} m"
