@@ -20,13 +20,18 @@ a recognizable date at all (ad-hoc test recordings).
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "station"))
 
-from pipeline import _date_from_filename  # noqa: E402
+from pipeline import Pipeline, _date_from_filename, _in_progress_reason  # noqa: E402
 
 
 class TestDateFromFilename(unittest.TestCase):
@@ -76,6 +81,79 @@ class TestDateFromFilename(unittest.TestCase):
 
     def test_no_digits_at_all_returns_none(self) -> None:
         self.assertIsNone(_date_from_filename("plainfilename.um980"))
+
+
+class TestInProgressDaySkipped(unittest.TestCase):
+    """
+    The UTC day station_manager is still appending to must not be
+    processed: archiving it moved the file out from under the recorder,
+    and the next night's archive overwrote the first part of the day.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.raw_dir = Path(self._tmp.name)
+        self.now = datetime(2026, 10, 20, 2, 30, tzinfo=timezone.utc)
+        self.old = time.time() - 3600
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _raw(self, name: str, mtime: float | None = None) -> Path:
+        path = self.raw_dir / name
+        path.write_bytes(b"x")
+        mtime = self.old if mtime is None else mtime
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_todays_utc_file_is_in_progress(self) -> None:
+        path = self._raw("station_20261020.um980", mtime=self.now.timestamp() - 3600)
+        self.assertIsNotNone(_in_progress_reason(path, now=self.now))
+
+    def test_yesterdays_file_is_finished(self) -> None:
+        # 02:30 UTC is 22:30 EDT: yesterday's UTC file is complete.
+        path = self._raw("station_20261019.um980", mtime=self.now.timestamp() - 3600)
+        self.assertIsNone(_in_progress_reason(path, now=self.now))
+
+    def test_recently_written_file_is_in_progress_whatever_its_name(self) -> None:
+        path = self._raw("test_recording.um980", mtime=time.time() - 60)
+        self.assertIsNotNone(_in_progress_reason(path))
+        path = self._raw("station_20261019.um980", mtime=time.time() - 60)
+        self.assertIsNotNone(_in_progress_reason(path))
+
+    def test_missing_file_with_old_date_is_not_in_progress(self) -> None:
+        self.assertIsNone(_in_progress_reason(self.raw_dir / "station_20261001.um980"))
+
+    def _pipeline(self, queued=()) -> tuple[Pipeline, list[str]]:
+        entries = [SimpleNamespace(filename=name, completed=False) for name in queued]
+        db = SimpleNamespace(processing_history=lambda filename=None: entries)
+        pipeline = Pipeline(cfg=SimpleNamespace(raw_dir=self.raw_dir), db=db)
+        processed: list[str] = []
+        pipeline._process_one_job = processed.append
+        return pipeline, processed
+
+    def test_scan_leaves_out_todays_file(self) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        self._raw("station_20200101.um980")
+        self._raw(f"station_{today}.um980")
+
+        pipeline, _ = self._pipeline()
+
+        self.assertEqual([p.name for p in pipeline._scan_raw_directory()],
+                         ["station_20200101.um980"])
+
+    def test_queue_leaves_todays_file_waiting(self) -> None:
+        # Queued by an earlier run the same UTC day, or before the
+        # check existed: still not processed while it is recording.
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        self._raw("station_20200101.um980")
+        self._raw(f"station_{today}.um980")
+
+        pipeline, processed = self._pipeline(
+            queued=["station_20200101.um980", f"station_{today}.um980"])
+        pipeline._process_queue()
+
+        self.assertEqual(processed, ["station_20200101.um980"])
 
 
 if __name__ == "__main__":

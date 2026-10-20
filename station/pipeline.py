@@ -157,6 +157,37 @@ def _date_from_filename(filename: str) -> str | None:
     return parsed.isoformat()
 
 
+# A raw file still being written must not be processed: station_manager
+# appends to station_<UTC date>.um980 all day, and the 22:30 local
+# (02:30 UTC) cron run would otherwise convert the first hours of the
+# new day. If that ever succeeded (nav or ultra orbits), _archive()
+# moved the file out from under the recorder, the next chunk started a
+# fresh file, and the next night's archive overwrote the first part --
+# that part of the day was lost. A file is in progress if its name
+# carries today's UTC date, or (for any name) it was written to in the
+# last IN_PROGRESS_MTIME_S seconds.
+IN_PROGRESS_MTIME_S = 15 * 60
+
+
+def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
+    """Why `path` is still being recorded, or None if it is finished."""
+
+    now = now or datetime.now(timezone.utc)
+
+    file_date = _date_from_filename(path.name)
+    if file_date is not None and file_date == now.date().isoformat():
+        return "its date is today (UTC)"
+
+    try:
+        age_s = now.timestamp() - path.stat().st_mtime
+    except OSError:
+        return None
+    if age_s < IN_PROGRESS_MTIME_S:
+        return f"written {age_s / 60:.0f} min ago"
+
+    return None
+
+
 # The version of this module's interface/contract (the convert()/
 # verify()/process()/verify() calling conventions documented above),
 # as opposed to the station application's own version (station/
@@ -493,7 +524,13 @@ class Pipeline:
 
         assert self.cfg is not None
 
-        paths = sorted(self.cfg.raw_dir.glob("*.um980"))
+        paths = []
+        for path in sorted(self.cfg.raw_dir.glob("*.um980")):
+            reason = _in_progress_reason(path)
+            if reason is not None:
+                self._logger.info("Skipping %s, still recording: %s", path.name, reason)
+                continue
+            paths.append(path)
 
         self._logger.debug("Scanned %s: %d file(s)", self.cfg.raw_dir, len(paths))
 
@@ -612,9 +649,20 @@ class Pipeline:
         """
 
         assert self.db is not None
+        assert self.cfg is not None
 
         entries = self.db.processing_history()
-        to_process = [entry.filename for entry in entries if not entry.completed]
+        to_process = []
+        for entry in entries:
+            if entry.completed:
+                continue
+            # Queued by an earlier run (or before this check existed)
+            # but still being recorded: leave it waiting for tomorrow.
+            reason = _in_progress_reason(self.cfg.raw_dir / entry.filename)
+            if reason is not None:
+                self._logger.info("Leaving %s queued, still recording: %s", entry.filename, reason)
+                continue
+            to_process.append(entry.filename)
 
         self._logger.info("Processing queue: %d file(s) pending", len(to_process))
 
