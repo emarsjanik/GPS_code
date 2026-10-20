@@ -649,6 +649,8 @@ def check_cron_ran() -> None:
 #     record, the processing, the public plot) is a FAIL once no run has
 #     gone through for RUN_OK_MAX_HOURS, which a nightly run with one bad
 #     night does not reach -- one bad night is a warning, two a failure.
+#     A diagnostic that fails only warns, but a last ok run older than
+#     RUN_OK_MAX_HOURS is a FAIL whatever the diagnostics did.
 # ------------------------------------------------------------------
 RUN_STATUS_NAME = "process_and_plot_status.json"
 RUN_OK_MAX_HOURS = 36    # the run is nightly
@@ -730,17 +732,24 @@ def check_run_status() -> None:
             record(FAIL, "run", f"{text} -- {ok_text}, so this is not a single bad night")
         else:
             record(WARN, "run", f"{text} ({ok_text})")
-    if failed:
-        return
+    if any(s.get("required", True) for s in failed):
+        return                   # said above, a FAIL once it is not a single bad night
+    # Only diagnostics failed, or nothing did. The age of the last ok run
+    # still counts: a tide comparison that fails every night must not
+    # hide that the run itself stopped coming.
     if st.get("ok") is False:
-        # an exit status the steps do not account for
-        record(FAIL if stale else WARN, "run",
-               f"process_and_plot.sh exited {st.get('rc')} in the run of {when}; {ok_text}")
+        # an exit status the steps do not account for, or the run was
+        # stopped inside a diagnostic step (said above, unless it is old)
+        if stale or not failed:
+            rc_text = (f"exited {st['rc']}" if st.get("rc") is not None
+                       else "ended without an exit status (killed?)")
+            record(FAIL if stale else WARN, "run",
+                   f"process_and_plot.sh {rc_text} in the run of {when}; {ok_text}")
     elif stale:
         age_d = (now - since).total_seconds() / 86400
         record(FAIL, "run", f"the last run, {when}, went through, but that was {age_d:.1f} "
                             f"days ago: process_and_plot.sh has not run since")
-    else:
+    elif not failed:
         n_skip = sum(1 for s in steps if s.get("status") == "skipped")
         record(OK, "run", f"last run {when}: {len(steps) - n_skip} step(s) ok"
                           + (f", {n_skip} skipped" if n_skip else ""))

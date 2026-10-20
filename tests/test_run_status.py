@@ -446,14 +446,38 @@ class HealthRunStatusTests(unittest.TestCase):
         self.assertEqual(status, "FAIL")
         self.assertIn("no run without a failed step since", message)
 
+    TIDE_FAILS = [("4", "water-level fit", "ok", True), ("6", "tide comparison", "failed", False)]
+
     def test_an_optional_step_failing_every_night_only_warns(self) -> None:
-        # the run is still ok, so it is its own last ok run
-        for hours in (57, 33, 9):
+        # the run is still ok, so it is its own last ok run: the morning
+        # after each night it is a warning, however long it has gone on
+        for first_hours in (9, 33, 57, 240):
             sh.findings.clear()
-            self.write(hours, [("4", "water-level fit", "ok", True),
-                               ("6", "tide comparison", "failed", False)], first_hours=57)
+            self.write(9, self.TIDE_FAILS, first_hours=first_hours)
             self.assertTrue(rs.load(self.path)["ok"])
             self.assertEqual([s for s, _ in self.findings()], ["WARN"])
+
+    def test_an_old_run_fails_even_if_only_a_diagnostic_failed_in_it(self) -> None:
+        # the tide comparison failing every night must not hide that the
+        # run itself has stopped coming
+        self.write(57, self.TIDE_FAILS)
+        found = self.findings()
+        self.assertEqual([s for s, _ in found], ["WARN", "FAIL"])
+        self.assertIn("Step 6 (tide comparison) failed", found[0][1])
+        self.assertIn("has not run since", found[1][1])
+
+    def test_a_run_stopped_in_a_diagnostic_step(self) -> None:
+        # SIGTERM during the tide plot: the step says so; the run is not
+        # ok, so the age of the last ok run counts
+        steps = [("4", "water-level fit", "ok", True), ("6", "tide plot", "failed", False)]
+        self.write(9, steps, rc=None, last_ok_hours=33)
+        self.assertEqual([s for s, _ in self.findings()], ["WARN"])
+        sh.findings.clear()
+        self.write(9, steps, rc=None, last_ok_hours=57)
+        found = self.findings()
+        self.assertEqual([s for s, _ in found], ["WARN", "FAIL"])
+        self.assertIn("ended without an exit status", found[1][1])
+        self.assertIn("the last run without a failed step ended", found[1][1])
 
     def test_a_good_run_long_ago_fails(self) -> None:
         self.write(72, self.GOOD)
