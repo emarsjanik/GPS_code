@@ -222,45 +222,91 @@ def _downscale_for_email(path: Path, tmpdir: Path):
         return raw, path.name, False
 
 
-def msmtp_from(path: Path | None = None) -> str | None:
-    """The sender address msmtp will use: the `from` of the default
-    account in ~/.msmtprc (or of its first account, or of `defaults`).
-    None if there is none, or it uses msmtp's %-substitutions."""
-    path = path or Path.home() / ".msmtprc"
+# msmtp's system configuration file; a user file's accounts override its.
+MSMTP_SYSTEM_CONFIG = Path("/etc/msmtprc")
+
+
+def _msmtp_user_config() -> Path:
+    """~/.msmtprc, else $XDG_CONFIG_HOME/msmtp/config (msmtp's own order)."""
+    home = Path.home() / ".msmtprc"
+    if home.exists():
+        return home
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "msmtp" / "config"
+
+
+def _msmtp_accounts(path: Path) -> dict | None:
+    """{account name: {command: argument}} of one msmtp configuration
+    file, built as msmtp builds them: an account starts from the
+    `defaults` given so far and, for `account name : a,b`, takes on all
+    settings of accounts a, then b; the lines after it override. Commands
+    and arguments are separated by any blanks, and an argument may be in
+    double quotes. None if the file cannot be read; ValueError if it has
+    an `eval` line, whose result only msmtp can know."""
     try:
         lines = path.read_text().splitlines()
     except OSError:
         return None
-    froms, order, current, alias = {}, [], None, None
+    defaults, accounts, current = {}, {}, None
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        key, _, value = line.partition(" ")
-        value = value.strip()
-        if key == "defaults":
-            current = ""
-        elif key == "account":
-            if ":" in value:            # account default : <name>
-                name, _, target = value.partition(":")
-                if name.strip() == "default":
-                    alias = target.strip()
-                current = name.strip()
-            else:
-                current = value
-            order.append(current)
-        elif key == "from" and current is not None:
-            froms[current] = value
-    name = alias or (order[0] if order else None)
-    sender = froms.get(name) if name else None
-    sender = sender or froms.get("")
-    return sender if sender and "%" not in sender else None
+        parts = line.split(None, 1)
+        command = parts[0]
+        argument = parts[1].strip() if len(parts) > 1 else ""
+        if len(argument) >= 2 and argument[0] == argument[-1] == '"':
+            argument = argument[1:-1]
+        if command == "eval":
+            raise ValueError(f"{path} sets something with eval")
+        if command == "defaults":
+            current = defaults
+        elif command == "account":
+            name, _, parents = argument.partition(":")
+            current = dict(defaults)
+            for parent in parents.split(","):
+                current.update(accounts.get(parent.strip(), {}))
+            accounts[name.strip()] = current
+        elif current is not None:
+            current[command] = argument
+    return accounts
+
+
+def msmtp_from(path: Path | None = None) -> str | None:
+    """The envelope-from address msmtp sends this mail with. msmtp is
+    run with neither --account nor --from, so by its own rule that is
+    the `from` of the account named "default" -- of the user
+    configuration file if it defines one, else of the system one
+    (/etc/msmtprc); with no "default" account msmtp sends nothing, it
+    does not fall back to the first account. `path` reads that one file
+    only. None whenever the address cannot be told from the files: no
+    "default" account or no `from`, msmtp's %-substitutions or a
+    wildcard pattern in it, the obsolete auto_from, or an `eval` line.
+    The From header is then left to msmtp, which writes it from the
+    envelope-from (set_from_header auto)."""
+    configs = [path] if path is not None else [_msmtp_user_config(), MSMTP_SYSTEM_CONFIG]
+    for config in configs:
+        try:
+            accounts = _msmtp_accounts(config)
+        except ValueError:
+            return None
+        account = (accounts or {}).get("default")
+        if account is None:
+            continue
+        sender = account.get("from", "")
+        if (account.get("auto_from", "off") != "off" or not sender
+                or any(c in sender for c in "%*?[")):
+            return None
+        return sender
+    return None
 
 
 def add_envelope_headers(msg: EmailMessage, sender: str | None) -> None:
     """Date, Message-ID and From, which msmtp may or may not add itself
     (their absence counts against a message with spam filters). From is
-    the address msmtp sends as, so the two agree."""
+    the address msmtp sends as (see main() for --from), so the two agree:
+    a From that differs from the envelope-from fails the SPF/DMARC
+    alignment receiving servers check."""
     msg["Date"] = formatdate(localtime=True)
     domain = sender.rpartition("@")[2] if sender and "@" in sender else None
     msg["Message-ID"] = make_msgid(idstring="station-health", domain=domain)
@@ -277,8 +323,10 @@ def main() -> int:
     p.add_argument("--no-stats", action="store_true",
                    help="skip the tide-model deviation section")
     p.add_argument("--from", dest="sender", default=os.environ.get("HEALTH_MAIL_FROM"),
-                   help="sender address for the From header (default: $HEALTH_MAIL_FROM, "
-                        "else the from address in ~/.msmtprc; none: no From header)")
+                   help="send as this address, in the From header and as msmtp's "
+                        "envelope-from (msmtp --from) (default: $HEALTH_MAIL_FROM; else the From "
+                        "header is the from of msmtp's \"default\" account, or none if that "
+                        "is not known, and msmtp adds it)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -330,7 +378,12 @@ def main() -> int:
             print(body)
             return 0
 
-        r = subprocess.run(["msmtp"] + args.to,
+        # An address given here is passed on as the envelope-from too:
+        # given only to the header, msmtp still sent as its default
+        # account's address and the two disagreed. One read from the
+        # msmtp configuration is what msmtp sends as already.
+        command = ["msmtp"] + ([f"--from={args.sender}"] if args.sender else [])
+        r = subprocess.run(command + args.to,
                            input=msg.as_bytes(), capture_output=True)
     if r.returncode != 0:
         sys.stderr.write(r.stderr.decode(errors="replace"))
