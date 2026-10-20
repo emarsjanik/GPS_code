@@ -541,6 +541,21 @@ class GnssRecordTests(unittest.TestCase):
                                            since=date(2026, 7, 1)), 0)
         self.assert_whole_record(date(2026, 12, 1), date(2027, 1, 2))
 
+    def test_status_names_the_gnssrefl_that_made_the_record(self):
+        results_range(self.refl, date(2026, 12, 1), date(2026, 12, 20))
+        with unittest.mock.patch.object(gr, "gnssrefl_version", return_value="4.1.5"):
+            self.assertEqual(self.night(), 0)
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+        self.assertEqual(st["gnssrefl_version"], "4.1.5")
+        # a failed update says so too
+        results_range(self.refl, date(2026, 12, 21), date(2026, 12, 22))
+        os.environ["FAKE_SUBDAILY"] = "silent"
+        with unittest.mock.patch.object(gr, "gnssrefl_version", return_value="4.2.3"):
+            self.night()
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+        self.assertFalse(st["ok"])
+        self.assertEqual(st["gnssrefl_version"], "4.2.3")
+
     def test_station_health_reports_the_record(self):
         sys.path.insert(0, str(ROOT / "diagnostics"))
         import station_health as sh

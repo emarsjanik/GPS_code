@@ -112,7 +112,7 @@ if python3 -c "import gnssrefl" >/dev/null 2>&1; then
     report_pass "gnssrefl importable (version $gnssrefl_version)"
 else
     report_fail "gnssrefl is not importable"
-    echo "         Run ./install.sh, or 'pip install gnssrefl' inside"
+    echo "         Run ./install.sh, or 'pip install gnssrefl==4.1.5' inside"
     echo "         the activated virtual environment."
 fi
 

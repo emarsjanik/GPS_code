@@ -80,7 +80,8 @@ HOW
 
   status   fit/record_status.json says how the last update went
            (diagnostics/station_health.py reports it in the daily mail),
-           including any year whose edit file subdaily did not write.
+           including any year whose edit file subdaily did not write,
+           and the gnssrefl version that ran.
 
 USAGE (process_and_plot.sh, every night)
 
@@ -438,10 +439,21 @@ def make_plan(refl_code, sta: str, settings: str, since: date | None = None,
 # Status (read by diagnostics/station_health.py)
 # ----------------------------------------------------------------
 
+def gnssrefl_version() -> str | None:
+    """The installed gnssrefl, so a status says which code made the record
+    (the output names this file relies on are those of 4.1.5)."""
+    try:
+        from importlib.metadata import version
+        return version("gnssrefl")
+    except Exception:
+        return None
+
+
 def write_status(files_dir: Path, **kw) -> None:
     fit_dir = files_dir / FIT_SUBDIR
     fit_dir.mkdir(parents=True, exist_ok=True)
     kw["time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kw.setdefault("gnssrefl_version", gnssrefl_version())
     write_atomic(fit_dir / STATUS_NAME, [json.dumps(kw, default=str, indent=1) + "\n"])
 
 
