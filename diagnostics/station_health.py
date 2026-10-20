@@ -411,6 +411,67 @@ def check_arc_stats(station_code: str) -> None:
 
 
 # ------------------------------------------------------------------
+# 2b''. Are the newest levels measured, or spline across a gap?
+#     gnssrefl's subdaily writes a level every 30 minutes wherever the
+#     arcs it kept are no more than 6 h apart, and fills spacings over
+#     5 h with straight-line fake data before fitting. Arcs drop out in
+#     rough seas (the 13 Oct 2026 gap), so a storm high tide can reach
+#     the public plot and the DEM as spline across a hole, or as that
+#     chord, with nothing to say so. gnss_record.py writes
+#     <sta>_spline_support.txt (per level: the hours to the nearest kept
+#     arc) and, for the newest 7 days, gap_support in
+#     record_status.json. WARN when more than GAP_SUPPORT_WARN_FRACTION
+#     of that week is over 2 h from any kept arc (with knots every 3 h,
+#     a gap the spline bridges rather than follows), or when any level
+#     of it lies in a kept-arc gap over 5 h (where the straight-line
+#     fill acts: synthetic tests of gnssrefl 4.1.5 put a high or low
+#     tide there 0.5-1.1 m off).
+# ------------------------------------------------------------------
+GAP_SUPPORT_WARN_FRACTION = 0.05   # of the week's ~336 levels: ~17, over 8 h
+
+
+def check_gap_support(station_code: str) -> None:
+    status = (PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+              / gnss_record.FIT_SUBDIR / gnss_record.STATUS_NAME)
+    try:
+        g = json.loads(status.read_text()).get("gap_support")
+    except (OSError, ValueError, AttributeError):
+        return
+    if not isinstance(g, dict) or not g.get("rows"):
+        return                              # no support file yet
+    name = g.get("file") or f"{station_code}_spline_support.txt"
+    try:
+        if g["unknown_rows"] >= g["rows"]:
+            record(WARN, "support", f"the newest {g['days']} days' water levels have no known "
+                                    f"support: subdaily left no {station_code}_<years>"
+                                    f"{gnss_record.KEPT_SUFFIX} in fit/ (a renamed gnssrefl "
+                                    f"output?), so {name} says nan")
+            return
+        summary = gnss_record.support_report(g)
+        many = g["unsupported_fraction"] > GAP_SUPPORT_WARN_FRACTION
+        fake = g["rows_in_gaps_over_5h"] > 0
+        gap_min_val = float(g.get("gap_min_val_hours") or gnss_record.GAP_MIN_VAL_H)
+    except (KeyError, TypeError, ValueError):
+        return
+    if not (many or fake):
+        record(OK, "support", summary)
+        return
+    fill = f"{gnss_record.FAKE_FILL_H:g}"
+    why = []
+    if many:
+        why.append(f"over {100 * GAP_SUPPORT_WARN_FRACTION:g} % of the week is spline across "
+                   f"gaps in the arcs, not measurement")
+    if fake:
+        why.append(f"gnssrefl fills gaps over {fill} h with straight-line fake data before "
+                   f"fitting, and a high or low tide there can be ~1 m off ("
+                   + (f"subdaily_gap_min_val {fill} in station.json leaves them out)"
+                      if gap_min_val > gnss_record.FAKE_FILL_H
+                      else "next to the newest arc, which gnssrefl's gap test never checks)"))
+    record(WARN, "support", f"{summary}: {'; '.join(why)}. Usually arcs lost in rough seas; "
+                            f"{name} lists the levels")
+
+
+# ------------------------------------------------------------------
 # 2c. Is the public plot being redrawn, and does the tide prediction
 #     cover it? process_and_plot.sh reports success when the 7-day plot
 #     fails, so a stale 7_day_plot.png is still uploaded and attached;
@@ -762,6 +823,7 @@ def main() -> int:
     check_processing_currency(station_code, since)
     check_water_level_record(station_code, since)
     check_arc_stats(station_code)
+    check_gap_support(station_code)
     check_public_plot(station_code)
     check_tide_coverage(station_code, d if isinstance(d, dict) else {})
     check_raw_backlog()

@@ -222,7 +222,10 @@ main result is gnssrefl's last plot, copied to
 night's gnssrefl output is in `fit/`). The water level itself, every
 year of it, is `products/refl_code/Files/<station>/<station>_spline_out.txt`
 (see `analysis_tools/gnss_record.py`); how the last nightly update went is
-in `fit/record_status.json`, and the daily health mail reports it.
+in `fit/record_status.json`, and the daily health mail reports it. Next
+to it, `<station>_spline_support.txt` gives for every level the hours to
+the nearest arc gnssrefl kept: a level far from any arc is the spline
+drawn across a gap in the data, not a measurement.
 
 ---
 

@@ -78,12 +78,36 @@ HOW
            fit/s3_upload_year_<year> for s3UploadTimeseries.sh, which
            re-uploads that year's months once.
 
+  support  A water level every 30 minutes is not a measurement every 30
+           minutes. subdaily writes a level wherever the arcs it kept to
+           the end (those within 3 sigma of its final spline) are no more
+           than gap_min_val (6 h) apart, and before fitting it replaces
+           every spacing over 5 h between arcs with straight-line fake
+           data (flipit3) -- so a level can lie hours from any arc, a
+           storm high tide drawn as a chord, and nothing in the spline
+           says so. <sta>_spline_support.txt, next to the record, has one
+           row per record row (the same MJD): the hours to the nearest
+           kept arc, the kept arcs within +-1 h, and the kept-arc gap the
+           row sits in -- subdaily drops a row exactly when that gap is
+           over gap_min_val (except next to the newest arc, which it never
+           tests), so the column also says what a smaller gap_min_val
+           would drop: the fit itself does not change. The kept arcs
+           are tonight's fit/<sta>_<years>_subdaily_edit.txt.withrhdotIF;
+           a frozen year keeps the support it was frozen with in
+           <sta>_<year>_spline_support_frozen.txt (a year frozen before
+           this file existed: "nan", not known). station.json's optional
+           "subdaily_gap_min_val" (hours) is passed to subdaily as
+           -gap_min_val, with the fallback settings too; unset, gnssrefl's
+           6 h applies. Changing it refits the frozen years once.
+
   status   fit/record_status.json says how the last update went
            (diagnostics/station_health.py reports it in the daily mail),
            including any year whose edit file subdaily did not write,
-           the gnssrefl version that ran, and per UTC day of the last
+           the gnssrefl version that ran, per UTC day of the last
            two weeks the arcs kept with their median Amp and PkNoise
-           (arc_stats; a storm shows as a drop).
+           (arc_stats; a storm shows as a drop), and gap_support: of the
+           newest 7 days' levels (the public plot's week), how many are
+           more than 2 h from a kept arc.
 
 USAGE (process_and_plot.sh, every night)
 
@@ -95,7 +119,8 @@ USAGE (process_and_plot.sh, every night)
 By hand (gnssrefl_venv active; --refl-code defaults to $REFL_CODE, else
 products/refl_code of this project), e.g. to accept a record that lost
 days on purpose -- the same settings as process_and_plot.sh, or the
-frozen years are refitted:
+frozen years are refitted (subdaily_gap_min_val is added from
+station.json here too):
 
     cd /home/argus_user/GNSS/v4.1 && source gnssrefl_venv/bin/activate
     python3 analysis_tools/gnss_record.py --refl-code products/refl_code \\
@@ -106,9 +131,11 @@ frozen years are refitted:
 from __future__ import annotations
 
 import argparse
+import bisect
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -134,6 +161,13 @@ AZ_COL = 5               # gnssir results: year doy RH sat UTC Azim ...
 AMP_COL = 6              # ... Amp eminO emaxO NumbOf freq rise EdotF PkNoise ...
 PKNOISE_COL = 13
 ARC_STATS_DAYS = 14      # days of arc statistics kept in record_status.json
+KEPT_SUFFIX = "_subdaily_edit.txt.withrhdotIF"   # subdaily's arcs kept to the end
+MJD_COL = 15             # ... their MJD column (as in the results)
+SUPPORT_HALF_WINDOW_H = 1.0   # kept arcs counted within +-1 h of each level
+UNSUPPORTED_H = 2.0      # a level further than this from every kept arc is unsupported
+SUPPORT_DAYS = 7         # gap_support in the status: the newest 7 days, as the public plot
+FAKE_FILL_H = 5.0        # gnssrefl 4.1.5 flipit3 fills spacings over 5 h with fake data
+GAP_MIN_VAL_H = 6.0      # gnssrefl 4.1.5's -gap_min_val
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 STATION_JSON = PROJECT_DIR / "station" / "resources" / "station.json"
 
@@ -161,6 +195,54 @@ def record_first_day(station_json: Path | str = STATION_JSON) -> date | None:
     except (OSError, ValueError, AttributeError):
         return None
     return date.fromisoformat(str(value)) if value else None
+
+
+def parse_gap_min_val(value) -> float | None:
+    """A "subdaily_gap_min_val" value: None when unset, else a positive
+    number of hours; anything else raises ValueError."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{value!r} is not a number of hours")
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{value!r} is not a number of hours") from None
+    if not (math.isfinite(hours) and hours > 0):
+        raise ValueError(f"{value!r} is not a positive number of hours")
+    return hours
+
+
+def subdaily_gap_min_val(station_json: Path | str = STATION_JSON) -> float | None:
+    """station.json's optional "subdaily_gap_min_val" (hours): passed to
+    subdaily as -gap_min_val, the longest spacing of kept arcs it still
+    draws a level across. Unset (or no station.json): None, and gnssrefl's
+    own 6 h applies. Lowering it to 5 h drops the stretches gnssrefl fills
+    with straight-line fake data before fitting (flipit3: spacings over
+    5 h; "support" in this file's docstring). A value that is not a
+    positive number raises ValueError."""
+    try:
+        cfg = json.loads(Path(station_json).read_text())
+    except (OSError, ValueError):
+        return None
+    return parse_gap_min_val(cfg.get("subdaily_gap_min_val")) if isinstance(cfg, dict) else None
+
+
+def with_gap_min_val(settings: str | None, hours: float | None) -> str | None:
+    """These subdaily settings with -gap_min_val <hours> added -- unless
+    hours is None, or they give one already (that one is used)."""
+    if hours is None or not settings or "-gap_min_val" in shlex.split(settings):
+        return settings
+    return f"{settings} -gap_min_val {hours:g}"
+
+
+def gap_min_val_hours(settings: str) -> float:
+    """The -gap_min_val (hours) these subdaily settings run with."""
+    a = shlex.split(settings or "")
+    try:
+        return float(a[a.index("-gap_min_val") + 1])
+    except (ValueError, IndexError):
+        return GAP_MIN_VAL_H
 
 
 # ----------------------------------------------------------------
@@ -358,6 +440,190 @@ def frozen_ok(path: Path, settings: str, fp: str) -> bool:
 
 
 # ----------------------------------------------------------------
+# Gap support: how far each level is from the arcs under it
+# ----------------------------------------------------------------
+#
+# subdaily is the RHdot-corrected cubic spline of Larson, Ray & Williams
+# (2017, J. Atmos. Oceanic Technol. 34, 295-307) as gnssrefl implements
+# it (Larson 2024, GPS Solutions 28, 165). In 4.1.5 (rhdot_correction2)
+# the final spline is fitted to the arcs left after the first 3-sigma
+# pass, with every spacing over 5 h first filled with straight-line fake
+# points an hour apart (sd_libs.flipit3; the first real arc after each
+# such gap is left out of the fit too). The arcs within 3 sigma of that
+# spline are the "kept" ones: written to <...>_subdaily_edit.txt
+# .withrhdotIF and given to the gap test, which leaves out the 30-minute
+# levels strictly inside any spacing of kept arcs over gap_min_val
+# (sd_libs.RH_ortho_plot2) -- except the spacing before the last kept
+# arc, which it never tests. With knots every 3 h (-knots 8), a level
+# more than 2 h from the nearest kept arc sits in a gap longer than a
+# knot interval: the spline there is set by its continuity with the data
+# either side (and, over 5 h, by the fake chord), not by a measurement.
+# In synthetic tests of the 4.1.5 code (20 Oct 2026), a 5-6 h gap at high
+# or low water that survived the 3-sigma pass was drawn 0.5-1.1 m off.
+
+SUPPORT_HEAD = [
+    "%  hours_to_arc: hours from this level to the nearest arc subdaily kept (within 3 sigma of\n",
+    "%  its final spline); arcs_1h: kept arcs within +-1 h; gap_h: hours between the kept arcs\n",
+    "%  either side (0 on an arc, nan before the first or after the last). subdaily leaves out\n",
+    "%  the levels with gap_h over gap_min_val (6 h unless -gap_min_val), except next to the last\n",
+    "%  arc, and fills spacings over 5 h with straight-line fake data before fitting. All three\n",
+    "%  nan: not known (a year frozen before this file existed, or no kept-arc file).\n",
+    "%  MJD              YYYY  MM  DD  HH  MM  SS  hours_to_arc  arcs_1h     gap_h\n",
+    "%  (1)               (2)   (3) (4) (5) (6) (7)          (8)      (9)      (10)\n",
+]
+
+
+def support_path(files_dir: Path, sta: str) -> Path:
+    return files_dir / f"{sta}_spline_support.txt"
+
+
+def frozen_support_path(files_dir: Path, sta: str, year: int) -> Path:
+    return files_dir / f"{sta}_{year}_spline_support_frozen.txt"
+
+
+def kept_arcs(fit_dir: Path, sta: str) -> list[float] | None:
+    """MJDs, sorted, of the arcs subdaily kept to the end of the run whose
+    output is in fit_dir (fit/<sta>_<years>_subdaily_edit.txt.withrhdotIF).
+    None when it wrote no such file, or one without arcs."""
+    found = sorted(fit_dir.glob(f"{sta}_*{KEPT_SUFFIX}"), key=lambda p: p.stat().st_mtime)
+    if not found:
+        return None
+    out = []
+    for s in _data_lines(found[-1]):
+        try:
+            out.append(float(s.split()[MJD_COL]))
+        except (IndexError, ValueError):
+            continue
+    return sorted(out) or None
+
+
+def row_support(m: float, arcs: list[float]) -> tuple[float, int, float]:
+    """(hours to the nearest kept arc, kept arcs within +-1 h, hours
+    between the kept arcs either side) for a level at MJD m; arcs sorted.
+    The gap is 0 on an arc and nan outside the first..last arc."""
+    eps = 1e-7                                         # days, ~0.01 s
+    i = bisect.bisect_left(arcs, m - eps)
+    before = arcs[i - 1] if i > 0 else None
+    after = arcs[i] if i < len(arcs) else None
+    near = min(abs(x - m) for x in (before, after) if x is not None) * 24
+    w = SUPPORT_HALF_WINDOW_H / 24
+    n = bisect.bisect_right(arcs, m + w + eps) - bisect.bisect_left(arcs, m - w - eps)
+    if after is not None and abs(after - m) <= eps:
+        gap = 0.0
+    elif before is not None and after is not None:
+        gap = (after - before) * 24
+    else:
+        gap = float("nan")
+    return near, n, gap
+
+
+def support_lines(lines, arcs: list[float] | None) -> list[str]:
+    """One support line per spline data line (its MJD and time as written);
+    all "nan" when the kept arcs are not known."""
+    out = []
+    for line in lines:
+        c = line.split()
+        key = f"{c[0]:>15} {c[2]:>4} {c[3]:>3} {c[4]:>3} {c[5]:>3} {c[6]:>3} {c[7]:>3}"
+        if arcs:
+            near, n, gap = row_support(float(c[0]), arcs)
+            out.append(f"{key} {near:12.2f} {n:8d} {gap:9.2f}\n")
+        else:
+            out.append(f"{key} {'nan':>12} {'nan':>8} {'nan':>9}\n")
+    return out
+
+
+def support_text(sta: str, settings: str, note: str, lines: list[str],
+                 results: str | None = None) -> list[str]:
+    """A support file: header (the settings, for a frozen year also its
+    results line, so it is only used with the frozen file it was made
+    with), then the lines."""
+    return ([f"%  station {sta}: support of each level of {sta}_spline_out.txt by the arcs "
+             f"subdaily kept\n", f"{SETTINGS_TAG} {settings}\n"]
+            + ([f"{RESULTS_TAG} {results}\n"] if results else [])
+            + [f"%  {note} (analysis_tools/gnss_record.py)\n"] + SUPPORT_HEAD + lines)
+
+
+def read_support(path: Path) -> tuple[list[str], list[str]]:
+    """(header lines, data lines) of a support file."""
+    head, lines = [], []
+    with open(path, errors="replace") as f:
+        for line in f:
+            if line.startswith("%"):
+                if not lines:
+                    head.append(line)
+            elif len(line.split()) >= 10:
+                lines.append(line if line.endswith("\n") else line + "\n")
+    return head, lines
+
+
+def frozen_support(files_dir: Path, sta: str, year: int, frozen_head: list[str]) -> dict:
+    """{MJD as written: support line} of a frozen year, from the file
+    written when it was frozen -- if it was written together with that
+    frozen file (the same settings and results line), else {}."""
+    try:
+        head, lines = read_support(frozen_support_path(files_dir, sta, year))
+    except OSError:
+        return {}
+    for tag in (SETTINGS_TAG, RESULTS_TAG):
+        if header_value(head, tag) != header_value(frozen_head, tag):
+            return {}
+    return {line.split()[0]: line for line in lines}
+
+
+def support_summary(path: Path, days: int = SUPPORT_DAYS) -> dict | None:
+    """gap_support for record_status.json: the levels of the newest `days`
+    days of a support file (counted back from its newest level, as
+    plot_7day.py chooses its window) that are more than UNSUPPORTED_H from
+    every kept arc, how many lie in kept-arc gaps over FAKE_FILL_H, and how
+    many 30-minute levels are missing (left out by subdaily: gaps over
+    gap_min_val). None for a file without levels; OSError if there is no
+    file."""
+    head, lines = read_support(path)
+    rows = []
+    for line in lines:
+        c = line.split()
+        try:
+            rows.append((float(c[0]), float(c[7]), float(c[9]), c))
+        except (IndexError, ValueError):
+            continue
+    if not rows:
+        return None
+    week = [r for r in rows if r[0] >= rows[-1][0] - days - 1e-6]
+    known = [r for r in week if not math.isnan(r[1])]
+    bad = [r for r in known if r[1] > UNSUPPORTED_H]
+
+    def when(c):
+        return f"{c[1]}-{int(c[2]):02d}-{int(c[3]):02d} {int(c[4]):02d}:{int(c[5]):02d}"
+
+    return {"file": path.name, "days": days, "from": when(week[0][3]), "to": when(week[-1][3]),
+            "rows": len(week), "unknown_rows": len(week) - len(known),
+            "missing_rows": max(0, round((week[-1][0] - week[0][0]) * 48) + 1 - len(week)),
+            "unsupported_hours": UNSUPPORTED_H, "unsupported_rows": len(bad),
+            "unsupported_fraction": round(len(bad) / len(known), 4) if known else None,
+            "max_hours_to_arc": round(max(r[1] for r in known), 2) if known else None,
+            "rows_in_gaps_over_5h": sum(1 for r in known if r[2] > FAKE_FILL_H),
+            "gap_min_val_hours": gap_min_val_hours(header_value(head, SETTINGS_TAG) or "")}
+
+
+def support_report(g: dict | None) -> str:
+    """One line for the nightly output and the health mail."""
+    if not g:
+        return "no levels"
+    if g["unknown_rows"] >= g["rows"]:
+        return f"not known for the newest {g['days']} days (no kept arcs)"
+    known = g["rows"] - g["unknown_rows"]
+    s = (f"newest {g['days']} days: {g['unsupported_rows']} of {known} levels "
+         f"({100 * g['unsupported_fraction']:.1f} %) more than {g['unsupported_hours']:g} h "
+         f"from any kept arc (longest {g['max_hours_to_arc']:g} h)")
+    if g["rows_in_gaps_over_5h"]:
+        s += f"; {g['rows_in_gaps_over_5h']} in kept-arc gaps over {FAKE_FILL_H:g} h"
+    if g.get("missing_rows"):
+        s += (f"; {g['missing_rows']} left out (kept-arc gaps over "
+              f"{g['gap_min_val_hours']:g} h)")
+    return s
+
+
+# ----------------------------------------------------------------
 # Tonight's plan
 # ----------------------------------------------------------------
 
@@ -502,6 +768,16 @@ def write_status(files_dir: Path, **kw) -> None:
         except Exception as exc:     # a status must still be written
             kw["arc_stats"] = []
             kw["arc_stats_error"] = str(exc)
+    if "gap_support" not in kw:
+        # of the support file on disk: the one of the record on disk, also
+        # when tonight's update failed and left last night's in place
+        try:
+            kw["gap_support"] = support_summary(support_path(files_dir, files_dir.name))
+        except OSError:
+            kw["gap_support"] = None
+        except Exception as exc:
+            kw["gap_support"] = None
+            kw["gap_support_error"] = str(exc)
     write_atomic(fit_dir / STATUS_NAME, [json.dumps(kw, default=str, indent=1) + "\n"])
 
 
@@ -516,6 +792,7 @@ class ThinFit:
     rows: list          # [(MJD, data line)] of that year
     used: str           # the settings that worked
     edit: str | None    # its <sta>_<year>_subdaily_edit.txt, if subdaily wrote one
+    arcs: list | None = None    # MJDs of the arcs that fit kept (kept_arcs)
 
 
 def compose(plan: Plan, files_dir: Path, sta: str, settings: str, freeze: bool = True,
@@ -546,23 +823,31 @@ def compose(plan: Plan, files_dir: Path, sta: str, settings: str, freeze: bool =
         return fail(f"the fit ({span}) does not cover {need_from}..{plan.end}")
     h_fit = header_hortho(head)
     eps = 1e-6
+    arcs = kept_arcs(fit_dir, sta)        # tonight's kept arcs: the support of its levels
 
     def rows_of(year, rows_):
         lo, hi = mjd(date(year, 1, 1)) - eps, mjd(date(year + 1, 1, 1)) - eps
         return [line for m, line in rows_ if lo <= m < hi]
 
-    body, parts = [], []
+    # the record and, line for line, its support
+    body, support, parts = [], [], []
     for y in plan.frozen:
         fh, frows = read_spline(frozen_path(files_dir, sta, y))
         h_y = header_hortho(fh)
-        body += [rehortho(line, h_y, h_fit) for line in rows_of(y, frows)]
+        lines = rows_of(y, frows)
+        body += [rehortho(line, h_y, h_fit) for line in lines]
+        known = frozen_support(files_dir, sta, y, fh)
+        support += [known.get(line.split()[0]) or support_lines([line], None)[0] for line in lines]
         parts.append(f"{y} frozen")
     for y, tf in thin_fits.items():
         h_y = header_hortho(tf.head)
         body += [rehortho(line, h_y, h_fit) for _, line in tf.rows]
+        support += support_lines([line for _, line in tf.rows], tf.arcs)
         parts.append(f"{y} frozen (fitted by itself with '{tf.used}': {plan.thin[y]} arc(s) "
                      f"in the azimuth window)")
-    body += [line for m, line in rows if m >= live_from - eps]
+    live_rows = [line for m, line in rows if m >= live_from - eps]
+    body += live_rows
+    support += support_lines(live_rows, arcs)
     parts.append(f"from {need_from} the fit of {plan.start}..{plan.end}")
     if used.split() != settings.split():
         parts.append(f"FALLBACK settings '{used}' (not frozen)")
@@ -592,11 +877,17 @@ def compose(plan: Plan, files_dir: Path, sta: str, settings: str, freeze: bool =
     # ---- freeze (from tonight's fit, so tomorrow's record equals tonight's) ----
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     frozen_now = []
+    # a frozen year's support goes first: a frozen file without it (a power
+    # cut in between) would be used with its support never known
     for y, tf in thin_fits.items():       # a fit of that year alone: final now
+        lines = [line for _, line in tf.rows]
+        note = (f"{y} frozen {stamp} from a fit of {y} by itself with '{tf.used}' "
+                f"({plan.thin[y]} arc(s) in the azimuth window)")
+        write_atomic(frozen_support_path(files_dir, sta, y),
+                     support_text(sta, settings, note, support_lines(lines, tf.arcs),
+                                  f"{plan.fp[y]} rows {len(lines)}"))
         write_atomic(frozen_path(files_dir, sta, y),
-                     frozen_text(tf.head, settings, plan.fp[y], [line for _, line in tf.rows],
-                                 f"{y} frozen {stamp} from a fit of {y} by itself with "
-                                 f"'{tf.used}' ({plan.thin[y]} arc(s) in the azimuth window)"))
+                     frozen_text(tf.head, settings, plan.fp[y], lines, note))
         if tf.edit is not None:
             write_atomic(files_dir / f"{sta}_{y}_subdaily_edit.txt", [tf.edit])
         (fit_dir / f"{UPLOAD_MARK}{y}").touch()
@@ -607,9 +898,12 @@ def compose(plan: Plan, files_dir: Path, sta: str, settings: str, freeze: bool =
             yr = rows_of(y, rows)
             if not yr:
                 continue
+            note = f"{y} frozen {stamp} from the fit of {plan.start}..{plan.end}"
+            write_atomic(frozen_support_path(files_dir, sta, y),
+                         support_text(sta, settings, note, support_lines(yr, arcs),
+                                      f"{plan.fp[y]} rows {len(yr)}"))
             write_atomic(frozen_path(files_dir, sta, y),
-                         frozen_text(head, settings, plan.fp[y], yr,
-                                     f"{y} frozen {stamp} from the fit of {plan.start}..{plan.end}"))
+                         frozen_text(head, settings, plan.fp[y], yr, note))
             (fit_dir / f"{UPLOAD_MARK}{y}").touch()
             frozen_now.append(y)
             print(f"  froze {y}: {frozen_path(files_dir, sta, y).name}")
@@ -617,6 +911,12 @@ def compose(plan: Plan, files_dir: Path, sta: str, settings: str, freeze: bool =
     write_atomic(record, head[:1]
                  + [f"%  record: {'; '.join(parts)} (analysis_tools/gnss_record.py)\n"]
                  + head[1:] + body)
+    # its support, one line per level, right after it (a reader joins on the MJD)
+    write_atomic(support_path(files_dir, sta),
+                 support_text(sta, used, f"record: {'; '.join(parts)}", support))
+    if arcs is None:
+        print(f"  WARNING: subdaily wrote no {sta}_<years>{KEPT_SUFFIX} -- the support of "
+              f"tonight's levels is not known ({support_path(files_dir, sta).name}: nan)")
 
     # the edit files of the years tonight's fit covers in full; one that
     # subdaily did not write (a renamed gnssrefl output, say) is reported,
@@ -646,12 +946,19 @@ def compose(plan: Plan, files_dir: Path, sta: str, settings: str, freeze: bool =
               f"a year is not being frozen (see {STATUS_NAME})")
 
     first, last = min(new_dates), max(new_dates)
+    try:
+        gap = {"gap_support": support_summary(support_path(files_dir, sta))}
+    except Exception:
+        gap = {}                          # write_status tries again and says why
     write_status(files_dir, ok=True, fallback=used.split() != settings.split(), settings=used,
                  record_first=first, record_last=last, fit_start=plan.start, fit_end=plan.end,
                  live_from=live, newest_results=plan.newest, frozen=plan.frozen + frozen_now,
                  missing_edit=missing_edit, first_day=plan.since, notes=plan.notes,
-                 message="; ".join(parts))
+                 message="; ".join(parts), **gap)
     print(f"  record: {len(body)} readings, {first} to {last} UTC ({'; '.join(parts)})")
+    if gap:
+        print(f"  support: {support_report(gap['gap_support'])} "
+              f"({support_path(files_dir, sta).name})")
     return 0
 
 
@@ -717,7 +1024,8 @@ def fit_thin_year(plan: Plan, year: int, files_dir: Path, sta: str, tries) -> Th
             print(f"  the fit of {year} does not cover {days[0]}..{days[-1]}")
             continue
         edit = fit_dir / f"{sta}_{year}_subdaily_edit.txt"
-        return ThinFit(head, rows, s, edit.read_text(errors="replace") if edit.exists() else None)
+        return ThinFit(head, rows, s, edit.read_text(errors="replace") if edit.exists() else None,
+                       kept_arcs(fit_dir, sta))       # before the next run clears fit/
     return None
 
 
@@ -826,7 +1134,9 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("summary", help="list the results days (exit 3 if none)")
     u = sub.add_parser("update", help="fit, freeze and write the record")
-    u.add_argument("--settings", required=True, help="subdaily options, e.g. \"-rhdot True -knots 8\"")
+    u.add_argument("--settings", required=True,
+                   help="subdaily options, e.g. \"-rhdot True -knots 8\"; station.json's "
+                        "subdaily_gap_min_val is added as -gap_min_val unless they give one")
     u.add_argument("--fallback-settings", help="tried if the first fit fails; never frozen")
     u.add_argument("--allow-shrink", action="store_true",
                    help="accept a record that starts later, or covers fewer days, than the current one")
@@ -840,7 +1150,19 @@ def main() -> int:
             p.error(f"gnss_record_first_day in {a.station_json}: {exc}")
     if a.cmd == "summary":
         return cmd_summary(refl_code, a.station, since)
-    return cmd_update(refl_code, a.station, a.settings, a.fallback_settings, a.allow_shrink, since)
+    try:
+        gap = subdaily_gap_min_val(a.station_json)
+    except ValueError as exc:
+        # said in the status too, so the health mail names it
+        msg = f"subdaily_gap_min_val in {a.station_json}: {exc}"
+        write_status(Path(refl_code) / "Files" / a.station, ok=False, message=msg)
+        p.error(msg)
+    settings = with_gap_min_val(a.settings, gap)
+    fallback = with_gap_min_val(a.fallback_settings, gap)
+    if gap is not None and settings != a.settings:
+        print(f"  subdaily_gap_min_val {gap:g} h (station.json): -gap_min_val {gap:g} added "
+              f"to the subdaily settings")
+    return cmd_update(refl_code, a.station, settings, fallback, a.allow_shrink, since)
 
 
 if __name__ == "__main__":
