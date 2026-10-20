@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -162,11 +163,225 @@ class TestTideCoverage(HealthTest):
         # cron runs station_health.py under the system python, which may
         # not have openpyxl: the xlsx is then read directly.
         path = self.write_tide(datetime(2026, 10, 1, 0, 0), datetime(2026, 10, 31, 12, 0))
-        expected = sh._xlsx_column_range(path, "time")
-        got = sh._xlsx_column_range_stdlib(path, "time")
-        self.assertEqual(expected, (datetime(2026, 10, 1), datetime(2026, 10, 31, 12)))
-        self.assertEqual([abs((g - e).total_seconds()) < 1 for g, e in zip(got, expected)],
-                         [True, True])
+        expected = sh._tide_times(path, "time", "tide_m")
+        got = sh._tide_times_stdlib(path, "time", "tide_m")
+        self.assertEqual((expected[0], expected[-1]),
+                         (datetime(2026, 10, 1), datetime(2026, 10, 31, 12)))
+        self.assertEqual(got, expected)
+
+    def test_times_without_a_tide_value_do_not_count(self) -> None:
+        # plot_7day.load_tide draws a row only if its value is a number:
+        # a sheet whose times run on past its values ends where the
+        # values end.
+        path = self.write_tide(datetime(2026, 10, 1), datetime(2026, 10, 31))
+        wb = openpyxl.load_workbook(path)
+        for row in wb.active.iter_rows(min_row=2):
+            if row[0].value >= datetime(2026, 10, 15):
+                row[1].value = None
+        wb.save(path)
+        self.write_spline(datetime(2026, 10, 19, 23, 30))
+        sh.check_tide_coverage(STA, self.cfg())
+        (status, message), = self.findings("tide")
+        self.assertEqual(status, "WARN")
+        self.assertIn("ends 2026-10-14 23:50", message)
+
+    def test_renamed_value_column_warns(self) -> None:
+        # The plot finds no tide_m column and draws no tide.
+        self.write_spline(datetime(2026, 10, 19, 23, 30))
+        self.write_tide(datetime(2026, 10, 1), datetime(2026, 10, 31))
+        cfg = dict(self.cfg(), tide_model_value_column="EOT20_heightm")
+        sh.check_tide_coverage(STA, cfg)
+        (status, message), = self.findings("tide")
+        self.assertEqual(status, "WARN")
+        self.assertIn("no 'EOT20_heightm' column", message)
+
+    def test_value_column_not_set_warns(self) -> None:
+        self.write_tide(datetime(2026, 10, 1), datetime(2026, 10, 31))
+        sh.check_tide_coverage(STA, {"tide_model_file": str(self.proj / "tides.xlsx")})
+        (status, message), = self.findings("tide")
+        self.assertEqual(status, "WARN")
+        self.assertIn("tide_model_value_column", message)
+
+    def test_hole_inside_the_window_warns(self) -> None:
+        # Two predictions joined (merge_tide_files.py) span the window
+        # but leave part of it without a tide.
+        self.write_spline(datetime(2026, 10, 19, 23, 30))
+        path = self.write_tide(datetime(2026, 10, 1), datetime(2026, 10, 31))
+        wb = openpyxl.load_workbook(path)
+        ws = wb.active
+        for row in list(ws.iter_rows(min_row=2)):
+            if datetime(2026, 10, 16, 6) < row[0].value < datetime(2026, 10, 16, 18):
+                row[1].value = None
+        wb.save(path)
+        sh.check_tide_coverage(STA, self.cfg())
+        (status, message), = self.findings("tide")
+        self.assertEqual(status, "WARN")
+        self.assertIn("no predicted tide from 2026-10-16 06:00 to 2026-10-16 18:00", message)
+
+    def test_stated_dimension_is_not_trusted(self) -> None:
+        # openpyxl's read_only mode reads only as far as the sheet's
+        # <dimension> says, and some writers state A1:A1; load_tide
+        # (not read-only) reads every row.
+        path = self.write_tide(datetime(2026, 10, 1), datetime(2026, 10, 31))
+        with zipfile.ZipFile(path) as z:
+            parts = {n: z.read(n) for n in z.namelist()}
+        sheet = parts["xl/worksheets/sheet1.xml"].decode()
+        start = sheet.index("<dimension ref=")
+        end = sheet.index("/>", start) + 2
+        parts["xl/worksheets/sheet1.xml"] = (
+            sheet[:start] + '<dimension ref="A1:B2"/>' + sheet[end:]).encode()
+        with zipfile.ZipFile(path, "w") as z:
+            for name, data in parts.items():
+                z.writestr(name, data)
+        times = sh._tide_times(path, "time", "tide_m")
+        self.assertEqual((times[0], times[-1]), (datetime(2026, 10, 1), datetime(2026, 10, 31)))
+
+
+# A minimal xlsx written by hand, for the layouts openpyxl does not write
+# but other spreadsheet programs do. Cells are given as XML.
+_CT = ('<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/'
+       'package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.'
+       'openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="'
+       'application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.'
+       'openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/'
+       'worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.'
+       'spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="'
+       'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>{shared}'
+       '</Types>')
+_CT_SHARED = ('<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.'
+              'openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>')
+_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_STYLES = (f'<styleSheet xmlns="{_MAIN}"><numFmts count="1"><numFmt numFmtId="164" '
+           'formatCode="yyyy\\-mm\\-dd\\ hh:mm"/></numFmts><fonts count="1"><font><sz val="11"/>'
+           '</font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill>'
+           '<patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/>'
+           '<right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf '
+           'numFmtId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="164" '
+           'applyNumberFormat="1"/><xf numFmtId="22" applyNumberFormat="1"/></cellXfs></styleSheet>')
+
+
+def write_xlsx(path: Path, rows: list, date1904: bool = False, shared: list | None = None) -> Path:
+    rels = [f'<Relationship Id="rId1" Type="{_REL}/worksheet" Target="worksheets/sheet1.xml"/>',
+            f'<Relationship Id="rId2" Type="{_REL}/styles" Target="styles.xml"/>']
+    if shared is not None:
+        rels.append(f'<Relationship Id="rId3" Type="{_REL}/sharedStrings" '
+                    f'Target="sharedStrings.xml"/>')
+    pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml", _CT.format(shared=_CT_SHARED if shared is not None else ""))
+        z.writestr("_rels/.rels", f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" '
+                                  f'Type="{_REL}/officeDocument" Target="xl/workbook.xml"/>'
+                                  f'</Relationships>')
+        z.writestr("xl/workbook.xml", f'<workbook xmlns="{_MAIN}" xmlns:r="{_REL}">'
+                                      + ('<workbookPr date1904="1"/>' if date1904 else "")
+                                      + '<sheets><sheet name="tide" sheetId="1" r:id="rId1"/>'
+                                        '</sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels", f'<Relationships xmlns="{pkg}">'
+                                                 + "".join(rels) + "</Relationships>")
+        z.writestr("xl/styles.xml", _STYLES)
+        if shared is not None:
+            z.writestr("xl/sharedStrings.xml", f'<sst xmlns="{_MAIN}">' + "".join(shared) + "</sst>")
+        z.writestr("xl/worksheets/sheet1.xml", f'<worksheet xmlns="{_MAIN}"><sheetData>'
+                                               + "".join(rows) + "</sheetData></worksheet>")
+    return path
+
+
+def header(time_col: str = "time", value_col: str = "tide_m") -> str:
+    return (f'<row r="1"><c r="A1" t="inlineStr"><is><t>{time_col}</t></is></c>'
+            f'<c r="B1" t="inlineStr"><is><t>{value_col}</t></is></c></row>')
+
+
+def row(r: int, serial: float, value: float = 0.5, style: int = 1) -> str:
+    return f'<row r="{r}"><c r="A{r}" s="{style}"><v>{serial}</v></c><c r="B{r}"><v>{value}</v></c></row>'
+
+
+# 46314 is 2026-10-19 in Excel's usual 1900 date system; 1462 days less in 1904's
+OCT19 = 46314
+
+
+class TestTideReaderVariants(unittest.TestCase):
+    """The xlsx reader for a python without openpyxl reads what openpyxl
+    (and so plot_7day.load_tide) reads, on layouts other programs write."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def read(self, rows: list, **kw) -> list:
+        path = write_xlsx(self.dir / "t.xlsx", rows, **kw)
+        got = sh._tide_times_stdlib(path, "time", "tide_m")
+        if openpyxl is not None:
+            self.assertEqual(got, sh._tide_times(path, "time", "tide_m"))
+        return got
+
+    def test_1904_date_system(self) -> None:
+        # Older Mac Excel counts from 1904-01-01; read from 1899-12-30
+        # every time came out four years and a day early.
+        got = self.read([header(), row(2, OCT19 - 1462), row(3, OCT19 - 1462 + 1.5)],
+                        date1904=True)
+        self.assertEqual(got, [datetime(2026, 10, 19), datetime(2026, 10, 20, 12)])
+
+    def test_a_number_is_a_date_only_with_a_date_format(self) -> None:
+        # The same serial in a cell with no date format is a plain number
+        # to openpyxl, and the plot draws no tide at it.
+        got = self.read([header(), row(2, OCT19, style=0), row(3, OCT19 + 0.25, style=2)])
+        self.assertEqual(got, [datetime(2026, 10, 19, 6)])
+
+    def test_cells_without_a_reference(self) -> None:
+        # The r attribute is optional; a cell without one takes the next
+        # column, a row without one the next row.
+        rows = ['<row><c t="inlineStr"><is><t>time</t></is></c><c t="inlineStr"><is><t>tide_m'
+                '</t></is></c></row>',
+                f'<row><c s="1"><v>{OCT19}</v></c><c><v>0.5</v></c></row>',
+                f'<row><c s="1"><v>{OCT19 + 1}</v></c><c><v>0.7</v></c></row>']
+        self.assertEqual(self.read(rows), [datetime(2026, 10, 19), datetime(2026, 10, 20)])
+
+    def test_shared_strings_with_rich_text_and_phonetic_runs(self) -> None:
+        shared = ['<si><r><t>ti</t></r><r><t>me</t></r><rPh sb="0" eb="1"><t>X</t></rPh></si>',
+                  '<si><t>tide_m</t></si>']
+        rows = ['<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>',
+                row(2, OCT19)]
+        self.assertEqual(self.read(rows, shared=shared), [datetime(2026, 10, 19)])
+
+    def test_iso_date_cells(self) -> None:
+        rows = [header(),
+                '<row r="2"><c r="A2" t="d"><v>2026-10-19T00:00:00</v></c><c r="B2"><v>0.5</v></c></row>',
+                '<row r="3"><c r="A3" t="d"><v>2026-10-20</v></c><c r="B3"><v>0.5</v></c></row>']
+        self.assertEqual(self.read(rows), [datetime(2026, 10, 19)])
+
+    def test_values_that_are_not_numbers_do_not_count(self) -> None:
+        rows = [header(), row(2, OCT19),
+                f'<row r="3"><c r="A3" s="1"><v>{OCT19 + 1}</v></c><c r="B3" t="str"><v>n/a</v></c></row>',
+                f'<row r="4"><c r="A4" s="1"><v>{OCT19 + 2}</v></c><c r="B4" t="e"><v>#N/A</v></c></row>',
+                f'<row r="5"><c r="A5" s="1"><v>{OCT19 + 3}</v></c><c r="B5"><f>B2</f></c></row>']
+        self.assertEqual(self.read(rows), [datetime(2026, 10, 19)])
+
+    def test_header_must_be_row_one(self) -> None:
+        # load_tide reads the header from ws[1]: a header in row 2 gives
+        # no tide on the plot, so it must not read as covered.
+        rows = [header().replace('r="1"', 'r="2"').replace('A1', 'A2').replace('B1', 'B2'),
+                row(3, OCT19)]
+        with self.assertRaises(ValueError):
+            self.read(rows)
+
+
+class TestTideCoverageWithoutOpenpyxl(HealthTest):
+    """The whole check as cron's system python runs it, with no openpyxl."""
+
+    def test_1904_workbook_covering_the_window_is_ok(self) -> None:
+        self.write_spline(datetime(2026, 10, 19, 23, 30))
+        rows = [header()] + [row(k + 2, OCT19 - 1462 - 20 + k / 24) for k in range(24 * 32)]
+        path = write_xlsx(self.proj / "tides.xlsx", rows, date1904=True)
+        with unittest.mock.patch.dict(sys.modules, {"openpyxl": None}):
+            sh.check_tide_coverage(STA, {"tide_model_file": str(path),
+                                         "tide_model_value_column": "tide_m"})
+        (status, message), = self.findings("tide")
+        self.assertEqual(status, "OK", message)
+        self.assertIn("covers 2026-09-29 to 2026-10-30", message)
 
 
 class TestArcStats(HealthTest):

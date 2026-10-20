@@ -421,6 +421,7 @@ def check_arc_stats(station_code: str) -> None:
 PLOT_STALE_HOURS = 36    # the plot is redrawn nightly
 TIDE_AHEAD_DAYS = 2      # warn this long before the tide prediction runs out
 PLOT_DAYS = 7            # plot_7day.py's default window
+TIDE_GAP_HOURS = 3       # a longer hole in the prediction can hide a high or low tide
 
 
 def _newest_spline_time(station_code: str) -> datetime | None:
@@ -463,67 +464,216 @@ def check_public_plot(station_code: str) -> None:
     record(OK, "plot", f"{plot.name} drawn {when:%Y-%m-%d %H:%M}Z")
 
 
-def _xlsx_column_range(path: Path, column: str):
-    """(first, last) datetime in `column` of the first sheet, read as
-    plot_7day.load_tide reads it. Uses openpyxl when this python has it,
-    else reads the xlsx (a zip of XML) directly: cron runs this script
-    under the system python, which may not."""
+def _tide_times(path: Path, time_col: str, value_col: str) -> list:
+    """The times plot_7day.load_tide draws a predicted tide at, sorted:
+    rows of the first sheet, below a header in row 1, whose time is a
+    date-time and whose value is a number. Checking only the time
+    column said "covered" for times with no tide value (a sheet filled
+    out ahead of its values), which the plot leaves blank. Uses openpyxl
+    exactly as load_tide does when this python has it -- not its
+    read_only mode, which reads only as far as the sheet's stated
+    <dimension>, and some writers state A1:B2 for a whole sheet -- else
+    reads the xlsx directly: cron runs this script under the system
+    python, which may not have openpyxl."""
     try:
         from openpyxl import load_workbook
     except ImportError:
-        return _xlsx_column_range_stdlib(path, column)
-    wb = load_workbook(path, read_only=True, data_only=True)
+        return _tide_times_stdlib(path, time_col, value_col)
+    wb = load_workbook(path, data_only=True)
     try:
-        rows = wb[wb.sheetnames[0]].iter_rows(values_only=True)
-        index = list(next(rows)).index(column)
-        times = [r[index] for r in rows
-                 if len(r) > index and isinstance(r[index], datetime)]
+        ws = wb[wb.sheetnames[0]]
+        header = [c.value for c in ws[1]]
+        ti, vi = _tide_columns(header, time_col, value_col)
+        times = [row[ti] for row in ws.iter_rows(min_row=2, values_only=True)
+                 if isinstance(row[ti], datetime) and isinstance(row[vi], (int, float))]
     finally:
         wb.close()
-    return (min(times), max(times)) if times else None
+    return sorted(times)
 
 
-def _xlsx_column_range_stdlib(path: Path, column: str):
+def _tide_columns(header: list, time_col: str, value_col: str) -> tuple:
+    for name in (time_col, value_col):
+        if name not in header:
+            raise ValueError(f"no '{name}' column in the first row")
+    return header.index(time_col), header.index(value_col)
+
+
+# Excel's built-in number formats that are dates or times (the rest of
+# 0-49 are numbers, text or currency). openpyxl reads a cell as a date
+# from its style's number format, built-in or custom, never from the
+# value: the same serial number is a date in one cell and a plain
+# number in the next.
+_XLSX_BUILTIN_DATE_FORMATS = {
+    14: "mm-dd-yy", 15: "d-mmm-yy", 16: "d-mmm", 17: "mmm-yy", 18: "h:mm AM/PM",
+    19: "h:mm:ss AM/PM", 20: "h:mm", 21: "h:mm:ss", 22: "m/d/yy h:mm",
+    45: "mm:ss", 46: "[h]:mm:ss", 47: "mmss.0",
+}
+
+
+def _xlsx_is_date_format(fmt: str | None) -> bool:
+    """openpyxl's is_date_format: a d, m, h, y or s outside quoted text
+    and [locale] brackets in the first section of the format."""
+    if fmt is None:
+        return False
+    fmt = re.sub(r'".*?"|\[(?!hh?\]|mm?\]|ss?\])[^\]]*\]', "", fmt.split(";")[0])
+    return re.search(r"(?<![_\\])[dmhysDMHYS]", fmt) is not None
+
+
+def _xlsx_is_timedelta_format(fmt: str | None) -> bool:
+    """openpyxl's is_timedelta_format ([h]:mm:ss and kin), read as a
+    duration, not a date-time."""
+    return fmt is not None and re.search(
+        r"\[hh?\](:mm(:ss(\.0*)?)?)?|\[mm?\](:ss(\.0*)?)?|\[ss?\](\.0*)?",
+        fmt.split(";")[0], re.I) is not None
+
+
+def _tide_times_stdlib(path: Path, time_col: str, value_col: str) -> list:
+    """_tide_times without openpyxl, reading the xlsx (a zip of XML) the
+    way openpyxl does, so both pythons give the same answer:
+
+    - parts found through the package's relationships, not fixed names;
+    - shared and inline strings: plain text plus rich-text runs, without
+      phonetic (rPh) runs;
+    - a number is a date only if its style's number format is a date
+      format (built-in or custom, as openpyxl's is_date_format), counted
+      from 1899-12-30, or from 1904-01-01 when the workbook says
+      date1904 (older Mac Excel); a duration format is not a date-time;
+    - ISO 8601 date-time cells (t="d");
+    - cells and rows without an r attribute take the next position;
+    - the header is row 1 only, as load_tide's ws[1]."""
+    import posixpath
     import zipfile
     import xml.etree.ElementTree as ET
     m = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     r_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    pkg = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+    def rels_of(z, part):
+        folder, name = posixpath.split(part)
+        try:
+            tree = ET.fromstring(z.read(posixpath.join(folder, "_rels", name + ".rels")))
+        except KeyError:
+            return {}
+        out = {}
+        for rel in tree.iter(f"{pkg}Relationship"):
+            target = rel.get("Target", "")
+            target = (target.lstrip("/") if target.startswith("/")
+                      else posixpath.normpath(posixpath.join(folder, target)))
+            out[rel.get("Id")] = (rel.get("Type", ""), target)
+        return out
+
+    def text_of(element):
+        # <t> directly under <si>/<is>, and under its rich-text runs <r>
+        return "".join(t.text or "" for t in element.findall(f"{m}t")) + "".join(
+            t.text or "" for r in element.findall(f"{m}r") for t in r.findall(f"{m}t"))
+
     with zipfile.ZipFile(path) as z:
-        shared = []
-        if "xl/sharedStrings.xml" in z.namelist():
-            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(f"{m}si"):
-                shared.append("".join(t.text or "" for t in si.iter(f"{m}t")))
-        # the first sheet, through the workbook's relationships
-        first = next(ET.fromstring(z.read("xl/workbook.xml")).iter(f"{m}sheet"))
-        rid = first.get(f"{r_ns}id")
-        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
-        target = next(r.get("Target") for r in rels if r.get("Id") == rid)
-        target = target.lstrip("/")
-        sheet = ET.fromstring(z.read(target if target.startswith("xl/") else "xl/" + target))
-    col, times = None, []
+        book = next((t for kind, t in rels_of(z, "").values()
+                     if kind.endswith("/officeDocument")), "xl/workbook.xml")
+        workbook = ET.fromstring(z.read(book))
+        book_rels = rels_of(z, book)
+        pr = workbook.find(f"{m}workbookPr")
+        flag = pr.get("date1904") if pr is not None else None
+        epoch = (datetime(1904, 1, 1) if flag and flag not in ("false", "f", "0")
+                 else datetime(1899, 12, 30))
+        shared, date_styles, duration_styles = [], set(), set()
+        for kind, target in book_rels.values():
+            if kind.endswith("/sharedStrings"):
+                shared = [text_of(si) for si in
+                          ET.fromstring(z.read(target)).findall(f"{m}si")]
+            elif kind.endswith("/styles"):
+                styles = ET.fromstring(z.read(target))
+                custom = {int(f.get("numFmtId")): f.get("formatCode")
+                          for f in styles.iter(f"{m}numFmt")}
+                xfs = styles.find(f"{m}cellXfs")
+                for index, xf in enumerate(xfs.findall(f"{m}xf") if xfs is not None else []):
+                    fmt_id = int(xf.get("numFmtId", 0))
+                    fmt = custom.get(fmt_id, _XLSX_BUILTIN_DATE_FORMATS.get(fmt_id))
+                    if _xlsx_is_date_format(fmt):
+                        date_styles.add(index)
+                    if _xlsx_is_timedelta_format(fmt):
+                        duration_styles.add(index)
+        first = next(workbook.iter(f"{m}sheet"))
+        sheet = ET.fromstring(z.read(book_rels[first.get(f"{r_ns}id")][1]))
+
+    def value_of(c):
+        kind = c.get("t", "n")
+        if kind == "inlineStr":
+            inline = c.find(f"{m}is")
+            return text_of(inline) if inline is not None else None
+        v = c.findtext(f"{m}v") or None
+        if v is None:
+            return None
+        if kind == "n":
+            number = float(v) if any(ch in v for ch in ".Ee") else int(v)
+            style = int(c.get("s", 0))
+            if style not in date_styles or style in duration_styles:
+                return number
+            day, fraction = divmod(number, 1)      # openpyxl's from_excel
+            if 0 <= number < 1:
+                return None                         # a time of day, not a date-time
+            if 0 < number < 60 and epoch.year == 1899:
+                day += 1                            # Excel's 29 Feb 1900
+            try:
+                return epoch + timedelta(days=day, milliseconds=round(fraction * 86400000))
+            except OverflowError:
+                return None                         # openpyxl makes it an error cell
+        if kind == "s":
+            return shared[int(v)]
+        if kind == "b":
+            return bool(int(v))
+        if kind == "d":
+            # openpyxl's from_ISO8601: date and time, any offset ignored;
+            # a date alone is not a date-time
+            iso = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,3})?)?", v)
+            if not iso:
+                return None
+            parts = [int(g) for g in iso.groups()[:6] if g is not None]
+            micro = int(float(iso.group(7)) * 1000000) if iso.group(7) else 0
+            try:
+                return datetime(*parts, microsecond=micro)
+            except ValueError:
+                return None
+        return v                                    # str (a formula's text), e (an error)
+
+    cells = {}                                      # {(row, column): value}
+    row_number = 0
     for row in sheet.iter(f"{m}row"):
-        for c in row.iter(f"{m}c"):
-            letters = re.match(r"[A-Z]+", c.get("r", "")).group(0)
-            kind = c.get("t")
-            v = c.find(f"{m}v")
-            if col is None:
-                text = (shared[int(v.text)] if kind == "s" and v is not None
-                        else "".join(t.text or "" for t in c.iter(f"{m}t")) if kind == "inlineStr"
-                        else v.text if v is not None else None)
-                if text == column:
-                    col = letters
-            elif letters == col and kind in (None, "n") and v is not None:
-                # an Excel date: days since 1899-12-30
-                times.append(datetime(1899, 12, 30) + timedelta(days=float(v.text)))
-        if col is None:
-            raise ValueError(f"no '{column}' column in the first row")
-    return (min(times), max(times)) if times else None
+        row_number = int(row.get("r", row_number + 1))
+        column = 0
+        for c in row.findall(f"{m}c"):
+            ref = re.match(r"\$?([A-Za-z]+)\$?(\d+)", c.get("r") or "")
+            if ref:
+                column = 0
+                for letter in ref.group(1).upper():
+                    column = column * 26 + ord(letter) - 64
+                row_number = int(ref.group(2))
+            else:
+                column += 1
+            cells[(row_number, column)] = value_of(c)
+
+    width = max([col for _, col in cells] or [0])
+    header = [cells.get((1, col)) for col in range(1, width + 1)]
+    ti, vi = _tide_columns(header, time_col, value_col)
+    times = []
+    for (row_number, column), t in cells.items():
+        if row_number > 1 and column == ti + 1 and isinstance(t, datetime):
+            value = cells.get((row_number, vi + 1))
+            if isinstance(value, (int, float)):
+                times.append(t)
+    return sorted(times)
 
 
 def check_tide_coverage(station_code: str, cfg: dict) -> None:
     tide_file = cfg.get("tide_model_file")
     if not tide_file:
         record(OK, "tide", "no tide_model_file set: the 7-day plot has no predicted tide")
+        return
+    value_col = cfg.get("tide_model_value_column")
+    if not value_col:
+        # plot_7day draws the tide only with both set
+        record(WARN, "tide", "tide_model_file is set but tide_model_value_column is not: "
+                             "the 7-day plot has no predicted tide or departure markers")
         return
     path = Path(tide_file)
     if not path.is_absolute() and not path.exists():
@@ -534,17 +684,23 @@ def check_tide_coverage(station_code: str, cfg: dict) -> None:
         return
     column = cfg.get("tide_model_time_column") or "time"
     try:
-        span = _xlsx_column_range(path, column)
+        times = _tide_times(path, column, value_col)
     except Exception as exc:
         record(WARN, "tide", f"could not read {path.name}: {exc}")
         return
-    if span is None:
-        record(WARN, "tide", f"{path.name} has no times in its '{column}' column")
+    if not times:
+        record(WARN, "tide", f"{path.name} has no rows with a time in '{column}' and a "
+                             f"number in '{value_col}'")
         return
-    start, end = span
+    start, end = times[0], times[-1]
     newest = _newest_spline_time(station_code) or utcnow().replace(tzinfo=None)
     need_from = newest - timedelta(days=PLOT_DAYS)
     need_to = newest + timedelta(days=TIDE_AHEAD_DAYS)
+    # holes inside the window: a file joined from two predictions
+    # (merge_tide_files.py) can span the window and still miss part of it
+    inside = [need_from] + [t for t in times if need_from < t < need_to] + [need_to]
+    holes = [(a, b) for a, b in zip(inside, inside[1:])
+             if b - a > timedelta(hours=TIDE_GAP_HOURS)]
     if end < need_to:
         state = ("are already missing from" if end < newest
                  else f"disappear from it within {TIDE_AHEAD_DAYS} days of")
@@ -555,6 +711,13 @@ def check_tide_coverage(station_code: str, cfg: dict) -> None:
     elif start > need_from:
         record(WARN, "tide", f"{path.name} starts {start:%Y-%m-%d %H:%M}, after the 7-day "
                              f"plot's window starts ({need_from:%Y-%m-%d %H:%M})")
+    elif holes:
+        a, b = max(holes, key=lambda h: h[1] - h[0])
+        record(WARN, "tide", f"{path.name} has no predicted tide from {a:%Y-%m-%d %H:%M} to "
+                             f"{b:%Y-%m-%d %H:%M}"
+                             + (f" ({len(holes)} gaps over {TIDE_GAP_HOURS} h)" if len(holes) > 1 else "")
+                             + f"; the 7-day plot needs it from {need_from:%Y-%m-%d %H:%M} to "
+                               f"{need_to:%Y-%m-%d} (newest water level + {TIDE_AHEAD_DAYS} days)")
     else:
         record(OK, "tide", f"{path.name} covers {start:%Y-%m-%d} to {end:%Y-%m-%d}")
 
