@@ -718,8 +718,21 @@ class TestExternalStorageExport(StationManagerTestCase):
             "usgs_spline_out.txt",
         )
         self.assertEqual(
-            (exported / "results" / "usgs" / "190.txt").read_text(), "190.txt"
+            (exported / "results" / "2026" / "usgs" / "190.txt").read_text(),
+            "190.txt",
         )
+
+    def _by_mtime(self):
+        # File times are set by hand in these tests, and a ctime cannot
+        # be: judge "changed" by mtime alone (the ctime half is tested
+        # in test_file_put_in_place_with_an_old_mtime_is_exported).
+        return unittest.mock.patch.object(
+            station_manager.StationManager, "_changed_time",
+            staticmethod(lambda st: st.st_mtime))
+
+    def _marker_time(self) -> float:
+        marker = self.external_root / "Products" / self.manager._EXPORT_MARKER
+        return float(marker.read_text())
 
     def test_next_export_copies_only_what_changed(self) -> None:
         # products/ now stays, so a daily export copies only the files
@@ -731,32 +744,131 @@ class TestExternalStorageExport(StationManagerTestCase):
 
         self.manager._export_day_to_external_storage(date(2026, 7, 8))
 
-        # Push the marker into the past, then write a later file.
-        marker = self.cfg.products_dir / self.manager._EXPORT_MARKER
-        long_ago = time.time() - 3600
-        os.utime(marker, (long_ago, long_ago))
-        os.utime(old_day, (long_ago - 60, long_ago - 60))
-        (results / "190.txt").write_text("day 190")
+        # The marker on the external storage holds when that export
+        # started: a file last changed well before it is not copied
+        # again, one changed after it is.
+        started = self._marker_time()
+        os.utime(old_day, (started - 3600, started - 3600))
+        new_day = results / "190.txt"
+        new_day.write_text("day 190")
+        os.utime(new_day, (started + 1, started + 1))
 
-        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+        with self._by_mtime():
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
 
-        second = self.external_root / "Products" / "20260709" / "results" / "usgs"
+        second = self.external_root / "Products" / "20260709" / "results" / "2026" / "usgs"
         self.assertTrue((second / "190.txt").exists())
         self.assertFalse((second / "189.txt").exists())
         self.assertTrue(
             (self.external_root / "Products" / "20260708" / "results"
-             / "usgs" / "189.txt").exists()
+             / "2026" / "usgs" / "189.txt").exists()
         )
         self.assertFalse(
             (self.external_root / "Products" / "20260709" / "other").exists()
         )
 
-    def test_flattening_removes_year_and_station_nesting(self) -> None:
+    def test_change_just_before_the_last_export_is_copied_again(self) -> None:
+        # File times lag time.time() (the kernel's coarse clock), some
+        # filesystems keep whole seconds, and the clock can be stepped
+        # back: a file changed just after an export started can carry a
+        # time just before it. It must be copied again, not missed.
+        results = self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        day = results / "190.txt"
+        day.write_text("first version")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        day.write_text("rewritten during the export")
+        just_before = self._marker_time() - 0.005
+        os.utime(day, (just_before, just_before))
+
+        with self._by_mtime():
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (self.external_root / "Products" / "20260709" / "results" / "2026"
+             / "usgs" / "190.txt").read_text(),
+            "rewritten during the export",
+        )
+
+    def test_file_put_in_place_with_an_old_mtime_is_exported(self) -> None:
+        # A file moved in (a rename keeps its mtime), restored with
+        # cp -p / rsync -a, or copied with shutil.copy2 (as the RINEX
+        # staging does) has an mtime from before the last export, but
+        # it has never been exported. Its ctime is fresh.
+        results = self.cfg.products_dir / "refl_code" / "2025" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        (results / "001.txt").write_text("day 1")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        restored = results / "300.txt"
+        restored.write_text("restored from a backup")
+        long_ago = self._marker_time() - 300 * 86400
+        os.utime(restored, (long_ago, long_ago))
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (self.external_root / "Products" / "20260709" / "results" / "2025"
+             / "usgs" / "300.txt").read_text(),
+            "restored from a backup",
+        )
+
+    def test_new_external_disk_gets_the_whole_record(self) -> None:
+        # What was last exported is kept on the external storage, not
+        # in products/: an empty (new, swapped, wiped) disk is given
+        # the whole record, not only what changed since the old disk
+        # was last written.
+        spline = self.cfg.products_dir / "refl_code" / "Files" / "usgs" / "usgs_spline_out.txt"
+        spline.parent.mkdir(parents=True, exist_ok=True)
+        spline.write_text("the whole record")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        new_disk = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, new_disk, True)
+        self.manager._external_storage_path = new_disk
+        with self._by_mtime():
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (new_disk / "Products" / "20260709" / "Files" / "usgs"
+             / "usgs_spline_out.txt").read_text(),
+            "the whole record",
+        )
+
+    def test_file_vanishing_during_the_export_is_skipped(self) -> None:
+        # A file listed by os.walk and gone before it is copied (a
+        # temporary file, a staged RINEX file being cleaned up; here a
+        # dangling symlink) used to abort the whole export, so the
+        # files after it were not copied and the marker not written.
+        refl = self.cfg.products_dir / "refl_code"
+        (refl / "2026" / "rinex" / "usgs").mkdir(parents=True, exist_ok=True)
+        os.symlink(str(self.root / "gone.rnx"),
+                   str(refl / "2026" / "rinex" / "usgs" / "staged.rnx"))
+        results = refl / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        (results / "190.txt").write_text("day 190")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Products" / "20260709"
+        self.assertEqual(
+            (exported / "results" / "2026" / "usgs" / "190.txt").read_text(), "day 190"
+        )
+        self.assertFalse((exported / "rinex" / "2026" / "usgs" / "staged.rnx").exists())
+        self.assertTrue(
+            (self.external_root / "Products" / self.manager._EXPORT_MARKER).exists()
+        )
+
+    def test_flattening_keeps_the_year_and_drops_refl_code(self) -> None:
         # Confirmed against a real, live products/ directory: results
-        # normally nest as <year>/results/<station>/<file> --
-        # flattening should collapse the year layer while keeping the
-        # station code, so files from different station codes never
-        # collide under the same filename.
+        # normally nest as <year>/results/<station>/<file>. The
+        # refl_code/ level goes; the year stays (a results file's name
+        # carries no year), and so does the station code, so files from
+        # different years or station codes never collide.
         results_dir = (
             self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
         )
@@ -767,10 +879,54 @@ class TestExternalStorageExport(StationManagerTestCase):
 
         exported = (
             self.external_root / "Products" / "20260709"
-            / "results" / "usgs" / "190.txt"
+            / "results" / "2026" / "usgs" / "190.txt"
         )
         self.assertTrue(exported.exists())
         self.assertEqual(exported.read_text(), "day 190 results")
+
+    def test_same_day_of_year_in_two_years_both_exported(self) -> None:
+        # Collapsing the year let 2025's 292.txt and 2026's 292.txt
+        # land on the same results/usgs/292.txt: with products/ now
+        # copied whole, the first export kept one year of every day of
+        # year the record has twice.
+        refl = self.cfg.products_dir / "refl_code"
+        for year in ("2025", "2026"):
+            path = refl / year / "results" / "usgs" / "292.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{year} day 292")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Products" / "20260709" / "results"
+        for year in ("2025", "2026"):
+            with self.subTest(year=year):
+                self.assertEqual(
+                    (exported / year / "usgs" / "292.txt").read_text(),
+                    f"{year} day 292",
+                )
+
+    def test_same_day_check_spline_does_not_replace_the_record(self) -> None:
+        # analysis_tools/ultra_rapid_check.py keeps its own REFL_CODE
+        # beside refl_code/, with its own few-day
+        # Files/usgs/usgs_spline_out.txt. Flattened to the same
+        # Files/usgs/ it overwrote the whole-record spline in the
+        # export (whichever os.walk reached last won).
+        for tree, text in (("refl_code", "the whole record"),
+                           ("refl_code_ultra", "four days, ultra-rapid")):
+            path = self.cfg.products_dir / tree / "Files" / "usgs" / "usgs_spline_out.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Products" / "20260709" / "Files"
+        self.assertEqual(
+            (exported / "usgs" / "usgs_spline_out.txt").read_text(), "the whole record"
+        )
+        self.assertEqual(
+            (exported / "refl_code_ultra" / "usgs" / "usgs_spline_out.txt").read_text(),
+            "four days, ultra-rapid",
+        )
 
     def test_multiple_station_codes_kept_separate_not_collided(self) -> None:
         # Confirmed real scenario: if a station's own code was ever
@@ -785,7 +941,7 @@ class TestExternalStorageExport(StationManagerTestCase):
 
         self.manager._export_day_to_external_storage(date(2026, 7, 9))
 
-        exported_root = self.external_root / "Products" / "20260709" / "results"
+        exported_root = self.external_root / "Products" / "20260709" / "results" / "2026"
         self.assertEqual(
             (exported_root / "usgs" / "197.txt").read_text(), "usgs results"
         )
@@ -805,7 +961,7 @@ class TestExternalStorageExport(StationManagerTestCase):
 
         exported = (
             self.external_root / "Products" / "20260709"
-            / "results" / "usgs" / "failQC" / "bad_arc.txt"
+            / "results" / "2026" / "usgs" / "failQC" / "bad_arc.txt"
         )
         self.assertTrue(exported.exists())
 
