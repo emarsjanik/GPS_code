@@ -449,6 +449,22 @@ class EvaluateTests(unittest.TestCase):
         # the production REFL_CODE is only read
         self.assertEqual(sorted(p.relative_to(self.refl) for p in self.refl.rglob("*")), before)
 
+    def test_production_span_is_planned_as_the_nightly_fit_plans_it(self):
+        # arc QC already on in production: the nightly fit plans (and checks
+        # its frozen years) with the json's options on the command line, so
+        # the evaluation must too, or its span reaches back past them
+        build_station(self.refl, date(2026, 9, 2), date(2026, 10, 1),
+                      (date(2026, 9, 25), date(2026, 9, 27)))
+        p = self.refl / "input" / STA / f"{STA}.json"
+        p.write_text(json.dumps(dict(CFG, subdaily_alt_sigma=True), indent=4))
+        with unittest.mock.patch.object(gr, "make_plan", wraps=gr.make_plan) as plan:
+            rc, out = self.run_main("--variants", "baseline")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(plan.call_args[0][2], SETTINGS + " -alt_sigma True")
+        self.assertEqual(plan.call_args[0][2],
+                         gr.with_json_qc(SETTINGS, self.refl, STA),
+                         "the settings gnss_record.cmd_update plans with")
+
     def test_without_gauge_or_tide_model_nothing_is_scored(self):
         build_station(self.refl, date(2026, 9, 2), date(2026, 10, 1),
                       (date(2026, 9, 25), date(2026, 9, 27)))

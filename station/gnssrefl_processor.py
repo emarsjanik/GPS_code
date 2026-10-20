@@ -957,11 +957,13 @@ class GnssIrProcessor:
         rewrites that list after make_gnssir_input() has written the
         file: a listed frequency gets its own value, every other one
         keeps the one gnssrefl wrote. It matters in storms: a rough sea
-        lowers the coherent reflected power (Strandberg et al. 2019;
-        Purnell et al. 2020), and of a strong signal the damped,
-        doubtful arcs still clear one shared threshold. A listed frequency that is not
-        in the json's freqs is ignored with a warning. Done on every
-        initialize(), like make_gnssir_input() itself.
+        lowers the coherent reflected power (the roughness damping of
+        Strandberg et al.'s inverse SNR model, 2016, 2019; Sepulveda
+        et al. 2023 see errors rise abruptly at high waves), and of a
+        strong signal the damped, doubtful arcs still clear one shared
+        threshold. A listed frequency that is not in the json's freqs
+        is ignored with a warning. Done on every initialize(), like
+        make_gnssir_input() itself.
 
         It applies to days gnssir processes from now on; results
         already written keep the threshold they were made with until

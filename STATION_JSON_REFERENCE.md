@@ -239,11 +239,14 @@ gnssrefl, every arc test is relative to the data themselves:
   standard deviation over the whole ~10-month fit.
 
 A rough sea lowers the coherent reflected power, roughly by
-exp(-4k²s²sin²e) for a surface height spread s (Strandberg et al. 2019).
-Purnell et al. (2020) find that the dynamic sea surface dominates the
-error budget, and Sepúlveda et al. (2023) see errors rise abruptly at
-high waves. So in a storm, arcs drop below the amplitude limit, and the
-ones that survive can be the biased ones. In the 25–27 Sep 2026 storm
+exp(-4k²s²sin²e) for a surface height spread s. That is the roughness
+damping term of Strandberg et al.'s inverse SNR model (2016, 2019).
+Purnell et al. (2020) find that the moving sea surface dominates the
+error budget of the inverse method (noise dominates that of the
+spectral method gnssrefl uses), and Sepúlveda et al. (2023) see errors
+rise abruptly at high waves at an exposed pier. So in a storm, arcs
+drop below the amplitude limit, and the ones that survive can be the
+biased ones. In the 25–27 Sep 2026 storm
 the spline read up to ~3 m above what the Chatham gauge implied.
 
 A synthetic reproduction of that storm with gnssrefl's real subdaily
@@ -388,12 +391,17 @@ Two cautions:
   answers is "does the storm depart less from the calm-weather
   relation?"
 
-References: Larson et al. (2017), *J. Atmos. Oceanic Technol.* 34, the
-subdaily spline and RHdot method; Larson (2024), *GPS Solutions* 28:165,
-gnssrefl; Strandberg et al. (2019), *GPS Solutions* 23; Purnell et al.
-(2020), *IEEE JSTARS* 13; Sepúlveda et al. (2023), *Earth Space Sci.*
-10; Stockdon et al. (2006), *Coastal Eng.* 53. The robust sigma is
-1.4826 × MAD, the standard normal-consistent scale.
+References: Larson, Ray, Nievinski & Freymueller (2013), *IEEE GRSL*
+10, the RHdot (height-rate) correction; Larson, Ray & Williams (2017),
+*J. Atmos. Oceanic Technol.* 34, ten years of subdaily water levels with
+it; Larson (2024), *GPS Solutions* 28:165, gnssrefl and its subdaily;
+Strandberg et al. (2016), *Radio Science* 51, and (2019), *GPS
+Solutions* 23, the inverse SNR model with its roughness damping;
+Purnell et al. (2020), *IEEE JSTARS* 13; Sepúlveda et al. (2023),
+*Earth Space Sci.* 10; Stockdon et al. (2006), *Coastal Eng.* 53. The
+robust sigma is 1.4826 × MAD, the standard normal-consistent scale; the
+`-alt_sigma` option and its attribution to Geremia-Nievinski are
+gnssrefl's own (subdaily's help text).
 
 ### Orthometric height reference
 

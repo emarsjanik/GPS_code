@@ -774,7 +774,13 @@ def main() -> int:
             return 1
         if n < want:
             print(f"  NOTE: {label} window {w[0]}..{w[1]} has results on {n} of {want} days")
-    plan = gr.make_plan(refl_code, sta, settings, since) if a.span == "production" else None
+    baseline = Variant("baseline", "the production json as it is")
+    # the plan from the settings the nightly fit itself plans with: last
+    # night's plus the json's arc QC (gnss_record.cmd_update). Without the
+    # QC options, a frozen year made with them would not match, and the
+    # span would reach back to the start of the record.
+    plan = (gr.make_plan(refl_code, sta, variant_settings(settings, baseline, cfg), since)
+            if a.span == "production" else None)
     span = eval_span(a.span, plan, windows, days[-1])
     span_days = [d for d in days if span[0] <= d <= span[1]]
     try:
@@ -796,7 +802,6 @@ def main() -> int:
                            "about": v.about}
         return ok
 
-    baseline = Variant("baseline", "the production json as it is")
     if not run(baseline):
         print(f"  ERROR: the baseline fit failed -- see {logs['baseline']}")
         return 1

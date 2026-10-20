@@ -20,12 +20,14 @@ and its subdaily takes one value per frequency (-ampl).
 
 It matters in storms. A rough sea lowers the coherent reflected
 power -- roughly by exp(-4 k^2 s^2 sin^2 e) for a surface height
-spread s (Strandberg et al. 2019; Purnell et al. 2020 find the
-dynamic sea surface dominates the error budget; Sepulveda et al. 2023
-see errors rise abruptly at high waves) -- so arcs drop below the
-threshold, and of a strong signal the damped, doubtful arcs still
-pass. Known finding G-B9: the arcs that survive a storm are the biased
-ones.
+spread s, the damping term of Strandberg et al.'s inverse SNR model
+(2016, 2019) -- so arcs drop below the threshold, and of a strong
+signal the damped, doubtful arcs still pass. Purnell et al. (2020)
+find the moving sea surface dominates the error budget of the
+inverse method (noise dominates that of the spectral one gnssir
+uses), and Sepulveda et al. (2023) see errors rise abruptly at high
+waves at an exposed pier. Known finding G-B9: the arcs that survive a
+storm are the biased ones.
 
 THE RULE
 
