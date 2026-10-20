@@ -233,6 +233,14 @@ is the single place that is defined; a spline file written with an
 older antenna height is moved onto NAVD88 when it is read or archived,
 using the `Hortho (m) is` line gnssrefl writes into its header.
 
+`water_level_msl_offset` and `tide_model_navd88_offset` were both
+measured against this station's own GNSS-IR record, so they carry its
+absolute bias with them. `analysis_tools/independent_datum.py` checks
+them against mean sea level on NAVD88 from NOAA's tidal datums and
+VDatum, and reports what a co-located gauge would need to settle it
+([`docs/INDEPENDENT_DATUM.md`](docs/INDEPENDENT_DATUM.md)). It is a
+report only and changes neither value.
+
 ### Refraction model
 
 | Field | Type | Description |
