@@ -10,6 +10,7 @@ markers then vanish from the plot without a word).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "diagnostics"))
 import station_health as sh  # noqa: E402
+import gnss_record as gr  # noqa: E402
 
 STA = "usgs"
 MJD0 = datetime(1858, 11, 17)
@@ -165,6 +167,70 @@ class TestTideCoverage(HealthTest):
         self.assertEqual(expected, (datetime(2026, 10, 1), datetime(2026, 10, 31, 12)))
         self.assertEqual([abs((g - e).total_seconds()) < 1 for g, e in zip(got, expected)],
                          [True, True])
+
+
+class TestArcStats(HealthTest):
+    """Storm amplitude damping: arcs drop below gnssir's limits."""
+
+    def write_results(self, day: datetime, n: int, amp: float, pknoise: float = 4.0) -> None:
+        doy = day.timetuple().tm_yday
+        path = (self.proj / "products" / "refl_code" / str(day.year) / "results"
+                / STA / f"{doy:03d}.txt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "% year doy RH sat UTCtime Azim Amp eminO emaxO NumbOf freq rise EdotF "
+            "PkNoise DelT MJD refr-appl\n"
+            + "".join(f"{day.year} {doy} 19.000 {i % 32 + 1} {24 * i / n:.3f} 80.00 "
+                      f"{amp + (i % 3) - 1:.2f} 5.05 14.95 200 1 1 0.7 {pknoise:.2f} 30.0 "
+                      f"61000.0 1\n" for i in range(n)))
+
+    def week(self, last_n: int, last_amp: float) -> None:
+        for k in range(8):
+            day = datetime(2026, 10, 12) + timedelta(days=k)
+            if k < 7:
+                self.write_results(day, n=400, amp=12.0)
+            else:
+                self.write_results(day, n=last_n, amp=last_amp, pknoise=3.1)
+        gr.write_status(self.files, ok=True)
+
+    def test_status_holds_per_day_arc_statistics(self) -> None:
+        self.week(last_n=390, last_amp=11.0)
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+        self.assertEqual(len(st["arc_stats"]), 8)
+        self.assertEqual(st["arc_stats"][0],
+                         {"day": "2026-10-12", "arcs": 400, "median_amp": 12.0,
+                          "median_pknoise": 4.0})
+        self.assertEqual(st["arc_stats"][-1]["day"], "2026-10-19")
+        self.assertEqual(st["arc_stats"][-1]["median_pknoise"], 3.1)
+
+    def test_steady_day_is_ok(self) -> None:
+        self.week(last_n=390, last_amp=11.0)
+        sh.check_arc_stats(STA)
+        self.assertEqual([s for s, _ in self.findings("arcs")], ["OK"])
+
+    def test_arc_count_drop_warns(self) -> None:
+        self.week(last_n=150, last_amp=11.0)
+        sh.check_arc_stats(STA)
+        (status, message), = self.findings("arcs")
+        self.assertEqual(status, "WARN")
+        self.assertIn("drop in arcs", message)
+
+    def test_amplitude_drop_warns(self) -> None:
+        self.week(last_n=390, last_amp=7.0)
+        sh.check_arc_stats(STA)
+        (status, message), = self.findings("arcs")
+        self.assertEqual(status, "WARN")
+        self.assertIn("amplitude", message)
+
+    def test_too_few_days_says_nothing(self) -> None:
+        self.write_results(datetime(2026, 10, 19), n=10, amp=5.0)
+        gr.write_status(self.files, ok=True)
+        sh.check_arc_stats(STA)
+        self.assertEqual(self.findings("arcs"), [])
+
+    def test_no_status_file_says_nothing(self) -> None:
+        sh.check_arc_stats(STA)
+        self.assertEqual(self.findings("arcs"), [])
 
 
 if __name__ == "__main__":

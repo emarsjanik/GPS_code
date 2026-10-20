@@ -363,6 +363,54 @@ def check_water_level_record(station_code: str, since=None) -> None:
 
 
 # ------------------------------------------------------------------
+# 2b'. Are arcs dropping out? A rough sea lowers the reflected power, so
+#     in a storm arcs fall below gnssir's amplitude / peak2noise limits
+#     and the survivors are the doubtful ones. gnss_record.py keeps per
+#     UTC day arc count, median Amp and median PkNoise (arc_stats in
+#     record_status.json); a sharp drop on the newest day against the
+#     days before it is a WARN. It is equally what a receiver or antenna
+#     problem looks like, which is worth a look too.
+# ------------------------------------------------------------------
+ARC_BASELINE_DAYS = 7    # days before the newest one it is compared with
+ARC_MIN_BASELINE = 3
+ARC_COUNT_DROP = 0.5     # newest day's arcs below half the baseline median
+ARC_AMP_DROP = 0.7       # newest day's median Amp below 70 % of the baseline
+
+
+def check_arc_stats(station_code: str) -> None:
+    status = (PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+              / gnss_record.FIT_SUBDIR / gnss_record.STATUS_NAME)
+    try:
+        stats = json.loads(status.read_text()).get("arc_stats") or []
+    except (OSError, ValueError, AttributeError):
+        return
+    if len(stats) < ARC_MIN_BASELINE + 1:
+        return
+    newest, before = stats[-1], stats[-1 - ARC_BASELINE_DAYS:-1]
+    try:
+        base_arcs = gnss_record._median([d["arcs"] for d in before])
+        base_amp = gnss_record._median([d["median_amp"] for d in before])
+        base_pkn = gnss_record._median([d["median_pknoise"] for d in before])
+        newest["arcs"], newest["median_amp"], newest["median_pknoise"]
+    except (KeyError, TypeError):
+        return
+    summary = (f"{newest['day']}: {newest['arcs']} arcs, median Amp {newest['median_amp']}, "
+               f"PkNoise {newest['median_pknoise']} (previous {len(before)} days: "
+               f"{base_arcs:.0f} arcs, Amp {base_amp:.1f}, PkNoise {base_pkn:.1f})")
+    dropped = []
+    if newest["arcs"] < ARC_COUNT_DROP * base_arcs:
+        dropped.append("arcs")
+    if newest["median_amp"] < ARC_AMP_DROP * base_amp:
+        dropped.append("amplitude")
+    if dropped:
+        record(WARN, "arcs", f"sharp drop in {' and '.join(dropped)} -- {summary}. Rough "
+                             f"seas damp the reflection (the water levels kept may be the "
+                             f"biased ones); so does a receiver or antenna problem")
+    else:
+        record(OK, "arcs", summary)
+
+
+# ------------------------------------------------------------------
 # 2c. Is the public plot being redrawn, and does the tide prediction
 #     cover it? process_and_plot.sh reports success when the 7-day plot
 #     fails, so a stale 7_day_plot.png is still uploaded and attached;
@@ -713,6 +761,7 @@ def main() -> int:
     check_recent_errors(db, args.days)
     check_processing_currency(station_code, since)
     check_water_level_record(station_code, since)
+    check_arc_stats(station_code)
     check_public_plot(station_code)
     check_tide_coverage(station_code, d if isinstance(d, dict) else {})
     check_raw_backlog()

@@ -81,7 +81,9 @@ HOW
   status   fit/record_status.json says how the last update went
            (diagnostics/station_health.py reports it in the daily mail),
            including any year whose edit file subdaily did not write,
-           and the gnssrefl version that ran.
+           the gnssrefl version that ran, and per UTC day of the last
+           two weeks the arcs kept with their median Amp and PkNoise
+           (arc_stats; a storm shows as a drop).
 
 USAGE (process_and_plot.sh, every night)
 
@@ -129,6 +131,9 @@ UPLOAD_MARK = "s3_upload_year_"
 FIT_LOG = "subdaily.log"
 MJD_EPOCH = date(1858, 11, 17)
 AZ_COL = 5               # gnssir results: year doy RH sat UTC Azim ...
+AMP_COL = 6              # ... Amp eminO emaxO NumbOf freq rise EdotF PkNoise ...
+PKNOISE_COL = 13
+ARC_STATS_DAYS = 14      # days of arc statistics kept in record_status.json
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 STATION_JSON = PROJECT_DIR / "station" / "resources" / "station.json"
 
@@ -449,11 +454,54 @@ def gnssrefl_version() -> str | None:
         return None
 
 
+def _median(values):
+    v = sorted(values)
+    n = len(v)
+    if not n:
+        return None
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def arc_stats(refl_code: Path | str, sta: str, days: int = ARC_STATS_DAYS) -> list[dict]:
+    """Per UTC day of the newest `days` results days: arcs kept by gnssir,
+    their median LSP amplitude (Amp) and median peak-to-noise (PkNoise).
+    A rough sea lowers the reflected power, so in a storm arcs fall below
+    gnssir's amplitude / peak2noise limits and drop out before anything
+    looks wrong in the water level; station_health.py warns on a sharp
+    drop. Read-only; a day that cannot be read is left out."""
+    out = []
+    for d, path in list(results_days(refl_code, sta).items())[-days:]:
+        amp, pkn = [], []
+        try:
+            for s in _data_lines(path):
+                c = s.split()
+                try:
+                    a, p = float(c[AMP_COL]), float(c[PKNOISE_COL])
+                except (IndexError, ValueError):
+                    continue
+                amp.append(a)
+                pkn.append(p)
+        except OSError:
+            continue
+        if amp:
+            out.append({"day": d.isoformat(), "arcs": len(amp),
+                        "median_amp": round(_median(amp), 2),
+                        "median_pknoise": round(_median(pkn), 2)})
+    return out
+
+
 def write_status(files_dir: Path, **kw) -> None:
     fit_dir = files_dir / FIT_SUBDIR
     fit_dir.mkdir(parents=True, exist_ok=True)
     kw["time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     kw.setdefault("gnssrefl_version", gnssrefl_version())
+    if "arc_stats" not in kw:
+        try:
+            # files_dir is <REFL_CODE>/Files/<sta>
+            kw["arc_stats"] = arc_stats(files_dir.parent.parent, files_dir.name)
+        except Exception as exc:     # a status must still be written
+            kw["arc_stats"] = []
+            kw["arc_stats_error"] = str(exc)
     write_atomic(fit_dir / STATUS_NAME, [json.dumps(kw, default=str, indent=1) + "\n"])
 
 
