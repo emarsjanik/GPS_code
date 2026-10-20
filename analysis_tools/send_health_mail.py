@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from email.utils import formataddr, formatdate, make_msgid
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -220,6 +222,52 @@ def _downscale_for_email(path: Path, tmpdir: Path):
         return raw, path.name, False
 
 
+def msmtp_from(path: Path | None = None) -> str | None:
+    """The sender address msmtp will use: the `from` of the default
+    account in ~/.msmtprc (or of its first account, or of `defaults`).
+    None if there is none, or it uses msmtp's %-substitutions."""
+    path = path or Path.home() / ".msmtprc"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    froms, order, current, alias = {}, [], None, None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition(" ")
+        value = value.strip()
+        if key == "defaults":
+            current = ""
+        elif key == "account":
+            if ":" in value:            # account default : <name>
+                name, _, target = value.partition(":")
+                if name.strip() == "default":
+                    alias = target.strip()
+                current = name.strip()
+            else:
+                current = value
+            order.append(current)
+        elif key == "from" and current is not None:
+            froms[current] = value
+    name = alias or (order[0] if order else None)
+    sender = froms.get(name) if name else None
+    sender = sender or froms.get("")
+    return sender if sender and "%" not in sender else None
+
+
+def add_envelope_headers(msg: EmailMessage, sender: str | None) -> None:
+    """Date, Message-ID and From, which msmtp may or may not add itself
+    (their absence counts against a message with spam filters). From is
+    the address msmtp sends as, so the two agree."""
+    msg["Date"] = formatdate(localtime=True)
+    domain = sender.rpartition("@")[2] if sender and "@" in sender else None
+    msg["Message-ID"] = make_msgid(idstring="station-health", domain=domain)
+    if sender:
+        msg["From"] = formataddr(("GNSS station health", sender))
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--subject", required=True)
@@ -228,6 +276,9 @@ def main() -> int:
                    help="path to a file to attach; missing files are noted, not fatal")
     p.add_argument("--no-stats", action="store_true",
                    help="skip the tide-model deviation section")
+    p.add_argument("--from", dest="sender", default=os.environ.get("HEALTH_MAIL_FROM"),
+                   help="sender address for the From header (default: $HEALTH_MAIL_FROM, "
+                        "else the from address in ~/.msmtprc; none: no From header)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -255,6 +306,7 @@ def main() -> int:
     msg = EmailMessage()
     msg["Subject"] = args.subject
     msg["To"] = ", ".join(args.to)
+    add_envelope_headers(msg, args.sender or msmtp_from())
     msg.set_content(body)
 
     import tempfile
@@ -272,6 +324,7 @@ def main() -> int:
         if args.dry_run:
             print(f"--- would send to: {' '.join(args.to)} ---")
             print(f"Subject: {args.subject}")
+            print(f"From: {msg['From'] or '(left to msmtp)'}")
             print(f"Attachments: {[p.name for p in attached] or 'none'}")
             print()
             print(body)
