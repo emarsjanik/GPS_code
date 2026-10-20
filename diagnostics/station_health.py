@@ -308,6 +308,9 @@ def check_processing_currency(station_code: str, since=None) -> None:
 #     camera frame the record does not cover, so a truncated or stale
 #     record must show up here, not only days later on the camera side.)
 # ------------------------------------------------------------------
+STATUS_STALE_HOURS = 36  # gnss_record.py update writes record_status.json nightly
+
+
 def check_water_level_record(station_code: str, since=None) -> None:
     base = PROJECT_DIR / "products" / "refl_code"
     days = list(results_days(base, station_code, since))
@@ -339,6 +342,17 @@ def check_water_level_record(station_code: str, since=None) -> None:
         st = json.loads((files / gnss_record.FIT_SUBDIR / gnss_record.STATUS_NAME).read_text())
     except (OSError, ValueError):
         st = {}
+    # The status is only as new as the last update that wrote it: an
+    # update that never ran, or stopped before writing it (another one
+    # holding the lock), leaves the night before's ok=True and arc
+    # statistics in place.
+    written = parse_ts(str(st.get("time") or ""))
+    age_h = (utcnow() - written).total_seconds() / 3600 if written else None
+    if age_h is not None and age_h > STATUS_STALE_HOURS:
+        record(WARN, "record", f"{gnss_record.STATUS_NAME} was last written "
+                              f"{written:%Y-%m-%d %H:%M}Z, {age_h / 24:.1f} days ago: the "
+                              f"nightly update has not run since, so what it says (and the "
+                              f"arc statistics) is that night's")
     if st and not st.get("ok", True):
         record(FAIL, "record", f"last update ({st.get('time')}) failed: {st.get('message')}")
     elif st.get("fallback"):

@@ -796,6 +796,10 @@ def _update(refl_code, files_dir, sta, settings, fallback, allow_shrink, since) 
     if shutil.which("subdaily") is None:
         print("  ERROR: gnssrefl's subdaily is not on PATH (source gnssrefl_venv/bin/activate "
               "first) -- record not updated")
+        # said in the status too: otherwise last night's ok=True stays,
+        # and the health mail reports a fit that did not happen
+        write_status(files_dir, ok=False, message="gnssrefl's subdaily is not on PATH",
+                     fit_start=plan.start, fit_end=plan.end, newest_results=plan.newest)
         return 1
 
     def check_range(plan):

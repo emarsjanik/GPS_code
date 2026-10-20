@@ -503,5 +503,39 @@ class TestArcStats(HealthTest):
         self.assertEqual(st["arc_stats"][-1]["day"], "2026-10-19")
 
 
+class TestRecordStatusAge(HealthTest):
+    """record_status.json is what the last update that wrote it said: an
+    update that did not run leaves the night before's ok=True."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for k in range(8):
+            day = datetime(2026, 10, 12) + timedelta(days=k)
+            doy = day.timetuple().tm_yday
+            path = (self.proj / "products" / "refl_code" / str(day.year) / "results"
+                    / STA / f"{doy:03d}.txt")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"% results\n{day.year} {doy} 19.000 5 12.000 80.00 12.00\n")
+        self.write_spline(datetime(2026, 10, 19, 23, 30))
+
+    def status(self, age_h: float) -> None:
+        written = sh.utcnow() - timedelta(hours=age_h)
+        (self.files / "fit").mkdir(exist_ok=True)
+        (self.files / "fit" / gr.STATUS_NAME).write_text(json.dumps(
+            {"ok": True, "time": written.strftime("%Y-%m-%dT%H:%M:%SZ")}))
+
+    def test_last_nights_status_is_ok(self) -> None:
+        self.status(age_h=9)
+        sh.check_water_level_record(STA)
+        self.assertEqual([s for s, _ in self.findings("record")], ["OK"])
+
+    def test_status_not_written_for_days_warns(self) -> None:
+        self.status(age_h=3 * 24)
+        sh.check_water_level_record(STA)
+        (status, message), = self.findings("record")
+        self.assertEqual(status, "WARN")
+        self.assertIn("3.0 days ago", message)
+
+
 if __name__ == "__main__":
     unittest.main()

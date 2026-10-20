@@ -556,6 +556,17 @@ class GnssRecordTests(unittest.TestCase):
         self.assertFalse(st["ok"])
         self.assertEqual(st["gnssrefl_version"], "4.2.3")
 
+    def test_status_says_so_when_subdaily_is_missing(self):
+        # it used to return before writing a status, so last night's
+        # ok=True stayed and the health mail reported a fit that did not run
+        results_range(self.refl, date(2026, 12, 1), date(2026, 12, 20))
+        self.assertEqual(self.night(), 0)
+        with unittest.mock.patch.object(gr.shutil, "which", return_value=None):
+            self.assertEqual(self.night(), 1)
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+        self.assertFalse(st["ok"])
+        self.assertIn("subdaily is not on PATH", st["message"])
+
     def test_station_health_reports_the_record(self):
         sys.path.insert(0, str(ROOT / "diagnostics"))
         import station_health as sh
