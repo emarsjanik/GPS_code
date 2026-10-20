@@ -325,7 +325,7 @@ one, rather than asking you to type a column name blind), or by hand.
 
 | Field | Type | Description |
 |---|---|---|
-| `external_storage_path` | string (path) | If set, each day's raw data and processed results are automatically moved here after processing, during continuous unattended operation. Leave unset to disable this entirely — everything stays local. |
+| `external_storage_path` | string (path) | If set, each day's raw data is moved here after processing, during continuous unattended operation, and whatever changed in `products/` since the last export is copied here (products/ itself is never moved or deleted: it holds the whole water-level record). Leave unset to disable this entirely — everything stays local. |
 | `manager_retry_delay_seconds` | number | How long to wait before retrying after a failed recording chunk, during continuous operation. Default `60.0`. |
 | `health_check_interval_seconds` | number | How often to record a system health snapshot (disk space, CPU, memory) during continuous operation. Default `3600.0` (1 hour). |
 | `export_retry_window_days` | integer | How many days to keep retrying a day's export to external storage before giving up (this exists because a day's orbit product routinely isn't published for 1-2 days after the fact, so an immediate export would predictably fail). Default `3`. |

@@ -577,14 +577,11 @@ class StationManager:
 
     def _export_day_to_external_storage(self, day: date) -> None:
         """
-        Move the day's raw capture and the entire gnssrefl working
-        directory (products/, i.e. $REFL_CODE and everything under
-        it) to external storage, then let the next day's processing
-        recreate products/ from scratch as needed (initialize()
-        already handles missing directories/files gracefully -- this
-        just costs a small amount of redundant setup each day, e.g.
-        re-downloading the EGM96 file, in exchange for a clean daily
-        export).
+        Move the day's raw capture, and copy what changed in the
+        gnssrefl working directory (products/, i.e. $REFL_CODE and
+        everything under it), to external storage. products/ itself
+        stays where it is: it holds the whole water-level record (see
+        _export_products_directory()).
 
         Disabled by default -- only runs if "external_storage_path"
         is set in station.json.
@@ -598,7 +595,7 @@ class StationManager:
         window, is simply left in place for a future cycle rather
         than exported.
 
-        Never raises. Local files are only removed after a
+        Never raises. The local raw file is only removed after a
         confirmed-successful move (shutil.move()'s own behavior), so
         a failure here (e.g. external storage temporarily unmounted)
         never loses data -- it just leaves that day's files sitting
@@ -696,15 +693,37 @@ class StationManager:
         "phase", "rinex", "orbits", "exe",
     )
 
+    # Written into products/ after each export; only files changed
+    # since then are copied by the next one (see below).
+    _EXPORT_MARKER = ".last_external_export"
+
     def _export_products_directory(self, day: date, destination_dir: Path) -> None:
         """
-        Flatten and move the entire products/ directory to external
-        storage, under a per-day folder name (so each day's export
-        doesn't overwrite the previous one) -- a no-op, not an error,
-        if products/ doesn't exist yet (e.g. the very first day,
-        before any processing has run at all).
+        Flatten and COPY products/ to external storage, under a
+        per-day folder name (so each day's export doesn't overwrite
+        the previous one) -- a no-op, not an error, if products/
+        doesn't exist yet (e.g. the very first day, before any
+        processing has run at all).
 
-        Confirmed necessary to flatten rather than move the whole
+        products/ is never moved or deleted. It holds the whole
+        water-level record, not one day's working files:
+        refl_code/<every year>/results (what gnss_record refits every
+        night), Files/<sta>/ (the whole-record spline, the frozen
+        years, the edit files) and input/<sta>.json. This used to
+        move every file and rmtree products/, so the first rollover
+        whose day had results left gnss_record with one day; its
+        shrink guard then refused to write, and the record stopped
+        while the frozen years were gone from the station. Copying
+        cannot do that.
+
+        To keep a daily per-day copy from re-copying the whole
+        record every day, only files changed since the previous
+        export (the _EXPORT_MARKER file's time) are copied; the
+        first export copies everything. The marker is only written
+        after every copy succeeded, so a failed export is redone in
+        full by the next one.
+
+        Confirmed necessary to flatten rather than copy the whole
         tree as-is: gnssrefl's own internal layout nests everything
         several levels deep (a year, then a category, then a station
         code, sometimes another year) purely for its own working
@@ -744,7 +763,16 @@ class StationManager:
             )
             return
 
-        files_moved = 0
+        marker = products_dir / self._EXPORT_MARKER
+        try:
+            since = marker.stat().st_mtime
+        except OSError:
+            since = None
+        # Taken before the walk: a file changed while it runs is
+        # copied again next time rather than missed.
+        started = time.time()
+
+        files_copied = 0
 
         for root, _dirs, files in os.walk(products_dir):
             if not files:
@@ -766,22 +794,26 @@ class StationManager:
                 if remainder_parts
                 else destination / category
             )
-            dest_subdir.mkdir(parents=True, exist_ok=True)
 
             for filename in files:
-                shutil.move(
-                    str(root_path / filename), str(dest_subdir / filename)
-                )
-                files_moved += 1
+                source = root_path / filename
+                if source == marker:
+                    continue
+                if since is not None and source.stat().st_mtime < since:
+                    continue
+                dest_subdir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(source), str(dest_subdir / filename))
+                files_copied += 1
 
-        shutil.rmtree(products_dir, ignore_errors=True)
+        marker.touch()
+        os.utime(marker, (started, started))
 
         self._logger.info(
-            "Exported and flattened products/ to external storage: "
-            "%s -> %s (%d files)",
+            "Exported and flattened products/ to external storage "
+            "(copied, products/ left in place): %s -> %s (%d files)",
             products_dir,
             destination,
-            files_moved,
+            files_copied,
         )
 
     @staticmethod

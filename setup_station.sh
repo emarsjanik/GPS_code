@@ -333,9 +333,9 @@ direct_signal_poly_order=$(prompt_optional_numeric "Direct-signal removal polyno
 
 echo ""
 echo "--- External storage (optional) ---"
-echo "If you want each day's raw data and processed results moved to"
-echo "external storage automatically after processing, enter the"
-echo "destination path."
+echo "If you want each day's raw data moved, and the processed results"
+echo "copied, to external storage automatically after processing, enter"
+echo "the destination path."
 external_storage_path=$(prompt "External storage path" "")
 
 echo ""

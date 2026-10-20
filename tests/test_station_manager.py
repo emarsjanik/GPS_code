@@ -20,6 +20,7 @@ Run with:
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import shutil
 import sys
 import tempfile
@@ -682,7 +683,73 @@ class TestExternalStorageExport(StationManagerTestCase):
         )
         self.assertTrue(exported.exists())
         self.assertEqual(exported.read_text(), "real data")
-        self.assertFalse(self.cfg.products_dir.exists())  # moved, not copied
+        # Copied, not moved: products/ is the whole water-level record.
+        self.assertEqual(
+            (self.cfg.products_dir / "refl_code" / "marker.txt").read_text(),
+            "real data",
+        )
+
+    def test_export_never_moves_or_deletes_the_record(self) -> None:
+        # products/ used to be moved file by file and then rmtree'd:
+        # the next night gnss_record found one day of results, refused
+        # to shrink the record, and the frozen years were gone.
+        refl = self.cfg.products_dir / "refl_code"
+        record_inputs = [
+            refl / "2025" / "results" / "usgs" / "300.txt",
+            refl / "2026" / "results" / "usgs" / "190.txt",
+            refl / "Files" / "usgs" / "usgs_spline_out.txt",
+            refl / "Files" / "usgs" / "usgs_2025_spline_frozen.txt",
+            refl / "Files" / "usgs" / "fit" / "record_status.json",
+            refl / "input" / "usgs.json",
+            refl / "2026" / "snr" / "usgs" / "usgs1900.26.snr66",
+        ]
+        for path in record_inputs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(path.name)
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        for path in record_inputs:
+            with self.subTest(path=path.relative_to(refl)):
+                self.assertEqual(path.read_text(), path.name)
+        exported = self.external_root / "Products" / "20260709"
+        self.assertEqual(
+            (exported / "Files" / "usgs" / "usgs_spline_out.txt").read_text(),
+            "usgs_spline_out.txt",
+        )
+        self.assertEqual(
+            (exported / "results" / "usgs" / "190.txt").read_text(), "190.txt"
+        )
+
+    def test_next_export_copies_only_what_changed(self) -> None:
+        # products/ now stays, so a daily export copies only the files
+        # changed since the last one, not the whole record again.
+        results = self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        old_day = results / "189.txt"
+        old_day.write_text("day 189")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        # Push the marker into the past, then write a later file.
+        marker = self.cfg.products_dir / self.manager._EXPORT_MARKER
+        long_ago = time.time() - 3600
+        os.utime(marker, (long_ago, long_ago))
+        os.utime(old_day, (long_ago - 60, long_ago - 60))
+        (results / "190.txt").write_text("day 190")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        second = self.external_root / "Products" / "20260709" / "results" / "usgs"
+        self.assertTrue((second / "190.txt").exists())
+        self.assertFalse((second / "189.txt").exists())
+        self.assertTrue(
+            (self.external_root / "Products" / "20260708" / "results"
+             / "usgs" / "189.txt").exists()
+        )
+        self.assertFalse(
+            (self.external_root / "Products" / "20260709" / "other").exists()
+        )
 
     def test_flattening_removes_year_and_station_nesting(self) -> None:
         # Confirmed against a real, live products/ directory: results
