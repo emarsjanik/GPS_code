@@ -368,8 +368,10 @@ def check_water_level_record(station_code: str, since=None) -> None:
 #     and the survivors are the doubtful ones. gnss_record.py keeps per
 #     UTC day arc count, median Amp and median PkNoise (arc_stats in
 #     record_status.json); a sharp drop on the newest day against the
-#     days before it is a WARN. It is equally what a receiver or antenna
-#     problem looks like, which is worth a look too.
+#     days before it is a WARN, and so is a newest day gnssir kept no arc
+#     of at all (it has no results file, so no other check sees it as a
+#     storm). It is equally what a receiver or antenna problem looks
+#     like, which is worth a look too.
 # ------------------------------------------------------------------
 ARC_BASELINE_DAYS = 7    # days before the newest one it is compared with
 ARC_MIN_BASELINE = 3
@@ -388,26 +390,37 @@ def check_arc_stats(station_code: str) -> None:
         return
     newest, before = stats[-1], stats[-1 - ARC_BASELINE_DAYS:-1]
     try:
+        # A day that kept no arc (gnss_record.kept_nothing_days) has 0
+        # arcs and no medians: it counts in the arc baseline, not in the
+        # amplitude one.
+        kept = [d for d in before if d["arcs"]]
         base_arcs = gnss_record._median([d["arcs"] for d in before])
-        base_amp = gnss_record._median([d["median_amp"] for d in before])
-        base_pkn = gnss_record._median([d["median_pknoise"] for d in before])
+        base_amp = gnss_record._median([d["median_amp"] for d in kept])
+        base_pkn = gnss_record._median([d["median_pknoise"] for d in kept])
         newest["arcs"], newest["median_amp"], newest["median_pknoise"]
     except (KeyError, TypeError):
         return
-    summary = (f"{newest['day']}: {newest['arcs']} arcs, median Amp {newest['median_amp']}, "
-               f"PkNoise {newest['median_pknoise']} (previous {len(before)} days: "
-               f"{base_arcs:.0f} arcs, Amp {base_amp:.1f}, PkNoise {base_pkn:.1f})")
+    today = (f"{newest['arcs']} arcs, median Amp {newest['median_amp']}, "
+             f"PkNoise {newest['median_pknoise']}" if newest["arcs"] else "no arcs kept")
+    previous = f"{base_arcs:.0f} arcs" + (f", Amp {base_amp:.1f}, PkNoise {base_pkn:.1f}"
+                                          if base_amp is not None else "")
+    summary = f"{newest['day']}: {today} (previous {len(before)} days: {previous})"
     dropped = []
     if newest["arcs"] < ARC_COUNT_DROP * base_arcs:
         dropped.append("arcs")
-    if newest["median_amp"] < ARC_AMP_DROP * base_amp:
+    if (newest["arcs"] and base_amp is not None
+            and newest["median_amp"] < ARC_AMP_DROP * base_amp):
         dropped.append("amplitude")
-    if dropped:
-        record(WARN, "arcs", f"sharp drop in {' and '.join(dropped)} -- {summary}. Rough "
-                             f"seas damp the reflection (the water levels kept may be the "
-                             f"biased ones); so does a receiver or antenna problem")
+    if not newest["arcs"]:
+        what = "gnssir kept no arcs at all"
+    elif dropped:
+        what = f"sharp drop in {' and '.join(dropped)}"
     else:
         record(OK, "arcs", summary)
+        return
+    record(WARN, "arcs", f"{what} -- {summary}. Rough seas damp the reflection (the "
+                         f"water levels kept may be the biased ones); so does a receiver "
+                         f"or antenna problem")
 
 
 # ------------------------------------------------------------------

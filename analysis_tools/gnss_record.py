@@ -462,15 +462,47 @@ def _median(values):
     return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
 
 
+def kept_nothing_days(refl_code: Path | str, sta: str) -> set[date]:
+    """Days gnssir ran for and kept no arc at all, so they have no results
+    file: gnssrefl 4.1.5 deletes <doy>.txt then ("No good retrievals
+    found", retrieve_rh.py) but still writes the rejected arcs to
+    results/<sta>/failQC/<doy>.txt, and recover_missing_days.sh leaves a
+    <doy>.no_data marker for such a day. A day gnssir never got to (no
+    SNR file: the orbit not out yet) has neither."""
+    found = set()
+    for ydir in Path(refl_code).glob("[0-9][0-9][0-9][0-9]"):
+        year = int(ydir.name)
+        res = ydir / "results" / sta
+        for f in list(res.glob("failQC/[0-9][0-9][0-9].txt")) + list(res.glob("[0-9]*.no_data")):
+            try:
+                d = date(year, 1, 1) + timedelta(days=int(f.name.split(".")[0]) - 1)
+            except ValueError:
+                continue
+            if d.year == year:
+                found.add(d)
+    return found
+
+
 def arc_stats(refl_code: Path | str, sta: str, days: int = ARC_STATS_DAYS) -> list[dict]:
-    """Per UTC day of the newest `days` results days: arcs kept by gnssir,
-    their median LSP amplitude (Amp) and median peak-to-noise (PkNoise).
-    A rough sea lowers the reflected power, so in a storm arcs fall below
-    gnssir's amplitude / peak2noise limits and drop out before anything
-    looks wrong in the water level; station_health.py warns on a sharp
-    drop. Read-only; a day that cannot be read is left out."""
+    """Per UTC day of the newest `days` days gnssir ran for: arcs kept by
+    gnssir, their median LSP amplitude (Amp) and median peak-to-noise
+    (PkNoise). A rough sea lowers the reflected power, so in a storm arcs
+    fall below gnssir's amplitude / peak2noise limits and drop out before
+    anything looks wrong in the water level; station_health.py warns on
+    a sharp drop. A day that kept no arc at all (kept_nothing_days) is
+    there with 0 arcs and no medians: it has no results file, and leaving
+    it out made the day before it the newest, so the worst storm day
+    read as an ordinary one. Read-only; a day that cannot be read is left
+    out."""
+    found = dict.fromkeys(kept_nothing_days(refl_code, sta))
+    found.update(results_days(refl_code, sta))
     out = []
-    for d, path in list(results_days(refl_code, sta).items())[-days:]:
+    for d in sorted(found)[-days:]:
+        path = found[d]
+        if path is None:
+            out.append({"day": d.isoformat(), "arcs": 0,
+                        "median_amp": None, "median_pknoise": None})
+            continue
         amp, pkn = [], []
         try:
             for s in _data_lines(path):
