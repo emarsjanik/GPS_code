@@ -5,8 +5,9 @@ Tests for the small operational fixes from the GPS_code review:
 
   B17  plot_raw_vs_spline.py read results/<doy>.txt unpadded, so days
        1-99 (gnssrefl writes 008.txt) were skipped. Same bug in
-       station_manager._has_real_results_for_day (export readiness)
-       and diagnostics/validate_station.py.
+       diagnostics/validate_station.py. (station_manager's export
+       readiness check is left as it is: it also looks outside
+       REFL_CODE, and fixing it arms the export, VERIFIED.md D3/M20.)
   B18  elevation_quality.py compared each arc's raw RH with the
        RHdot- and IF-corrected spline.
   B19  compare_to_usgs_gage.py took NWIS 00065 (gage height, above the
@@ -88,26 +89,6 @@ class TestOtherZeroPaddedReaders(unittest.TestCase):
             (results / "008.txt").write_text(results_line(2026, 8, 19.0))
             rows = vs.parse_gnssir_results(results, [8])
         self.assertEqual(len(rows), 1)
-
-    def test_station_manager_export_sees_results_of_day_8(self) -> None:
-        sys.path.insert(0, str(ROOT / "station"))
-        import types
-        if "serial" not in sys.modules:
-            fake = types.ModuleType("serial")
-            fake.SerialException = Exception
-            fake.Serial = None
-            sys.modules["serial"] = fake
-        import station_manager
-
-        with tempfile.TemporaryDirectory() as tmp:
-            products = Path(tmp)
-            manager = station_manager.StationManager()
-            manager.cfg = types.SimpleNamespace(
-                products_dir=products, station={"gnssrefl_station_code": "abcd"})
-            folder = products / "2026" / "results" / "abcd"
-            folder.mkdir(parents=True)
-            (folder / "008.txt").write_text("% h\n" + results_line(2026, 8, 19.0))
-            self.assertTrue(manager._has_real_results_for_day(date(2026, 1, 8)))
 
 
 # ------------------------------------------------------------

@@ -671,7 +671,7 @@ class StationManager:
             / str(day.year)
             / "results"
             / station_code
-            / f"{doy:03d}.txt"  # gnssrefl zero-pads (008.txt)
+            / f"{doy}.txt"
         )
 
         if not results_path.exists():
