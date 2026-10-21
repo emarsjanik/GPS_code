@@ -308,6 +308,11 @@ fi
 
 # Without the azimuth window as a fallback (a year with too few arcs in
 # the window makes subdaily crash); a fallback fit is never frozen.
+# gnss_record.py adds -gap_min_val <hours> to both when station.json sets
+# "subdaily_gap_min_val" (unset: gnssrefl's own 6 h), and writes
+# ${STATION_CODE}_spline_support.txt next to the spline: per level, the
+# hours to the nearest arc subdaily kept, so a level drawn across a gap
+# in the arcs can be told from a measured one.
 if "${GNSS_RECORD[@]}" update --settings "$SUBDAILY_SETTINGS" \
         --fallback-settings "-rhdot True -knots 8"; then
     echo ""

@@ -28,7 +28,8 @@ WHAT IT DOES (each run)
   3. Copies the production results of the previous two days into that
      folder (for continuity), runs subdaily over the three days with the
      same settings as process_and_plot.sh (-rhdot True -knots 8, azimuth
-     35-125, and any opt-in arc QC of station.json, which gnssir's json
+     35-125, station.json's subdaily_gap_min_val as -gap_min_val when
+     it is set, and any opt-in arc QC of station.json, which gnssir's json
      carries and gnss_record.with_json_qc puts on the command line, as
      each night's fit does), and keeps today's part of the spline as
      products/refl_code_ultra/history/ultra_<run time>.csv.
@@ -62,10 +63,23 @@ sys.path.insert(0, str(PROJECT / "station"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from station_datum import spline_shift  # noqa: E402
 from gnss_record import (MIN_EDGE_ARCS, arcs_in_window, azimuth_window,  # noqa: E402
-                         results_days, subdaily_range, with_json_qc)
+                         parse_gap_min_val, results_days, subdaily_range, with_gap_min_val,
+                         with_json_qc)
 
 # the same as process_and_plot.sh
 SUBDAILY_SETTINGS = "-rhdot True -knots 8 -azim1 35 -azim2 125"
+
+
+def subdaily_settings(station: dict) -> str:
+    """SUBDAILY_SETTINGS with station.json's optional subdaily_gap_min_val
+    as -gap_min_val, as gnss_record.py adds it to the production fit; a
+    value that is not a positive number of hours is said and left out."""
+    try:
+        return with_gap_min_val(SUBDAILY_SETTINGS,
+                                parse_gap_min_val(station.get("subdaily_gap_min_val")))
+    except ValueError as exc:
+        print(f"subdaily_gap_min_val in station.json: {exc} -- gnssrefl's default used here")
+        return SUBDAILY_SETTINGS
 
 
 def new_year_too_thin(days: dict, settings: str = SUBDAILY_SETTINGS) -> bool:
@@ -249,7 +263,7 @@ def main() -> int:
     spline = refl / "Files" / station / f"{station}_spline_out.txt"
     spline.unlink(missing_ok=True)                # so last run's spline is never read as this one's
     cmd = ["subdaily", station, str(y1), "-doy1", str(d1), "-year_end", str(y2), "-doy2", str(d2)
-           ] + with_json_qc(SUBDAILY_SETTINGS, refl, station).split()
+           ] + with_json_qc(subdaily_settings(cfg.station), refl, station).split()
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0 or not spline.exists():
         print(f"subdaily wrote no spline (exit status {r.returncode}):\n" + (r.stderr or r.stdout)[-1500:])

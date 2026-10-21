@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -75,7 +76,9 @@ def spline_text(first: date, last: date, hortho: float, rh_offset: float = 0.0) 
 # writing (what subdaily does when it finds no results); =crash_azim exits 1
 # when an azimuth window is given; =window exits 1 when the window leaves a
 # year of the range with no arcs (what the real one does); =rename_edit
-# writes the edit files under another name (a gnssrefl upgrade).
+# writes the edit files under another name (a gnssrefl upgrade). Like
+# gnssrefl it also writes the arcs it kept (all of them, in the azimuth
+# window) to <sta>_<years>_subdaily_edit.txt.withrhdotIF; =no_kept does not.
 FAKE_SUBDAILY = r'''#!/usr/bin/env python3
 import os, sys
 from datetime import date, timedelta
@@ -123,7 +126,16 @@ edit = "_subdaily_edit_v5.txt" if mode == "rename_edit" else "_subdaily_edit.txt
 for y in sorted({d.year for d in days}):
     with open(f"{out}/{sta}_{y}{edit}", "w") as f:
         f.write("% edit\n" + "".join(f"{d.year} {d.timetuple().tm_yday} 5.0\n" for d in days if d.year == y))
-with open(f"{out}/{sta}_{y1}_last.png" if y1 == y2 else f"{out}/{sta}_{y1}_{y2}_last.png", "w") as f:
+years = f"{y1}" if y1 == y2 else f"{y1}_{y2}"
+if mode != "no_kept":
+    lo, hi = float(opt.get("-azim1", 0)), float(opt.get("-azim2", 360))
+    with open(f"{out}/{sta}_{years}_subdaily_edit.txt.withrhdotIF", "w") as f:
+        f.write("% kept arcs\n")
+        for d in days:
+            for l in open(f"{refl}/{d.year}/results/{sta}/{d.timetuple().tm_yday:03d}.txt"):
+                if not l.startswith("%") and lo <= float(l.split()[5]) <= hi:
+                    f.write(" " + l)
+with open(f"{out}/{sta}_{years}_last.png", "w") as f:
     f.write(f"plot {y1} {y2}\n")
 '''
 
@@ -139,6 +151,35 @@ def write_result(refl: Path, d: date, n: int = 40, az: float = 80.0, rh: float =
                            f"{24 * i / n:.3f} {az:.2f} 12.0 5.05 14.95 200 1 1 0.7 4.0 45.0 "
                            f"{m0 + i / n:.6f} 1\n" for i in range(n)))
     return p
+
+
+def write_arcs(refl: Path, d: date, hours, az: float = 80.0) -> Path:
+    """A gnssir results file with one arc at each of these UTC hours."""
+    p = refl / str(d.year) / "results" / STA / f"{d.timetuple().tm_yday:03d}.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    m0 = (d - MJD0).days
+    p.write_text("% year doy RH sat UTCtime Azim Amp eminO emaxO NumbOf freq rise EdotF PkNoise"
+                 " DelT MJD refr-appl\n"
+                 + "".join(f"{d.year} {d.timetuple().tm_yday} 5.000 {i % 32 + 1} {h:.3f} {az:.2f} "
+                           f"12.0 5.05 14.95 200 1 1 0.7 4.0 45.0 {m0 + h / 24:.6f} 1\n"
+                           for i, h in enumerate(hours)))
+    return p
+
+
+def support_rows(path: Path):
+    """[(MJD as written, hours_to_arc, arcs_1h, gap_h)] of a support file."""
+    out = []
+    for line in path.read_text().splitlines():
+        if line.startswith("%") or not line.strip():
+            continue
+        c = line.split()
+        out.append((c[0], float(c[7]), float(c[8]), float(c[9])))
+    return out
+
+
+def as_text(support):
+    """Support rows compared as written (nan == nan)."""
+    return [tuple(map(str, s)) for s in support]
 
 
 def results_range(refl: Path, first: date, last: date) -> None:
@@ -1071,6 +1112,218 @@ class GnssRecordTests(unittest.TestCase):
 
 
 
+    # ---- gap support ------------------------------------------------------
+    # <sta>_spline_support.txt: for every level of the record, how far the
+    # arcs subdaily kept are, so a level drawn across a gap in the arcs (or
+    # across gnssrefl's straight-line fill of one over 5 h) can be told from
+    # a measured one; its newest-week summary in record_status.json and the
+    # health mail; and station.json's subdaily_gap_min_val.
+
+    # an arc at :15 and :45 of every hour: every level is 0.25 h from one
+    EVERY_HALF_HOUR = [k / 2 + 0.25 for k in range(48)]
+
+    def week_with_a_gap(self, gap=(10, 15)):
+        """1-10 December 2026; on the 9th no arcs between gap[0] and gap[1]
+        UTC, so the kept arcs either side are 9:45 and 15:15 (5.5 h)."""
+        d = date(2026, 12, 1)
+        while d <= date(2026, 12, 10):
+            hours = self.EVERY_HALF_HOUR
+            if d == date(2026, 12, 9):
+                hours = [h for h in hours if not gap[0] < h < gap[1]]
+            write_arcs(self.refl, d, hours)
+            d += timedelta(days=1)
+
+    def support(self):
+        return support_rows(gr.support_path(self.files, STA))
+
+    def check_health(self, sh):
+        sh.findings.clear()
+        with unittest.mock.patch.object(sh, "PROJECT_DIR", self.tmp):
+            sh.check_gap_support(STA)
+        return [(f[0], f[2]) for f in sh.findings if f[1] == "support"]
+
+    def test_row_support_at_the_edges(self):
+        arcs = [100.0, 100.0 + 1 / 24, 100.0 + 6 / 24]
+        near, n, gap = gr.row_support(100.0, arcs)               # on an arc
+        self.assertEqual((round(near, 6), n, gap), (0.0, 2, 0.0))
+        near, n, gap = gr.row_support(100.0 + 3 / 24, arcs)      # inside the 5 h gap
+        self.assertEqual((round(near, 6), n, round(gap, 6)), (2.0, 0, 5.0))
+        near, n, gap = gr.row_support(100.0 - 0.5 / 24, arcs)    # before the first arc
+        self.assertEqual((round(near, 6), n), (0.5, 1))
+        self.assertTrue(math.isnan(gap))
+        near, n, gap = gr.row_support(100.0 + 7 / 24, arcs)      # after the last
+        self.assertEqual((round(near, 6), n), (1.0, 1))          # +-1 h counts its ends
+        self.assertTrue(math.isnan(gap))
+
+    def test_one_support_row_per_level_and_the_gap_in_it(self):
+        self.week_with_a_gap()
+        self.assertEqual(self.night(), 0)
+        rec = (self.files / f"{STA}_spline_out.txt").read_text().splitlines()
+        mjds = [l.split()[0] for l in rec if not l.startswith("%")]
+        sup = self.support()
+        self.assertEqual([s[0] for s in sup], mjds, "the same MJD, as written, row for row")
+        by_time = {round((float(m) - (date(2026, 12, 9) - MJD0).days) * 24, 2): s
+                   for m, *s in sup if float(m) // 1 == (date(2026, 12, 9) - MJD0).days}
+        self.assertEqual(by_time[8.0], [0.25, 4.0, 0.5])         # ordinary: 4 arcs within 1 h
+        self.assertEqual(by_time[12.5], [2.75, 0.0, 5.5])        # the middle of the gap
+        self.assertEqual(by_time[10.0], [0.25, 2.0, 5.5])         # 9:15 and 9:45
+        self.assertEqual([t for t, s in sorted(by_time.items()) if s[0] > 2],
+                         [12.0, 12.5, 13.0])
+        head = gr.support_path(self.files, STA).read_text()
+        self.assertIn(f"{gr.SETTINGS_TAG} {SETTINGS}", head)
+        self.assertEqual(oct(gr.support_path(self.files, STA).stat().st_mode & 0o777), "0o644")
+
+    def test_status_and_health_mail_report_the_newest_week(self):
+        sh = self.link_products()
+        self.week_with_a_gap(gap=(10, 13))                        # 9:45 to 13:15: 3.5 h
+        self.assertEqual(self.night(), 0)
+        g = self.status()["gap_support"]
+        # the newest 7 days as plot_7day.py counts them: 3 Dec 23:30 to 10 Dec 23:30
+        self.assertEqual((g["from"], g["to"], g["rows"]), ("2026-12-03 23:30", "2026-12-10 23:30",
+                                                           7 * 48 + 1))
+        self.assertEqual((g["unknown_rows"], g["unsupported_rows"], g["rows_in_gaps_over_5h"],
+                          g["missing_rows"]), (0, 0, 0, 0))
+        self.assertEqual((g["max_hours_to_arc"], g["gap_min_val_hours"]), (1.75, 6.0))
+        self.assertEqual([s for s, _ in self.check_health(sh)], ["OK"])
+        # a 5.5 h gap: 3 levels over 2 h (under 5 %), but 11 in the fake-filled band
+        self.week_with_a_gap(gap=(10, 15))
+        self.assertEqual(self.night(), 0)
+        g = self.status()["gap_support"]
+        self.assertEqual((g["unsupported_rows"], g["rows_in_gaps_over_5h"], g["max_hours_to_arc"]),
+                         (3, 11, 2.75))
+        self.assertEqual(g["unsupported_fraction"], round(3 / 337, 4))
+        (status, message), = self.check_health(sh)
+        self.assertEqual(status, "WARN")
+        self.assertIn("3 of 337 levels (0.9 %) more than 2 h from any kept arc (longest 2.75 h); "
+                      "11 in kept-arc gaps over 5 h", message)
+        self.assertIn("straight-line fake data", message)
+        self.assertIn("subdaily_gap_min_val 5 in station.json", message)
+        self.assertIn(f"{STA}_spline_support.txt", message)
+        # a gap that has left the newest week is no longer counted
+        results_range(self.refl, date(2026, 12, 11), date(2026, 12, 17))
+        self.assertEqual(self.night(), 0)
+        self.assertEqual(self.status()["gap_support"]["rows_in_gaps_over_5h"], 0)
+        self.assertEqual([s for s, _ in self.check_health(sh)], ["OK"])
+
+    def test_no_kept_arc_file_is_reported_not_guessed(self):
+        sh = self.link_products()
+        results_range(self.refl, date(2026, 12, 1), date(2026, 12, 10))
+        os.environ["FAKE_SUBDAILY"] = "no_kept"
+        with unittest.mock.patch("builtins.print") as out:
+            self.assertEqual(gr.cmd_update(self.refl, STA, SETTINGS, FALLBACK, False), 0)
+        printed = "\n".join(str(c.args[0]) for c in out.call_args_list if c.args)
+        self.assertIn(f"subdaily wrote no {STA}_<years>{gr.KEPT_SUFFIX}", printed)
+        self.assertTrue(all(math.isnan(s[1]) for s in self.support()))
+        self.assertEqual(len(self.support()), len(self.record()))
+        g = self.status()["gap_support"]
+        self.assertEqual(g["unknown_rows"], g["rows"])
+        self.assertIsNone(g["unsupported_fraction"])
+        (status, message), = self.check_health(sh)
+        self.assertEqual(status, "WARN")
+        self.assertIn("no known support", message)
+        # the record itself is reported as before
+        self.assertEqual([f[0] for f in self.health(sh)], ["OK"])
+
+    def test_frozen_year_keeps_the_support_it_was_frozen_with(self):
+        results_range(self.refl, date(2026, 11, 20), date(2027, 1, 14))
+        self.assertEqual(self.night(), 0)                         # freezes 2026
+        fs = gr.frozen_support_path(self.files, STA, 2026)
+        frozen = support_rows(fs)
+        self.assertEqual(len(frozen), len(rows(gr.frozen_path(self.files, STA, 2026))))
+        self.assertFalse(any(math.isnan(s[1]) for s in frozen))
+        results_range(self.refl, date(2027, 1, 15), date(2027, 1, 15))
+        self.assertEqual(self.night(), 0)                         # 2027 only
+        self.assertEqual(self.status()["frozen"], [2026])
+        sup = self.support()
+        self.assertEqual(len(sup), len(self.record()))
+        self.assertEqual(as_text(sup[:len(frozen)]), as_text(frozen))
+        # a frozen year whose support file is gone: nan there, the rest known
+        fs.unlink()
+        self.assertEqual(self.night(), 0)
+        sup = self.support()
+        self.assertTrue(all(math.isnan(s[1]) for s in sup[:len(frozen)]))
+        self.assertFalse(any(math.isnan(s[1]) for s in sup[len(frozen):]))
+        self.assertEqual(self.status()["gap_support"]["unknown_rows"], 0)   # the week is 2027
+        # ... and one written with another freeze of that year is not used
+        write_result(self.refl, date(2026, 12, 25), n=30)        # 2026 changes: refrozen
+        self.assertEqual(self.night(), 0)
+        self.assertTrue(fs.exists())
+        self.assertFalse(any(math.isnan(s[1]) for s in self.support()))
+        text = fs.read_text().replace(gr.RESULTS_TAG + " ", gr.RESULTS_TAG + " 0")
+        fs.write_text(text)
+        self.assertEqual(self.night(), 0)
+        self.assertTrue(math.isnan(self.support()[0][1]))
+
+    def test_thin_year_fitted_by_itself_has_its_own_support(self):
+        write_result(self.refl, date(2026, 12, 31), n=8, az=250.0)
+        results_range(self.refl, date(2027, 1, 1), date(2027, 1, 5))
+        os.environ["FAKE_SUBDAILY"] = "window"
+        self.assertEqual(self.night(), 0)
+        self.assertEqual(self.status()["frozen"], [2026])
+        fs = support_rows(gr.frozen_support_path(self.files, STA, 2026))
+        n2026 = sum(1 for r in self.record() if r[1] == 2026)
+        self.assertEqual(len(fs), n2026)
+        # the thin year was fitted without the window: its 8 arcs are the support
+        self.assertFalse(any(math.isnan(s[1]) for s in fs))
+        self.assertEqual(as_text(self.support()[:n2026]), as_text(fs))
+
+    def test_gap_min_val_from_station_json(self):
+        results_range(self.refl, date(2026, 11, 20), date(2027, 1, 14))
+        sj = self.tmp / "station.json"
+
+        def update(cfg, settings=SETTINGS):
+            sj.write_text(json.dumps(dict({"station_id": "USGS00USA"}, **cfg)))
+            return subprocess.run(
+                [sys.executable, str(ROOT / "analysis_tools" / "gnss_record.py"),
+                 "--refl-code", str(self.refl), "--station", STA, "--station-json", str(sj),
+                 "update", "--settings", settings, "--fallback-settings", FALLBACK],
+                capture_output=True, text=True)
+
+        r = update({})                                            # unset: gnssrefl's own 6 h
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("gap_min_val", self.calls.read_text())
+        self.assertEqual(self.status()["gap_support"]["gap_min_val_hours"], 6.0)
+        frozen = gr.frozen_path(self.files, STA, 2026)
+        self.assertIn(f"{gr.SETTINGS_TAG} {SETTINGS}\n", frozen.read_text())
+        r = update({"subdaily_gap_min_val": 5})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("-gap_min_val 5 added", r.stdout)
+        self.assertTrue(self.last_call().endswith(f"{SETTINGS} -gap_min_val 5"), self.last_call())
+        st = self.status()
+        self.assertEqual((st["settings"], st["gap_support"]["gap_min_val_hours"]),
+                         (f"{SETTINGS} -gap_min_val 5", 5.0))
+        # the settings changed: 2026 is refitted and frozen again with them
+        self.assertIn("usgs 2026 -doy1 324 -year_end 2027", self.last_call())
+        self.assertIn(f"{gr.SETTINGS_TAG} {SETTINGS} -gap_min_val 5\n", frozen.read_text())
+        # the fallback gets it too
+        os.environ["FAKE_SUBDAILY"] = "crash_azim"
+        self.assertEqual(update({"subdaily_gap_min_val": 5.5}).returncode, 0)
+        self.assertTrue(self.last_call().endswith(f"{FALLBACK} -gap_min_val 5.5"), self.last_call())
+        os.environ["FAKE_SUBDAILY"] = ""
+        # one given in --settings is used, not doubled
+        self.assertEqual(update({"subdaily_gap_min_val": 5}, f"{SETTINGS} -gap_min_val 4").returncode, 0)
+        self.assertEqual(self.last_call().count("-gap_min_val"), 1)
+        self.assertTrue(self.last_call().endswith("-gap_min_val 4"))
+        # not a positive number of hours: refused, said in the status, record kept
+        before = (self.files / f"{STA}_spline_out.txt").read_text()
+        for bad in ("5h", 0, -1, True):
+            r = update({"subdaily_gap_min_val": bad})
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn("subdaily_gap_min_val", r.stderr)
+            self.assertFalse(self.status()["ok"])
+            self.assertIn("subdaily_gap_min_val", self.status()["message"])
+        self.assertEqual((self.files / f"{STA}_spline_out.txt").read_text(), before)
+
+    def test_ultra_rapid_check_uses_the_same_gap_setting(self):
+        import ultra_rapid_check as urc
+        self.assertEqual(urc.subdaily_settings({}), urc.SUBDAILY_SETTINGS)
+        self.assertEqual(urc.subdaily_settings({"subdaily_gap_min_val": 5}),
+                         urc.SUBDAILY_SETTINGS + " -gap_min_val 5")
+        with unittest.mock.patch("builtins.print"):
+            self.assertEqual(urc.subdaily_settings({"subdaily_gap_min_val": "x"}),
+                             urc.SUBDAILY_SETTINGS)
+
+
 def _gnssrefl_installed() -> bool:
     return shutil.which("subdaily") is not None and importlib.util.find_spec("gnssrefl") is not None
 
@@ -1244,6 +1497,40 @@ class RealSubdailyTests(unittest.TestCase):
         self.assertTrue(np.any(np.isclose(a[:, 0], mjd_2029 - 1 / 48, rtol=0, atol=1e-4)),
                         "23:30 on doy 366")
         self.assertTrue(np.any(np.isclose(a[:, 0], mjd_2029, rtol=0, atol=1e-4)), "00:00 on 1 January")
+
+    def test_support_and_gap_min_val_with_real_subdaily(self):
+        """The support file against gnssrefl's own output: one row per level,
+        the kept arcs found, and its gap column says exactly which levels
+        -gap_min_val 5 leaves out (gap_min_val does not change the fit)."""
+        np = self.np
+        self.results(date(2026, 12, 1), date(2026, 12, 10))
+        # a hole of just over 5 h on 6 December: filled with gnssrefl's
+        # straight-line fake data before the fit, and drawn under its 6 h
+        p = self.refl / "2026" / "results" / STA / f"{date(2026, 12, 6).timetuple().tm_yday:03d}.txt"
+        p.write_text("".join(l for l in p.read_text().splitlines(True)
+                             if l.startswith("%") or not 9.0 < float(l.split()[4]) < 14.1))
+        self.assertEqual(self.night(), 0)
+        a = np.loadtxt(self.files / f"{STA}_spline_out.txt", comments="%")
+        sup = support_rows(gr.support_path(self.files, STA))
+        self.assertEqual(len(sup), len(a))
+        np.testing.assert_allclose([float(s[0]) for s in sup], a[:, 0], rtol=0, atol=1e-7)
+        self.assertFalse(any(math.isnan(s[1]) for s in sup), "the kept arcs were found")
+        hole = {s[0] for s in sup if s[3] > 5}
+        self.assertGreater(len(hole), 4)
+        self.assertTrue(any(s[1] > 2 for s in sup if s[0] in hole))
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+        self.assertEqual(st["gap_support"]["rows_in_gaps_over_5h"], len(hole))   # in the newest week
+        # the same night with -gap_min_val 5: exactly those levels are gone,
+        # every other one is unchanged
+        with unittest.mock.patch("builtins.print"):
+            self.assertEqual(gr.cmd_update(self.refl, STA, gr.with_gap_min_val(SETTINGS, 5),
+                                           gr.with_gap_min_val(FALLBACK, 5), False), 0)
+        b = np.loadtxt(self.files / f"{STA}_spline_out.txt", comments="%")
+        kept = np.array([s[0] not in hole for s in sup])
+        np.testing.assert_array_equal(b[:, 0], a[kept, 0])
+        np.testing.assert_array_equal(b[:, 8], a[kept, 8])
+        g = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())["gap_support"]
+        self.assertEqual((g["rows_in_gaps_over_5h"], g["missing_rows"]), (0, len(hole)))
 
     def test_ultra_rapid_window_on_1_january(self):
         self.results(date(2026, 12, 30), date(2027, 1, 1))

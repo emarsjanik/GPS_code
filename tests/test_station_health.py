@@ -563,5 +563,78 @@ class TestRecordStatusAge(HealthTest):
         self.assertIn("3.0 days ago", message)
 
 
+class TestGapSupport(HealthTest):
+    """Levels drawn across gaps in the arcs subdaily kept (support file
+    and gap_support in record_status.json, written by gnss_record.py)."""
+
+    SETTINGS = "-rhdot True -knots 8 -azim1 35 -azim2 125"
+
+    def write_support(self, arcs_at, settings=SETTINGS, days=8,
+                      last=datetime(2026, 10, 19, 23, 30)) -> None:
+        """A support file for 30-minute levels over `days` days to `last`,
+        from kept arcs at the UTC hours arcs_at(day) gives for each day."""
+        t = last - timedelta(days=days)
+        lines, arcs = [], []
+        while t <= last:
+            m = (t - MJD0).total_seconds() / 86400
+            lines.append(f"{m:15.7f}      5.000 {t.year:4d} {t.month:3d} {t.day:3d} {t.hour:3d} "
+                         f"{t.minute:3d}   0      0.500\n")
+            t += timedelta(minutes=30)
+        day = (last - timedelta(days=days + 1)).replace(hour=0, minute=0)
+        while day <= last:
+            arcs += [(day - MJD0).total_seconds() / 86400 + h / 24 for h in arcs_at(day)]
+            day += timedelta(days=1)
+        (self.files / f"{STA}_spline_support.txt").write_text("".join(
+            gr.support_text(STA, settings, "test", gr.support_lines(lines, sorted(arcs)))))
+        gr.write_status(self.files, ok=True)
+
+    @staticmethod
+    def every_half_hour(day, skip=()):
+        return [k / 2 + 0.25 for k in range(48)
+                if not any(a < k / 2 + 0.25 < b for a, b in skip)]
+
+    def test_well_supported_week_is_ok(self) -> None:
+        self.write_support(self.every_half_hour)
+        sh.check_gap_support(STA)
+        (status, message), = self.findings("support")
+        self.assertEqual(status, "OK")
+        self.assertIn("newest 7 days: 0 of 337 levels (0.0 %) more than 2 h", message)
+
+    def test_many_levels_far_from_any_arc_warn(self) -> None:
+        # two 5.0 h gaps a day (none over 5 h): 4 levels a day over 2 h, 8 %
+        self.write_support(lambda d: self.every_half_hour(d, [(1, 5.5), (13, 17.5)]))
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())["gap_support"]
+        self.assertEqual((st["unsupported_rows"], st["rows_in_gaps_over_5h"]), (28, 0))
+        sh.check_gap_support(STA)
+        (status, message), = self.findings("support")
+        self.assertEqual(status, "WARN")
+        self.assertIn("over 5 % of the week is spline across gaps in the arcs", message)
+        self.assertNotIn("fake data", message)
+
+    def test_band_left_by_a_smaller_gap_min_val_is_said(self) -> None:
+        # gap_min_val is 5 already: a 5.5 h gap is left only next to the newest arc
+        def arcs_at(day):
+            hours = self.every_half_hour(day)
+            return [h for h in hours if h < 18] + [23.75] if day.day == 19 else hours
+        self.write_support(arcs_at, settings=self.SETTINGS + " -gap_min_val 5")
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())["gap_support"]
+        self.assertEqual(st["gap_min_val_hours"], 5.0)
+        self.assertGreater(st["rows_in_gaps_over_5h"], 0)
+        sh.check_gap_support(STA)
+        (status, message), = self.findings("support")
+        self.assertEqual(status, "WARN")
+        self.assertIn("next to the newest arc", message)
+        self.assertNotIn("subdaily_gap_min_val 5 in station.json", message)
+
+    def test_status_without_gap_support_says_nothing(self) -> None:
+        gr.write_status(self.files, ok=True)                  # no support file yet
+        self.assertIsNone(json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+                          ["gap_support"])
+        sh.check_gap_support(STA)
+        (self.files / "fit" / gr.STATUS_NAME).write_text(json.dumps({"ok": True}))  # older status
+        sh.check_gap_support(STA)
+        self.assertEqual(self.findings("support"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
