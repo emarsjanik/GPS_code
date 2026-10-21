@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -889,10 +890,21 @@ class TestExternalStorageExport(StationManagerTestCase):
         # Confirms the real ordering in run()'s daily cycle: pipeline
         # runs, then health check, then export -- not export first,
         # which could move data pipeline.py still needed. Recording
-        # itself is irrelevant to this test, so it's replaced with a
-        # no-op to reach the ordering-relevant calls immediately.
+        # itself is irrelevant to this test: the first day ends at
+        # once, to reach the ordering-relevant calls immediately, and
+        # the next one records until stopped, as the real recorder
+        # does while the pipeline runs in the background.
         self.manager._today = lambda: date(2026, 7, 9)
-        self.manager._record_day = lambda day: None
+        days_recorded = []
+
+        def record_day(day):
+            if days_recorded:
+                deadline = time.monotonic() + 5.0
+                while not self.manager._stop_requested and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            days_recorded.append(day)
+
+        self.manager._record_day = record_day
 
         raw_file = self.cfg.raw_dir / "station_20260709.um980"
         raw_file.write_bytes(b"fake raw data")
@@ -974,7 +986,10 @@ class TestLifecycle(StationManagerTestCase):
         self.manager.run()
 
         self.assertEqual(pipeline_runs["count"], 2)
-        self.assertEqual(len(FakeReceiver.record_calls), 2)
+        # day3 keeps recording while day2's pipeline runs in the
+        # background, until that run asks for the stop: at least the
+        # two chunks of day1 and day2, usually more.
+        self.assertGreaterEqual(len(FakeReceiver.record_calls), 2)
         self.assertFalse(self.manager._running)
         self.assertTrue(self.manager._stop_requested)
 
@@ -999,6 +1014,371 @@ class TestLifecycle(StationManagerTestCase):
 
         self.assertTrue(self.fake_pipeline.shutdown_called)
         self.assertFalse(self.manager._initialized)
+
+
+# ------------------------------------------------------------
+# Recording continues while the pipeline runs (review B8)
+# ------------------------------------------------------------
+
+class BlockingPipeline(FakePipeline):
+    """
+    A FakePipeline whose run() holds until `release` is set (or a
+    timeout), counting the chunks of `watch_day` that the recorder
+    wrote meanwhile. Tracks how many runs overlap.
+    """
+
+    def __init__(self, watch_day: date, hold_s: float = 5.0):
+        super().__init__()
+        self.watch = f"{watch_day:%Y%m%d}"
+        self.hold_s = hold_s
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.chunks_at_start = None
+        self.chunks_during_run = None
+        self.active = 0
+        self.max_active = 0
+        self._count_lock = threading.Lock()
+
+    def watched_chunks(self) -> int:
+        return sum(
+            self.watch in call["filename"].name
+            for call in list(FakeReceiver.record_calls)
+        )
+
+    def run(self) -> PipelineSummary:
+        with self._count_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if self.run_calls == 0:
+                self.chunks_at_start = self.watched_chunks()
+                self.started.set()
+                self.release.wait(self.hold_s)
+                self.chunks_during_run = (
+                    self.watched_chunks() - self.chunks_at_start
+                )
+            return super().run()
+        finally:
+            with self._count_lock:
+                self.active -= 1
+            self.finished.set()
+
+
+class TestPipelineInBackground(StationManagerTestCase):
+
+    day1 = date(2026, 7, 9)
+    day2 = date(2026, 7, 10)
+    day3 = date(2026, 7, 11)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.manager._seconds_until_next_utc_midnight = lambda: 9999.0
+
+    def _use(self, pipeline, station=None) -> None:
+        self.cfg.station = dict(station or {})
+        self.manager = station_manager.StationManager(
+            cfg=self.cfg, db=self.db, pipeline=pipeline
+        )
+        self.manager._make_receiver = lambda: FakeReceiver(cfg=self.cfg)
+        self.manager.initialize()
+        self.manager._seconds_until_next_utc_midnight = lambda: 9999.0
+        self.manager._chunk_seconds = 0.0
+        self.manager._retry_delay_seconds = 0.0
+
+    def _days_by_chunk_count(self, *days_and_chunks) -> None:
+        """
+        _today() follows the chunks recorded: the first n1 chunks are
+        day 1, the next n2 day 2, ...; the last day never ends.
+        """
+
+        def fake_today():
+            done = len(FakeReceiver.record_calls)
+            for day, chunks in days_and_chunks[:-1]:
+                if done < chunks:
+                    return day
+                done -= chunks
+            return days_and_chunks[-1][0]
+
+        self.manager._today = fake_today
+
+    def _stop_when(self, predicate, timeout_s: float = 10.0) -> None:
+        """Stop between chunks once `predicate()` holds (or on timeout)."""
+
+        original = self.manager._record_one_chunk
+        deadline = time.monotonic() + timeout_s
+
+        def record(raw_file, duration):
+            original(raw_file, duration)
+            if predicate() or time.monotonic() > deadline:
+                self.manager.stop()
+            else:
+                time.sleep(0.001)
+
+        self.manager._record_one_chunk = record
+
+    def test_defaults_to_background(self) -> None:
+        self._use(FakePipeline())
+        self.assertTrue(self.manager._pipeline_in_background)
+
+    def test_station_json_can_restore_inline_order(self) -> None:
+        self._use(FakePipeline(), {"manager_pipeline_in_background": False})
+        self.assertFalse(self.manager._pipeline_in_background)
+
+    def test_next_day_records_while_pipeline_runs(self) -> None:
+        # The fix itself: the pipeline started at day1's rollover
+        # holds until the recorder has written a chunk of day2. With
+        # the old inline run nothing records until run() returns, so
+        # the pipeline would hold for its full timeout and count none.
+        pipeline = BlockingPipeline(watch_day=self.day2)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+
+        def released_and_done():
+            if (
+                pipeline.started.is_set()
+                and pipeline.watched_chunks() > pipeline.chunks_at_start
+            ):
+                pipeline.release.set()
+            return pipeline.finished.is_set()
+
+        self._stop_when(released_and_done)
+
+        self.manager.run()
+
+        self.assertEqual(pipeline.run_calls, 1)
+        self.assertGreaterEqual(pipeline.chunks_during_run, 1)
+        day2_files = {
+            c["filename"].name for c in FakeReceiver.record_calls
+            if "20260710" in c["filename"].name
+        }
+        self.assertEqual(day2_files, {"station_20260710.um980"})
+
+    def test_inline_mode_records_nothing_while_pipeline_runs(self) -> None:
+        # The way back ("manager_pipeline_in_background": false) is
+        # the old order: no chunk of day2 while day1's pipeline runs.
+        pipeline = BlockingPipeline(watch_day=self.day2, hold_s=0.2)
+        self._use(pipeline, {"manager_pipeline_in_background": False})
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+        self._stop_when(lambda: pipeline.finished.is_set())
+
+        self.manager.run()
+
+        self.assertEqual(pipeline.chunks_during_run, 0)
+        self.assertEqual(len(FakeReceiver.record_calls), 2)
+
+    def test_health_and_export_follow_the_pipeline_in_the_thread(self) -> None:
+        pipeline = BlockingPipeline(watch_day=self.day2)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+
+        order = []
+        original_health = self.manager._health_check
+        original_export = self.manager._export_day_to_external_storage
+
+        def health():
+            order.append(("health", pipeline.finished.is_set()))
+            original_health()
+
+        def export(day):
+            order.append(("export", day))
+            original_export(day)
+
+        self.manager._health_check = health
+        self.manager._export_day_to_external_storage = export
+
+        def released_and_done():
+            if pipeline.started.is_set():
+                pipeline.release.set()
+            return len(order) >= 2
+
+        self._stop_when(released_and_done)
+
+        self.manager.run()
+
+        self.assertEqual(order, [("health", True), ("export", self.day1)])
+
+    def test_stop_waits_for_the_pipeline_in_progress(self) -> None:
+        # A stop asked for while the background run is busy must not
+        # let run() return (and shutdown() close the database) under it.
+        pipeline = BlockingPipeline(watch_day=self.day2)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+
+        def stop_then_release_late():
+            if not pipeline.started.is_set():
+                return False
+            # Released only after run() has seen the stop.
+            threading.Timer(0.3, pipeline.release.set).start()
+            return True
+
+        self._stop_when(stop_then_release_late)
+
+        self.manager.run()
+
+        self.assertTrue(pipeline.finished.is_set())
+        self.assertIsNone(self.manager._rollover_thread)
+        self.manager.shutdown()
+        self.assertTrue(pipeline.shutdown_called)
+
+    def test_a_busy_pipeline_delays_the_next_day_never_overlaps(self) -> None:
+        # day1's run holds past day2's rollover; day2's run waits for
+        # it, so the two never run at once, and both days are exported
+        # in order.
+        pipeline = BlockingPipeline(watch_day=self.day3)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1), (self.day3, 1))
+
+        exported = []
+        self.manager._export_day_to_external_storage = exported.append
+
+        def release_on_day3_then_done():
+            if pipeline.watched_chunks() >= 1:
+                pipeline.release.set()
+            return len(exported) >= 2
+
+        self._stop_when(release_on_day3_then_done)
+
+        self.manager.run()
+
+        self.assertEqual(pipeline.run_calls, 2)
+        self.assertEqual(pipeline.max_active, 1)
+        self.assertEqual(exported, [self.day1, self.day2])
+
+    def test_system_exit_in_the_pipeline_is_logged_recording_goes_on(self) -> None:
+        # gnssrefl calls sys.exit() on some error paths. In the thread
+        # that must not end the day's work silently, nor reach the
+        # recorder; the next day's work still runs.
+        class ExitingPipeline(FakePipeline):
+            def run(self):
+                if self.run_calls == 0:
+                    self.run_calls += 1
+                    raise SystemExit("gnssrefl gave up")
+                return super().run()
+
+        pipeline = ExitingPipeline()
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1), (self.day3, 1))
+        self._stop_when(lambda: pipeline.run_calls >= 2 and len(FakeReceiver.record_calls) >= 3)
+
+        with self.assertLogs("station.manager", level="ERROR") as logs:
+            self.manager.run()
+
+        self.assertEqual(pipeline.run_calls, 2)
+        self.assertTrue(any("gnssrefl gave up" in line for line in logs.output))
+        self.assertFalse(self.manager._running)
+
+
+class _WritingReceiver(FakeReceiver):
+    """A FakeReceiver that really appends bytes, as record_raw() does."""
+
+    def record_raw(self, filename, duration, append=False, enable_logging=False, **kwargs):
+        result = super().record_raw(filename, duration, append, enable_logging)
+        with open(filename, "ab" if append else "wb") as handle:
+            handle.write(b"\xaa" * 1000)
+        return result
+
+
+class TestRealPipelineInBackground(StationManagerTestCase):
+    """
+    The real Pipeline and a real SQLite Database, shared with the
+    manager, run in the background thread (only convbin and gnssrefl
+    are faked), while the recorder appends to today's raw file.
+    """
+
+    def test_real_pipeline_processes_the_closed_day_while_today_records(self) -> None:
+        from pipeline import Pipeline
+
+        closed_day = date(2020, 1, 1)
+        today = datetime.now(timezone.utc).date()
+        closed_file = self.cfg.raw_dir / f"station_{closed_day:%Y%m%d}.um980"
+        today_file = self.cfg.raw_dir / f"station_{today:%Y%m%d}.um980"
+
+        def today_chunks() -> int:
+            return sum(
+                c["filename"] == today_file for c in list(FakeReceiver.record_calls)
+            )
+
+        seen = {"today_chunks_during_convert": None, "converted": []}
+        converted = threading.Event()
+        root = self.root
+
+        class FakeRinex:
+            def convert(self, raw_path):
+                seen["converted"].append(raw_path.name)
+                before = today_chunks()
+                deadline = time.monotonic() + 5.0
+                while today_chunks() <= before and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                seen["today_chunks_during_convert"] = today_chunks() - before
+                converted.set()
+                return SimpleNamespace(
+                    observation_file=root / "rinex" / f"{raw_path.stem}.obs",
+                    navigation_file="", sbas_file="", success=True,
+                    convbin_version="fake", message="ok",
+                )
+
+            def verify(self, result):
+                return True
+
+        class FakeGnssir:
+            def process(self, observation_file, day):
+                return SimpleNamespace(
+                    reflector_height=19.0, soil_moisture=None, snow_depth=None,
+                    quality_score=1.0, output_directory=str(root / "products"),
+                    success=True, runtime_seconds=0.0, message="ok",
+                )
+
+            def verify(self, result):
+                return True
+
+        class TestPipeline(Pipeline):
+            def _initialize_processors(self):
+                self._rinex = FakeRinex()
+                self._gnssir = FakeGnssir()
+
+        pipeline = TestPipeline(cfg=self.cfg, db=self.db)
+        manager = station_manager.StationManager(
+            cfg=self.cfg, db=self.db, pipeline=pipeline
+        )
+        manager._make_receiver = lambda: _WritingReceiver(cfg=self.cfg)
+        manager.initialize()
+        manager._seconds_until_next_utc_midnight = lambda: 9999.0
+        manager._chunk_seconds = 0.0
+        manager._today = lambda: closed_day if not FakeReceiver.record_calls else today
+
+        original = manager._record_one_chunk
+        deadline = time.monotonic() + 10.0
+
+        def record(raw_file, duration):
+            original(raw_file, duration)
+            if raw_file == closed_file:
+                # Closed long ago, so the pipeline's "written in the
+                # last 15 min" rule (for files without today's date)
+                # does not hold it back in this test.
+                old = time.time() - 3600
+                os.utime(closed_file, (old, old))
+            if (converted.is_set() and manager._last_summary is not None
+                    and today_chunks() >= 2) or time.monotonic() > deadline:
+                manager.stop()
+            else:
+                time.sleep(0.001)
+
+        manager._record_one_chunk = record
+
+        manager.run()
+
+        # The closed day went through the real pipeline and was archived ...
+        self.assertEqual(seen["converted"], [closed_file.name])
+        self.assertTrue((self.cfg.archive_dir / closed_file.name).exists())
+        self.assertFalse(closed_file.exists())
+        self.assertEqual(manager._last_summary.files_processed, 1)
+        # ... while today's file kept growing in raw/, never touched.
+        self.assertGreaterEqual(seen["today_chunks_during_convert"], 1)
+        self.assertTrue(today_file.exists())
+        self.assertEqual(today_file.stat().st_size, 1000 * today_chunks())
+        # The health snapshot ran in the thread on the shared database.
+        self.assertIsNotNone(manager._last_health_check)
 
 
 # ------------------------------------------------------------

@@ -27,13 +27,53 @@ Daily cycle
         |   one growing raw file for the day, checking for a
         |   requested stop between chunks
         |
-        +-- once the day rolls over (or a stop was requested),
-        |   run the processing pipeline (raw -> RINEX -> GNSS-IR ->
-        |   archive) over whatever's accumulated
+        +-- once the day rolls over, hand the day just closed to a
+        |   background thread, which runs the processing pipeline
+        |   (raw -> RINEX -> GNSS-IR -> archive) over whatever's
+        |   accumulated, then records a system health snapshot,
+        |   then exports the day (if configured)
         |
-        +-- record a periodic system health snapshot
+        +-- start recording the new day at once, while that runs
         |
         +-- repeat, unless a stop was requested
+
+Recording does not wait for the pipeline
+------------------------------------------
+The pipeline used to run inline, between the last chunk of one day
+and the first chunk of the next. Converting a ~360 MB day and running
+rinex2snr and gnssir takes minutes, so every day lost its first
+minutes after 00:00 UTC: no data was recorded while it ran. That gap
+is under 5 h, so gnssrefl's subdaily spline bridged it with
+interpolated values, as if they had been observed (review B8).
+
+The run is not dropped, although the 22:30 cron runs the same
+pipeline: it is the run the record depends on. The cron's pipeline
+step imports pipeline.py by a path relative to cron's working
+directory, so with the documented crontab it does not run (verified
+finding H1). Instead the run, the health snapshot and the export go
+to one background thread, in that order, and the main thread goes
+straight back to recording.
+
+A thread rather than a separate process, because everything the run
+needs is already safe to share. database.py opens SQLite with
+check_same_thread=False and serialises every call with a lock, and
+the main thread does not touch the database while it records.
+Neither processor changes the working directory or installs a signal
+handler, and gnssrefl_processor.py already catches the SystemExit
+that gnssrefl raises on some error paths. The recorder writes only
+today's raw file, which pipeline.py leaves alone ("still recording"),
+and the export moves the closed day's raw file only after the
+pipeline has finished with it, in the same thread. Run from a
+process, the injected Pipeline (tests, shared orchestration) and the
+last summary in status() would be lost.
+
+If the work for one rollover is still running when the next day
+closes (a large backlog), the next day's work waits for it, so two
+pipeline runs never overlap. A stop request waits for the running
+work to finish before run() returns, as it waited for the inline run
+before. "manager_pipeline_in_background": false in station.json
+restores the old inline order, as a way back if the thread ever
+causes trouble on the station.
 
 Chunked recording, not one call per day
 -----------------------------------------
@@ -75,6 +115,7 @@ import logging
 import os
 import shutil
 import signal
+import threading
 import time
 
 from config import Config
@@ -151,6 +192,12 @@ class StationManager:
         default=3600.0, init=False, repr=False
     )
     _export_retry_window_days: int = field(default=3, init=False, repr=False)
+    # See "Recording does not wait for the pipeline" in the module
+    # docstring.
+    _pipeline_in_background: bool = field(default=True, init=False, repr=False)
+    _rollover_thread: threading.Thread | None = field(
+        default=None, init=False, repr=False
+    )
     _external_storage_path: Path | None = field(
         default=None, init=False, repr=False
     )
@@ -206,6 +253,9 @@ class StationManager:
         self._export_retry_window_days = int(
             station_section.get("export_retry_window_days", 3)
         )
+        self._pipeline_in_background = bool(
+            station_section.get("manager_pipeline_in_background", True)
+        )
 
         external_storage = station_section.get("external_storage_path")
         self._external_storage_path = (
@@ -225,11 +275,13 @@ class StationManager:
 
         self._logger.info(
             "StationManager initialized: chunk=%.0fs retry_delay=%.0fs "
-            "health_check_every=%.0fs export_retry_window=%dd",
+            "health_check_every=%.0fs export_retry_window=%dd "
+            "pipeline_in_background=%s",
             self._chunk_seconds,
             self._retry_delay_seconds,
             self._health_check_every_seconds,
             self._export_retry_window_days,
+            self._pipeline_in_background,
         )
 
         return "READY"
@@ -239,12 +291,16 @@ class StationManager:
         The main loop. Blocks until stop() is called (directly, or
         via a caught SIGTERM/SIGINT), recording each UTC day in
         chunks and running the processing pipeline once each day's
-        recording finishes.
+        recording finishes -- in a background thread, while the next
+        day records (see the module docstring).
 
         A failure recording one chunk, or running the pipeline for a
         day, is logged and the loop continues -- this is meant to
         run completely unattended, so a single failure must never
         take down the whole process.
+
+        Before returning, waits for any pipeline run still in
+        progress, so shutdown() never closes the database under it.
         """
 
         if not self._initialized:
@@ -266,13 +322,9 @@ class StationManager:
             if self._stop_requested:
                 break
 
-            self._logger.info(
-                "Recording for %s complete; running pipeline", self._current_day
-            )
+            self._start_rollover_work(self._current_day)
 
-            self._run_pipeline_safely()
-            self._health_check()
-            self._export_day_to_external_storage(self._current_day)
+        self._wait_for_rollover_work()
 
         self._running = False
         self._logger.info("StationManager main loop stopped")
@@ -304,6 +356,11 @@ class StationManager:
         """Close the database connection, if this manager opened it."""
 
         self._logger.info("Shutting down StationManager")
+
+        # run() already waited; this covers a run() that was left by
+        # an exception (e.g. a KeyboardInterrupt before the signal
+        # handlers were registered).
+        self._wait_for_rollover_work()
 
         if self._pipeline is not None:
             self._pipeline.shutdown()
@@ -430,6 +487,94 @@ class StationManager:
     # ==========================================================
     # Private: pipeline / health
     # ==========================================================
+
+    def _start_rollover_work(self, day: date) -> None:
+        """
+        Hand the work for the day just closed (pipeline, health
+        snapshot, export) to a background thread and return at once,
+        so the caller can start recording the new day. With
+        manager_pipeline_in_background false, do the work here
+        instead, as run() used to.
+
+        The thread waits for the previous rollover's thread first, so
+        the work of two days never runs at the same time.
+        """
+
+        if not self._pipeline_in_background:
+            self._logger.info(
+                "Recording for %s complete; running pipeline", day
+            )
+            self._rollover_work(day, previous=None)
+            return
+
+        previous = self._rollover_thread
+        if previous is not None and previous.is_alive():
+            self._logger.warning(
+                "Pipeline work for an earlier day is still running; the "
+                "work for %s will start when it finishes",
+                day,
+            )
+        else:
+            previous = None
+
+        self._logger.info(
+            "Recording for %s complete; running pipeline in the "
+            "background while the next day records",
+            day,
+        )
+
+        thread = threading.Thread(
+            target=self._rollover_work,
+            args=(day, previous),
+            name=f"rollover-{day:%Y%m%d}",
+        )
+        self._rollover_thread = thread
+        thread.start()
+
+    def _rollover_work(self, day: date, previous: threading.Thread | None) -> None:
+        """
+        The work that follows a day's recording, in its required
+        order: the pipeline first, then the health snapshot, then the
+        export (which may move the day's raw file, so it must come
+        after the pipeline is done with it).
+
+        Never raises. _run_pipeline_safely(), _health_check() and the
+        export already catch every Exception; what is left is
+        SystemExit, which gnssrefl raises on some error paths
+        (gnssrefl_processor.py catches it around rinex2snr and gnssir,
+        but not elsewhere). Uncaught in a thread it would end the
+        thread with nothing in the station log; inline it used to end
+        the whole manager. Here it is logged, the rest of that day's
+        work is skipped, and recording carries on.
+        """
+
+        try:
+            if previous is not None:
+                previous.join()
+
+            self._run_pipeline_safely()
+            self._health_check()
+            self._export_day_to_external_storage(day)
+
+        except (Exception, SystemExit) as exc:
+            self._logger.error(
+                "Pipeline work for %s failed (non-fatal): %s", day, exc
+            )
+
+    def _wait_for_rollover_work(self) -> None:
+        """Block until the background pipeline work (if any) is done."""
+
+        thread = self._rollover_thread
+        if thread is None or thread is threading.current_thread():
+            return
+
+        if thread.is_alive():
+            self._logger.info(
+                "Waiting for the pipeline run in progress to finish"
+            )
+
+        thread.join()
+        self._rollover_thread = None
 
     def _run_pipeline_safely(self) -> None:
         assert self._pipeline is not None

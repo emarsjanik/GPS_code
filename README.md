@@ -104,7 +104,7 @@ See [`STATION_JSON_REFERENCE.md`](STATION_JSON_REFERENCE.md) for the complete fi
 | `gnssrefl_orbit_source` | `"nav"` for offline-friendly broadcast ephemeris; unset for default multi-GNSS SP3 |
 | `gnssrefl_sample_rate` | Recording sample rate in seconds; must match the real `LOG ... ONTIME` interval |
 | `record_raw_chunk_seconds` | `StationManager` recording chunk size; 3600 (1h) default, 600 (10min) recommended for cron/systemd-managed deployments so stop/restart stay responsive |
-| `manager_retry_delay_seconds`, `health_check_interval_seconds` | `StationManager` tuning |
+| `manager_retry_delay_seconds`, `health_check_interval_seconds`, `manager_pipeline_in_background` | `StationManager` tuning |
 | `tide_model_file`, `tide_model_value_column`, `tide_model_time_column` | Optional — enables automatic tide model comparison in `process_and_plot.sh` |
 
 ## Running

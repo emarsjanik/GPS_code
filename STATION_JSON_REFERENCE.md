@@ -329,6 +329,7 @@ one, rather than asking you to type a column name blind), or by hand.
 | `manager_retry_delay_seconds` | number | How long to wait before retrying after a failed recording chunk, during continuous operation. Default `60.0`. |
 | `health_check_interval_seconds` | number | How often to record a system health snapshot (disk space, CPU, memory) during continuous operation. Default `3600.0` (1 hour). |
 | `export_retry_window_days` | integer | How many days to keep retrying a day's export to external storage before giving up (this exists because a day's orbit product routinely isn't published for 1-2 days after the fact, so an immediate export would predictably fail). Default `3`. |
+| `manager_pipeline_in_background` | boolean | At each UTC midnight, run the processing pipeline (then the health snapshot, then the export) in a background thread while the next day records. Default `true`. `false` restores the old order, in which nothing was recorded while the pipeline ran (a gap of several minutes after 00:00 UTC every day); it is there only as a way back if the background run ever causes trouble. |
 
 ---
 
