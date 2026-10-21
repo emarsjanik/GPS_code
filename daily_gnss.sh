@@ -93,6 +93,13 @@ if [ ! -x "$PROJECT_DIR/process_and_plot.sh" ]; then
     exit 1
 fi
 
+# process_and_plot.sh exits non-zero only when it cannot run at all (no
+# venv, no convbin, no usable station.json, the results cannot be
+# listed). A step that fails after that -- the fit, the 7-day plot, the
+# tide comparison -- leaves that step's output from an earlier night,
+# and the run still exits 0, so the upload below goes ahead with what
+# was made. Which steps failed is in logs/process_and_plot_status.json;
+# station_health.py reports it (see process_and_plot.sh, EXIT STATUS).
 proc_start=$(date +%s)
 if "$PROJECT_DIR/process_and_plot.sh" >>"$LOG_FILE" 2>&1; then
     proc_elapsed=$(( $(date +%s) - proc_start ))

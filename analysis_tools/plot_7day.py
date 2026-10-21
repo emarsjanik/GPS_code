@@ -32,7 +32,17 @@ standards than the internal diagnostic plots:
     mean sea level.) The offset comes from station.json
     (water_level_msl_offset) rather than being hardcoded, because it
     has been revised more than once as processing was corrected, and
-    a stale correction on a public page is worse than none.
+    a stale correction on a public page is worse than none. The
+    predicted tide is drawn as the model gives it, so each departure
+    carries (tide_model_navd88_offset - water_level_msl_offset), about
+    1 cm today. With "plot_7day_tide_on_msl": true in station.json
+    (opt-in, register L1, for the owner to confirm) it gets there the
+    way the water levels do: onto NAVD88 by tide_model_navd88_offset,
+    as in every other product, then down by the same mean-sea-level
+    height (station_datum.tide_model_in_datum). The offset then moves
+    both curves together and never changes a departure: each one is
+    the NAVD88 water level minus the NAVD88 tide, the number every
+    other product compares.
 
   - "Estimated", not "measured". The water level is inferred from a
     reflected signal, not read off a staff gauge, and the caption
@@ -94,7 +104,8 @@ import numpy as np
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from station_datum import config_to_navd88, spline_shift  # noqa: E402
+from station_datum import (load_station, msl_navd88, spline_shift,  # noqa: E402
+                           tide_model_in_datum)
 
 # The record is kept in UTC. Displayed times are converted to the
 # station's local zone so a reader sees the tide at the hour it
@@ -103,6 +114,10 @@ DISPLAY_ZONE_LABEL = "Eastern Time"
 
 MARK_COLOUR = "#b3450c"
 MAX_MARKED = 8          # most high/low tides marked and listed in the legend
+
+# station.json switch, off unless set: draw the predicted tide on the
+# water levels' datum (see the module docstring).
+TIDE_ON_MSL_KEY = "plot_7day_tide_on_msl"
 
 
 class _USEastern(tzinfo):
@@ -205,21 +220,18 @@ def load_tide(path: Path, time_col: str, value_col: str):
 
 def msl_offset(project_dir: Path) -> float:
     """Height of local mean sea level on NAVD88 (m), subtracted from the
-    NAVD88 water levels to draw them above mean sea level.
+    NAVD88 water levels to draw them above mean sea level -- and, with
+    plot_7day_tide_on_msl, from the predicted tide once it is on
+    NAVD88, so that it moves both curves and no departure
+    (station_datum.tide_model_in_datum).
 
     water_level_msl_offset in station.json is in station.json's own
     datum: before maintenance/migrate_to_navd88.py that is the old
-    CGVD2013 antenna height, so it is moved onto NAVD88 here exactly as
-    the water levels are (station_datum.config_to_navd88). Zero if
-    unset -- an unset offset should produce an unshifted plot, not a
-    guess."""
-    path = project_dir / "station" / "resources" / "station.json"
-    try:
-        d = json.loads(path.read_text())
-        v = d.get("water_level_msl_offset")
-        return float(v) + config_to_navd88(d) if v is not None else 0.0
-    except Exception:
-        return 0.0
+    CGVD2013 antenna height, so it is moved onto NAVD88 exactly as the
+    water levels are (station_datum.msl_navd88). Zero if unset -- an
+    unset offset should produce an unshifted plot, not a guess."""
+    return msl_navd88(load_station(project_dir / "station" / "resources"
+                                   / "station.json"))
 
 
 def _turning_points(secs, values, half_window_s=3 * 3600, min_turn_m=0.1,
@@ -446,6 +458,7 @@ def main() -> int:
     # Predicted tide, drawn beneath so the estimate stays visually
     # primary.
     tide_t, tide_v = [], []
+    tide_shift = None
     if not args.no_tide:
         tide_file = args.tide_file
         tide_col = args.tide_value_col
@@ -467,6 +480,23 @@ def main() -> int:
                       if cutoff <= t <= newest]
             tide_t = to_local([t for t, _ in keep_t])
             tide_v = [v for _, v in keep_t]
+            # Drawn raw unless station.json opts in (register L1, for
+            # the owner to confirm: it moves every departure label by
+            # tide_model_navd88_offset - water_level_msl_offset).
+            # Opted in, on this plot's datum the way the water levels
+            # got there: onto NAVD88 by tide_model_navd88_offset, as in
+            # every other product, then down by the same
+            # mean-sea-level height as the blue line (msl_offset). A
+            # tide offset it cannot use (not a number) costs the
+            # prediction, not the plot, as in load_tide; with no
+            # station.json both curves stay on NAVD88.
+            station = load_station(project_dir / "station" / "resources" / "station.json")
+            if str(station.get(TIDE_ON_MSL_KEY)).strip().lower() in ("true", "yes", "1"):
+                try:
+                    tide_v, tide_shift = tide_model_in_datum(tide_v, "MSL", station)
+                except Exception as exc:
+                    print(f"  (tide model not plotted: {exc})")
+                    tide_t, tide_v = [], []
 
     if tide_t:
         ax.plot(tide_t, tide_v, color="#d9822b", linewidth=1.6, alpha=0.65,
@@ -558,6 +588,9 @@ def main() -> int:
     print(f"Wrote {args.output}")
     print(f"  {len(t_sel)} points, {span}")
     print(f"  MSL offset applied: {-offset:+.3f} m")
+    if tide_t and tide_shift is not None:
+        print(f"  Tide model moved {tide_shift:+.3f} m (onto NAVD88 by "
+              f"tide_model_navd88_offset, then to mean sea level)")
     if qc_line:
         print(f"  {qc_line}")
     return 0

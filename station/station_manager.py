@@ -27,13 +27,57 @@ Daily cycle
         |   one growing raw file for the day, checking for a
         |   requested stop between chunks
         |
-        +-- once the day rolls over (or a stop was requested),
-        |   run the processing pipeline (raw -> RINEX -> GNSS-IR ->
-        |   archive) over whatever's accumulated
+        +-- once the day rolls over, hand the day just closed to a
+        |   background thread, which runs the processing pipeline
+        |   (raw -> RINEX -> GNSS-IR -> archive) over whatever's
+        |   accumulated, then records a system health snapshot,
+        |   then exports the day (if configured)
         |
-        +-- record a periodic system health snapshot
+        +-- start recording the new day at once, while that runs
         |
         +-- repeat, unless a stop was requested
+
+Recording does not wait for the pipeline
+------------------------------------------
+The pipeline used to run inline, between the last chunk of one day
+and the first chunk of the next. Converting a ~360 MB day and running
+rinex2snr and gnssir takes minutes, so every day lost its first
+minutes after 00:00 UTC: no data was recorded while it ran. That gap
+is under 5 h, so gnssrefl's subdaily spline bridged it with
+interpolated values, as if they had been observed (review B8).
+
+The run is not dropped, although the 22:30 cron runs the same
+pipeline: it is the run the record depends on. Until verified finding
+H1 was fixed, the cron's pipeline step imported pipeline.py by a path
+relative to cron's working directory, so with the documented crontab
+it never ran, and this was the only run that processed anything. The
+two now share Pipeline.run()'s lock (logs/pipeline.lock), so they
+never overlap: whichever comes second waits for the other, up to an
+hour (pipeline.PIPELINE_LOCK_WAIT_S). Instead of running inline, the
+run, the health snapshot and the export go to one background thread,
+in that order, and the main thread goes straight back to recording.
+
+A thread rather than a separate process, because everything the run
+needs is already safe to share. database.py opens SQLite with
+check_same_thread=False and serialises every call with a lock, and
+the main thread does not touch the database while it records.
+Neither processor changes the working directory or installs a signal
+handler, and gnssrefl_processor.py already catches the SystemExit
+that gnssrefl raises on some error paths. The recorder writes only
+today's raw file, which pipeline.py leaves alone ("still recording"),
+and the export moves the closed day's raw file only after the
+pipeline has finished with it, in the same thread. Run from a
+process, the injected Pipeline (tests, shared orchestration) and the
+last summary in status() would be lost.
+
+If the work for one rollover is still running when the next day
+closes (a large backlog), the next day's work waits for it, so two
+pipeline runs never overlap. A stop request waits for the running
+work to finish before run() returns, as it waited for the inline run
+before. "manager_pipeline_in_background": false in station.json
+restores the old inline order, as a way back if the thread ever
+causes trouble on the station (inline, a wait for the cron's run to
+release the lock also holds back recording).
 
 Chunked recording, not one call per day
 -----------------------------------------
@@ -75,6 +119,7 @@ import logging
 import os
 import shutil
 import signal
+import threading
 import time
 
 from config import Config
@@ -151,6 +196,12 @@ class StationManager:
         default=3600.0, init=False, repr=False
     )
     _export_retry_window_days: int = field(default=3, init=False, repr=False)
+    # See "Recording does not wait for the pipeline" in the module
+    # docstring.
+    _pipeline_in_background: bool = field(default=True, init=False, repr=False)
+    _rollover_thread: threading.Thread | None = field(
+        default=None, init=False, repr=False
+    )
     _external_storage_path: Path | None = field(
         default=None, init=False, repr=False
     )
@@ -206,6 +257,9 @@ class StationManager:
         self._export_retry_window_days = int(
             station_section.get("export_retry_window_days", 3)
         )
+        self._pipeline_in_background = bool(
+            station_section.get("manager_pipeline_in_background", True)
+        )
 
         external_storage = station_section.get("external_storage_path")
         self._external_storage_path = (
@@ -225,11 +279,13 @@ class StationManager:
 
         self._logger.info(
             "StationManager initialized: chunk=%.0fs retry_delay=%.0fs "
-            "health_check_every=%.0fs export_retry_window=%dd",
+            "health_check_every=%.0fs export_retry_window=%dd "
+            "pipeline_in_background=%s",
             self._chunk_seconds,
             self._retry_delay_seconds,
             self._health_check_every_seconds,
             self._export_retry_window_days,
+            self._pipeline_in_background,
         )
 
         return "READY"
@@ -239,12 +295,16 @@ class StationManager:
         The main loop. Blocks until stop() is called (directly, or
         via a caught SIGTERM/SIGINT), recording each UTC day in
         chunks and running the processing pipeline once each day's
-        recording finishes.
+        recording finishes -- in a background thread, while the next
+        day records (see the module docstring).
 
         A failure recording one chunk, or running the pipeline for a
         day, is logged and the loop continues -- this is meant to
         run completely unattended, so a single failure must never
         take down the whole process.
+
+        Before returning, waits for any pipeline run still in
+        progress, so shutdown() never closes the database under it.
         """
 
         if not self._initialized:
@@ -266,13 +326,9 @@ class StationManager:
             if self._stop_requested:
                 break
 
-            self._logger.info(
-                "Recording for %s complete; running pipeline", self._current_day
-            )
+            self._start_rollover_work(self._current_day)
 
-            self._run_pipeline_safely()
-            self._health_check()
-            self._export_day_to_external_storage(self._current_day)
+        self._wait_for_rollover_work()
 
         self._running = False
         self._logger.info("StationManager main loop stopped")
@@ -304,6 +360,11 @@ class StationManager:
         """Close the database connection, if this manager opened it."""
 
         self._logger.info("Shutting down StationManager")
+
+        # run() already waited; this covers a run() that was left by
+        # an exception (e.g. a KeyboardInterrupt before the signal
+        # handlers were registered).
+        self._wait_for_rollover_work()
 
         if self._pipeline is not None:
             self._pipeline.shutdown()
@@ -430,6 +491,94 @@ class StationManager:
     # ==========================================================
     # Private: pipeline / health
     # ==========================================================
+
+    def _start_rollover_work(self, day: date) -> None:
+        """
+        Hand the work for the day just closed (pipeline, health
+        snapshot, export) to a background thread and return at once,
+        so the caller can start recording the new day. With
+        manager_pipeline_in_background false, do the work here
+        instead, as run() used to.
+
+        The thread waits for the previous rollover's thread first, so
+        the work of two days never runs at the same time.
+        """
+
+        if not self._pipeline_in_background:
+            self._logger.info(
+                "Recording for %s complete; running pipeline", day
+            )
+            self._rollover_work(day, previous=None)
+            return
+
+        previous = self._rollover_thread
+        if previous is not None and previous.is_alive():
+            self._logger.warning(
+                "Pipeline work for an earlier day is still running; the "
+                "work for %s will start when it finishes",
+                day,
+            )
+        else:
+            previous = None
+
+        self._logger.info(
+            "Recording for %s complete; running pipeline in the "
+            "background while the next day records",
+            day,
+        )
+
+        thread = threading.Thread(
+            target=self._rollover_work,
+            args=(day, previous),
+            name=f"rollover-{day:%Y%m%d}",
+        )
+        self._rollover_thread = thread
+        thread.start()
+
+    def _rollover_work(self, day: date, previous: threading.Thread | None) -> None:
+        """
+        The work that follows a day's recording, in its required
+        order: the pipeline first, then the health snapshot, then the
+        export (which may move the day's raw file, so it must come
+        after the pipeline is done with it).
+
+        Never raises. _run_pipeline_safely(), _health_check() and the
+        export already catch every Exception; what is left is
+        SystemExit, which gnssrefl raises on some error paths
+        (gnssrefl_processor.py catches it around rinex2snr and gnssir,
+        but not elsewhere). Uncaught in a thread it would end the
+        thread with nothing in the station log; inline it used to end
+        the whole manager. Here it is logged, the rest of that day's
+        work is skipped, and recording carries on.
+        """
+
+        try:
+            if previous is not None:
+                previous.join()
+
+            self._run_pipeline_safely()
+            self._health_check()
+            self._export_day_to_external_storage(day)
+
+        except (Exception, SystemExit) as exc:
+            self._logger.error(
+                "Pipeline work for %s failed (non-fatal): %s", day, exc
+            )
+
+    def _wait_for_rollover_work(self) -> None:
+        """Block until the background pipeline work (if any) is done."""
+
+        thread = self._rollover_thread
+        if thread is None or thread is threading.current_thread():
+            return
+
+        if thread.is_alive():
+            self._logger.info(
+                "Waiting for the pipeline run in progress to finish"
+            )
+
+        thread.join()
+        self._rollover_thread = None
 
     def _run_pipeline_safely(self) -> None:
         assert self._pipeline is not None
@@ -577,14 +726,11 @@ class StationManager:
 
     def _export_day_to_external_storage(self, day: date) -> None:
         """
-        Move the day's raw capture and the entire gnssrefl working
-        directory (products/, i.e. $REFL_CODE and everything under
-        it) to external storage, then let the next day's processing
-        recreate products/ from scratch as needed (initialize()
-        already handles missing directories/files gracefully -- this
-        just costs a small amount of redundant setup each day, e.g.
-        re-downloading the EGM96 file, in exchange for a clean daily
-        export).
+        Move the day's raw capture, and copy what changed in the
+        gnssrefl working directory (products/, i.e. $REFL_CODE and
+        everything under it), to external storage. products/ itself
+        stays where it is: it holds the whole water-level record (see
+        _export_products_directory()).
 
         Disabled by default -- only runs if "external_storage_path"
         is set in station.json.
@@ -598,7 +744,7 @@ class StationManager:
         window, is simply left in place for a future cycle rather
         than exported.
 
-        Never raises. Local files are only removed after a
+        Never raises. The local raw file is only removed after a
         confirmed-successful move (shutil.move()'s own behavior), so
         a failure here (e.g. external storage temporarily unmounted)
         never loses data -- it just leaves that day's files sitting
@@ -696,31 +842,103 @@ class StationManager:
         "phase", "rinex", "orbits", "exe",
     )
 
+    # Written into the external Products/ folder after each export
+    # that copied everything it found: the time that export started.
+    # Only files changed since then are copied by the next one (see
+    # below).
+    _EXPORT_MARKER = ".last_external_export"
+
+    # How far before the previous export's start a file's change time
+    # may lie and still be copied again. File times come from the
+    # kernel's coarse clock (a few ms behind time.time()), some
+    # filesystems keep whole seconds, and an NTP step can set the
+    # clock back a little: a file changed just after the previous
+    # export started can carry a time just before it, and would never
+    # be exported. Copying a few files twice costs nothing. A larger
+    # step is not covered by this; see the marker check in
+    # _export_products_directory().
+    _EXPORT_TIME_SLACK_S = 60.0
+
+    @staticmethod
+    def _changed_time(stat_result) -> float:
+        """
+        When a file last changed, for the export: the later of its
+        mtime and ctime. A file put in place with an old mtime --
+        moved in (a rename keeps the mtime), restored with cp -p,
+        rsync -a or tar, or copied with shutil.copy2 as
+        gnssrefl_processor._stage_rinex_file does -- has an mtime
+        before the last export but a fresh ctime, which no tool can
+        set back. By mtime alone such a file was never exported.
+        """
+
+        return max(stat_result.st_mtime, stat_result.st_ctime)
+
     def _export_products_directory(self, day: date, destination_dir: Path) -> None:
         """
-        Flatten and move the entire products/ directory to external
-        storage, under a per-day folder name (so each day's export
-        doesn't overwrite the previous one) -- a no-op, not an error,
-        if products/ doesn't exist yet (e.g. the very first day,
-        before any processing has run at all).
+        Flatten and COPY products/ to external storage, under a
+        per-day folder name (so each day's export doesn't overwrite
+        the previous one) -- a no-op, not an error, if products/
+        doesn't exist yet (e.g. the very first day, before any
+        processing has run at all).
 
-        Confirmed necessary to flatten rather than move the whole
+        products/ is never moved or deleted. It holds the whole
+        water-level record, not one day's working files:
+        refl_code/<every year>/results (what gnss_record refits every
+        night), Files/<sta>/ (the whole-record spline, the frozen
+        years, the edit files) and input/<sta>.json. This used to
+        move every file and rmtree products/, so the first rollover
+        whose day had results left gnss_record with one day; its
+        shrink guard then refused to write, and the record stopped
+        while the frozen years were gone from the station. Copying
+        cannot do that.
+
+        To keep a daily per-day copy from re-copying the whole
+        record every day, only files changed since the previous
+        export started are copied (see _changed_time() and
+        _EXPORT_TIME_SLACK_S); the first export copies everything.
+        That time is kept in the _EXPORT_MARKER file in
+        `destination_dir` -- the external storage, not products/ --
+        so a new or emptied external disk gets the whole record
+        again rather than only what changed since the last disk was
+        written. The marker is only written after an export that
+        copied everything it found, so after a failed export the
+        next one copies everything changed since the last good one.
+        A marker later than the clock now says the clock was ahead
+        when it was written (a wrong clock at boot, before NTP set
+        it) and has since been set back: by it, every file changed
+        since then would be skipped, write-once results/<doy>.txt
+        files for good, so that export copies everything instead.
+        A clock that ran ahead by less than the time to the next
+        export is not caught this way: files changed after it was
+        set back and before the marker's time (less the slack) are
+        not copied by that export, and not by a later one unless
+        they change again.
+        A file that disappears while the export walks products/
+        (a temporary file, a staged RINEX file being cleaned up) is
+        skipped, not a failure: there is nothing left to copy.
+
+        Confirmed necessary to flatten rather than copy the whole
         tree as-is: gnssrefl's own internal layout nests everything
         several levels deep (a year, then a category, then a station
         code, sometimes another year) purely for its own working
-        needs, not because any of that structure is meaningful once
-        archived. This walks every real file, identifies which known
+        needs. This walks every real file, identifies which known
         category it belongs to from its actual path (not an assumed
-        fixed layout), and re-homes it under a flat
-        <category>/<station code>/... structure instead -- collapsing
-        the redundant year/refl_code nesting while still keeping
-        files from different station codes safely separated by
-        keeping the station code as one subfolder level, so nothing
-        from two different station codes can collide under the same
-        filename. Anything that doesn't match a known category is
-        kept under "other/" with its original relative path intact,
-        rather than silently dropped, in case gnssrefl ever adds a
-        new category this doesn't already know about.
+        fixed layout), and re-homes it under
+        <category>/<what sat above the category>/<station code>/...
+        -- the default refl_code/ level is dropped, and so is nothing
+        else. In particular the year above results/ and snr/ is KEPT
+        (results/<year>/<sta>/<doy>.txt): a results file's name
+        carries no year, and collapsing that level let 2025's
+        292.txt and 2026's 292.txt overwrite each other in the
+        export. Likewise another REFL_CODE beside refl_code/ (the
+        same-day check's refl_code_ultra/) keeps its own folder, so
+        its 4-day spline cannot land on, and replace, the
+        whole-record Files/<sta>/<sta>_spline_out.txt. Files from
+        different station codes stay apart by the station code's
+        own subfolder level. Anything that doesn't match a known
+        category is kept under "other/" with its original relative
+        path intact, rather than silently dropped, in case gnssrefl
+        ever adds a new category this doesn't already know about.
         """
 
         assert self.cfg is not None
@@ -744,7 +962,26 @@ class StationManager:
             )
             return
 
-        files_moved = 0
+        marker = destination_dir / self._EXPORT_MARKER
+        try:
+            since = float(marker.read_text().strip())
+        except (OSError, ValueError):
+            since = None
+        # Taken before the walk: a file changed while it runs is
+        # copied again next time rather than missed.
+        started = time.time()
+        if since is not None and since > started:
+            self._logger.warning(
+                "Last export marker %s is %.0f s after the clock now "
+                "(the clock was ahead when it was written) -- copying "
+                "all of products/ this time",
+                marker,
+                since - started,
+            )
+            since = None
+
+        files_copied = 0
+        files_vanished = 0
 
         for root, _dirs, files in os.walk(products_dir):
             if not files:
@@ -758,7 +995,10 @@ class StationManager:
             for index, part in enumerate(relative_parts):
                 if part in self._KNOWN_EXPORT_CATEGORIES:
                     category = part
-                    remainder_parts = relative_parts[index + 1:]
+                    above = relative_parts[:index]
+                    if above[:1] == ("refl_code",):
+                        above = above[1:]
+                    remainder_parts = above + relative_parts[index + 1:]
                     break
 
             dest_subdir = (
@@ -766,22 +1006,33 @@ class StationManager:
                 if remainder_parts
                 else destination / category
             )
-            dest_subdir.mkdir(parents=True, exist_ok=True)
 
             for filename in files:
-                shutil.move(
-                    str(root_path / filename), str(dest_subdir / filename)
-                )
-                files_moved += 1
+                source = root_path / filename
+                try:
+                    if (since is not None and self._changed_time(source.stat())
+                            < since - self._EXPORT_TIME_SLACK_S):
+                        continue
+                    dest_subdir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(source), str(dest_subdir / filename))
+                except FileNotFoundError:
+                    # Gone since os.walk listed it (or a dangling
+                    # symlink): nothing left to copy.
+                    files_vanished += 1
+                    continue
+                files_copied += 1
 
-        shutil.rmtree(products_dir, ignore_errors=True)
+        tmp_marker = marker.with_name(marker.name + ".tmp")
+        tmp_marker.write_text(f"{started:.3f}\n")
+        os.replace(str(tmp_marker), str(marker))
 
         self._logger.info(
-            "Exported and flattened products/ to external storage: "
-            "%s -> %s (%d files)",
+            "Exported and flattened products/ to external storage "
+            "(copied, products/ left in place): %s -> %s (%d files%s)",
             products_dir,
             destination,
-            files_moved,
+            files_copied,
+            f"; {files_vanished} vanished while copying" if files_vanished else "",
         )
 
     @staticmethod

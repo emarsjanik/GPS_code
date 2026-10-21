@@ -107,10 +107,12 @@ assuming:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+import fcntl
 import logging
 import os
 import re
@@ -155,6 +157,158 @@ def _date_from_filename(filename: str) -> str | None:
         return None
 
     return parsed.isoformat()
+
+
+# A raw file still being written must not be processed: station_manager
+# appends to station_<UTC date>.um980 all day, and the 22:30 local
+# (02:30 UTC) cron run would otherwise convert the first hours of the
+# new day. If that ever succeeded (nav or ultra orbits), _archive()
+# moved the file out from under the recorder and the next chunk started
+# a fresh raw/station_<day>.um980. That second file was never processed:
+# its name was already in the database (UNIQUE filename) with a
+# completed queue entry, so results/<doy>.txt kept only the first ~2.5 h
+# and the rest of the day was silently missing from the record. A file
+# is in progress if its name carries today's UTC date, or, unless it is
+# station_manager's file of a past UTC day, if it was written to in the
+# last IN_PROGRESS_MTIME_S seconds.
+#
+# The time it was written is not asked of station_manager's own day
+# file (station_<UTC date>.um980, _STATION_DAY_FILE) once its date is
+# past: station_manager runs the pipeline right after the last chunk of
+# a day, at 00:00 UTC, when that day's file was written seconds ago and
+# is finished. Taken as in progress, the day was skipped by that run,
+# the station's own, and left to whichever came next: station_manager's
+# a day later, or the cron's only where its pipeline step worked
+# (process_and_plot.sh imported pipeline by a path relative to cron's
+# working directory, verified finding H1). With a same-day orbit (nav,
+# ultra) that put every day a day late.
+#
+# Every other name keeps the IN_PROGRESS_MTIME_S rule, dated or not.
+# overnight_recording.py (QUICKSTART Step 5) writes
+# raw/overnight_<LOCAL start YYYYMMDD_HHMMSS>.um980: the date in that
+# name is the local day the recording began, not a UTC day, so a
+# recording started on an evening (EDT) is still being written when the
+# UTC date has already moved past it. Taken as finished, a run then
+# converted it mid-recording and _archive() moved it out from under the
+# recorder, the same loss as above.
+IN_PROGRESS_MTIME_S = 15 * 60
+
+_STATION_DAY_FILE = re.compile(r"station_\d{8}\.um980")
+
+# One run() at a time, across processes: station_manager's run at each
+# UTC midnight and the cron's (process_and_plot.sh Step 2) share the
+# processing_queue, the files they archive and gnssrefl's staging, and
+# nothing else keeps them apart (verified finding H1). run() holds an
+# exclusive flock on logs/pipeline.lock for the whole pass. A run that
+# finds it held waits for it, up to PIPELINE_LOCK_WAIT_S, rather than
+# skipping: the run holding it is usually station_manager's day just
+# closed, and the cron's fit (Step 4) should see that day's results.
+# Past the wait, run() raises PipelineBusyError and does nothing.
+# The other writers of gnssrefl's shared state take the same lock
+# (run_lock): the cron's initialize(), whose GnssIrProcessor rewrites
+# the station's gnssir json, and maintenance/recover_missing_days.py.
+# A lock that cannot be taken for any other reason (a file system
+# without flock, a logs/ folder that cannot be written) is logged and
+# the work goes ahead without it: the lock must never be what stops
+# processing.
+PIPELINE_LOCK_NAME = "pipeline.lock"
+PIPELINE_LOCK_WAIT_S = 60 * 60
+_LOCK_POLL_S = 5.0
+
+
+class PipelineBusyError(RuntimeError):
+    """Another Pipeline.run() held the run lock for longer than the wait."""
+
+
+@contextmanager
+def run_lock(logs_dir, wait_s: float, logger: logging.Logger):
+    """
+    Hold the exclusive run lock (<logs_dir>/pipeline.lock) while inside.
+
+    Waits for another holder up to wait_s seconds, then raises
+    PipelineBusyError. Only a lock another process or thread really
+    holds (BlockingIOError, EAGAIN/EWOULDBLOCK) counts as busy; any
+    other OSError from creating, opening or locking the file is
+    logged as a warning and the body runs without the lock.
+    """
+
+    path = Path(logs_dir) / PIPELINE_LOCK_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(path, "a")
+    except OSError as exc:
+        logger.warning(
+            "Could not open the run lock %s (%s); going ahead without it",
+            path,
+            exc,
+        )
+        lock = None
+
+    if lock is None:
+        yield
+        return
+
+    with lock:
+        deadline = time.monotonic() + wait_s
+        waiting = False
+        locked = False
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise PipelineBusyError(
+                        f"another pipeline run has held {path} for over "
+                        f"{wait_s / 60:.0f} min -- this run did nothing"
+                    )
+                if not waiting:
+                    logger.info(
+                        "Another pipeline run is in progress; waiting "
+                        "up to %.0f min for it to finish",
+                        wait_s / 60,
+                    )
+                    waiting = True
+                time.sleep(min(_LOCK_POLL_S, left))
+            except OSError as exc:
+                logger.warning(
+                    "Could not take the run lock %s (%s); going ahead "
+                    "without it",
+                    path,
+                    exc,
+                )
+                break
+        try:
+            yield
+        finally:
+            if locked:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
+    """Why `path` is still being recorded, or None if it is finished."""
+
+    now = now or datetime.now(timezone.utc)
+
+    today = now.date().isoformat()
+    file_date = _date_from_filename(path.name)
+    if file_date is not None and file_date == today:
+        return "its date is today (UTC)"
+    if (file_date is not None and file_date < today
+            and _STATION_DAY_FILE.fullmatch(path.name)):
+        # a past UTC day of station_manager's: closed at its midnight
+        return None
+
+    try:
+        age_s = now.timestamp() - path.stat().st_mtime
+    except OSError:
+        return None
+    if age_s < IN_PROGRESS_MTIME_S:
+        return f"written {age_s / 60:.0f} min ago"
+
+    return None
 
 
 # The version of this module's interface/contract (the convert()/
@@ -281,11 +435,18 @@ class Pipeline:
     # Public API
     # ==========================================================
 
-    def initialize(self) -> str:
+    def initialize(self, lock_wait_s: float | None = None) -> str:
         """
         Connect the database, load configuration, verify directories
         and external executables, and prepare the RINEX/GNSS-IR
         processors.
+
+        Preparing the GNSS-IR processor rewrites the station's gnssir
+        json, which a gnssir another run has under way reads. With
+        lock_wait_s given (the cron's Step 2), that is done holding the
+        run lock (see PIPELINE_LOCK_NAME), waiting for another holder
+        up to lock_wait_s seconds. Left at None it is not
+        (station_manager, at startup, must not wait for the cron).
 
         Returns "READY" on success.
 
@@ -295,6 +456,8 @@ class Pipeline:
             If the database cannot be connected.
         FileNotFoundError
             If a required directory is missing.
+        PipelineBusyError
+            With lock_wait_s, if another run held the lock longer.
         """
 
         self._logger.info("Initializing pipeline")
@@ -313,7 +476,11 @@ class Pipeline:
 
         self._verify_directories()
         self._verify_external_executables()
-        self._initialize_processors()
+        if lock_wait_s is None:
+            self._initialize_processors()
+        else:
+            with self._run_lock(lock_wait_s):
+                self._initialize_processors()
 
         self._initialized = True
 
@@ -321,7 +488,7 @@ class Pipeline:
 
         return "READY"
 
-    def run(self) -> PipelineSummary:
+    def run(self, lock_wait_s: float = PIPELINE_LOCK_WAIT_S) -> PipelineSummary:
         """
         Run one full pass: scan for new raw files, queue whatever
         needs work (new discoveries and previous failures alike),
@@ -331,11 +498,20 @@ class Pipeline:
         A failure on any single file is caught, logged, and recorded
         against that file; it never aborts the run. Call initialize()
         first.
+
+        Only one run, in any process, works at a time (see
+        PIPELINE_LOCK_NAME): if another holds the lock, this one waits
+        for it up to lock_wait_s seconds, then raises
+        PipelineBusyError without doing anything.
         """
 
         if not self._initialized:
             raise RuntimeError("Pipeline.initialize() must be called before run()")
 
+        with self._run_lock(lock_wait_s):
+            return self._run()
+
+    def _run(self) -> PipelineSummary:
         self._logger.info("Pipeline run starting")
 
         self._reset_run_stats()
@@ -382,6 +558,13 @@ class Pipeline:
 
         assert self.db is not None
         return self.db.processing_statistics()
+
+    def _run_lock(self, wait_s: float):
+        """Hold the exclusive run lock (logs/pipeline.lock) while inside."""
+
+        assert self.cfg is not None
+
+        return run_lock(self.cfg.logs_dir, wait_s, self._logger)
 
     # ==========================================================
     # Private: initialize()
@@ -493,7 +676,13 @@ class Pipeline:
 
         assert self.cfg is not None
 
-        paths = sorted(self.cfg.raw_dir.glob("*.um980"))
+        paths = []
+        for path in sorted(self.cfg.raw_dir.glob("*.um980")):
+            reason = _in_progress_reason(path)
+            if reason is not None:
+                self._logger.info("Skipping %s, still recording: %s", path.name, reason)
+                continue
+            paths.append(path)
 
         self._logger.debug("Scanned %s: %d file(s)", self.cfg.raw_dir, len(paths))
 
@@ -612,9 +801,20 @@ class Pipeline:
         """
 
         assert self.db is not None
+        assert self.cfg is not None
 
         entries = self.db.processing_history()
-        to_process = [entry.filename for entry in entries if not entry.completed]
+        to_process = []
+        for entry in entries:
+            if entry.completed:
+                continue
+            # Queued by an earlier run (or before this check existed)
+            # but still being recorded: leave it waiting for tomorrow.
+            reason = _in_progress_reason(self.cfg.raw_dir / entry.filename)
+            if reason is not None:
+                self._logger.info("Leaving %s queued, still recording: %s", entry.filename, reason)
+                continue
+            to_process.append(entry.filename)
 
         self._logger.info("Processing queue: %d file(s) pending", len(to_process))
 

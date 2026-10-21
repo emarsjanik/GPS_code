@@ -60,7 +60,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis_tools"))
 from station_datum import (load_station, navd88_hortho, spline_shift,  # noqa: E402
-                           tide_model_to_navd88)
+                           tide_model_in_datum)
 
 _FIELD = re.compile(r"[^,\s]+")
 
@@ -280,8 +280,7 @@ def main():
         if sel:
             tide_times, tide_values = load_tide(
                 Path(args.tide_file), args.tide_time_col, args.tide_value_col)
-            tide_shift = tide_model_to_navd88(cfg)
-            tide_values = [v + tide_shift for v in tide_values]
+            tide_values, _ = tide_model_in_datum(tide_values, "NAVD88", cfg)
             tide_at = interp_tide(tide_times, tide_values, [t for t, _ in sel])
 
             # Both columns NAVD88 metres; the tide model moved onto
