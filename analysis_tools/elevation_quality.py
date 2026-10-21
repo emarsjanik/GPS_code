@@ -42,15 +42,42 @@ The same grouping is applied by azimuth, which answers the
 companion question: is the whole 353-173 window equally good, or
 are some bearings systematically worse?
 
+WHICH REFLECTOR HEIGHT (review B18)
+
+The spline is fitted to reflector heights with two corrections
+applied: the RHdot correction (the bias a moving surface puts on an
+arc's RH: the spline's slope dRH/dt times the arc's tan(e)/(de/dt),
+EdotF in column 13; Larson, Ray, Nievinski & Freymueller 2013, "The
+accidental tide gauge", IEEE GRSL 10(5)) and the inter-frequency
+biases (one constant per frequency, relative to GPS L1). An arc's
+raw RH compared with that spline disagrees by those corrections too:
+RHdot is largest at mid-tide and changes sign between rising and
+setting arcs, and the biases differ by frequency, whose mix differs
+between bearings (each constellation's tracks lie at its own
+azimuths). So the raw comparison mixes the geometry this test is
+after with corrections that have nothing to do with the footprint.
+
+gnssrefl 4.1.5's subdaily writes three per-arc files:
+  <sta>_<year>_subdaily_edit.txt              raw RH only (column 3)
+  ..._subdaily_edit.txt.withrhdot             + RH with RHdot (column 23)
+  ..._subdaily_edit.txt.withrhdotIF           + RH with RHdot and IF bias (column 25)
+The last two are written by the nightly fit in Files/<sta>/fit/,
+named for the years it spans (gnss_record.py). This reads the most
+corrected RH the given file has. Given the plain edit file, it uses
+the .withrhdotIF file found next to it or in its fit/ folder,
+restricted to the edit file's time span, and says so; --raw-rh
+compares the raw RH instead, as this script did before.
+
 Usage:
     python3 elevation_quality.py \\
-        --subdaily products/refl_code/Files/usgs/usgs_2026_subdaily_edit.txt \\
+        --subdaily products/refl_code/Files/usgs/fit/usgs_2026_subdaily_edit.txt.withrhdotIF \\
         --spline products/refl_code/Files/usgs/usgs_spline_out.txt
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -62,8 +89,41 @@ from station_datum import navd88_hortho, spline_shift  # noqa: E402
 import numpy as np
 
 
-def load_subdaily(path: Path, hortho: float):
-    """Returns per-arc records: time, water level, mean elevation, azimuth, peak-to-noise."""
+# 0-based columns of the RH variants (see "Which reflector height").
+RAW_RH_COL, RHDOT_RH_COL, IF_RH_COL = 2, 22, 24
+RH_LABELS = {
+    RAW_RH_COL: "column 3, raw RH (no RHdot or IF correction)",
+    RHDOT_RH_COL: "column 23, RH with the RHdot correction",
+    IF_RH_COL: "column 25, RH with the RHdot and IF corrections",
+}
+
+
+def rh_column(c: list[str], raw_rh: bool = False) -> int:
+    """
+    The most corrected RH column this row has. gnssrefl leaves column
+    25 at 0 for a frequency missing from its bias table
+    (subdaily.rhdot_correction2), so 0 there falls back to column 23.
+    """
+    if raw_rh:
+        return RAW_RH_COL
+    if len(c) > IF_RH_COL:
+        try:
+            if float(c[IF_RH_COL]) != 0.0:
+                return IF_RH_COL
+        except ValueError:
+            pass
+    if len(c) > RHDOT_RH_COL:
+        return RHDOT_RH_COL
+    return RAW_RH_COL
+
+
+def load_subdaily(path: Path, hortho: float, raw_rh: bool = False, used: Counter | None = None):
+    """
+    Returns per-arc records: time, water level, mean elevation,
+    azimuth, peak-to-noise. The water level is Hortho minus the most
+    corrected RH of each row (rh_column()); `used` counts the columns
+    taken.
+    """
     recs = []
     with open(path, errors="replace") as f:
         for line in f:
@@ -72,9 +132,10 @@ def load_subdaily(path: Path, hortho: float):
             c = line.split()
             if len(c) < 22:
                 continue
+            col = rh_column(c, raw_rh)
             try:
                 year = int(float(c[0]))
-                rh = float(c[2])
+                rh = float(c[col])
                 azim = float(c[5])
                 emin = float(c[7])
                 emax = float(c[8])
@@ -87,6 +148,8 @@ def load_subdaily(path: Path, hortho: float):
                 dt = datetime(year, month, day, hh, mm, ss)
             except ValueError:
                 continue
+            if used is not None:
+                used[col] += 1
             recs.append({
                 "time": dt,
                 "wl": hortho - rh,
@@ -96,6 +159,49 @@ def load_subdaily(path: Path, hortho: float):
                 "pknoise": pknoise,
             })
     return recs
+
+
+def corrected_file_for(path: Path) -> Path | None:
+    """
+    The nightly fit's .withrhdotIF file for a plain
+    <sta>_<year>_subdaily_edit.txt: next to it or in its fit/ folder,
+    the newest if there are several (a fit spanning two years is named
+    <sta>_<year>_<year_end>_subdaily_edit.txt.withrhdotIF).
+    """
+    sta = path.name.split("_")[0]
+    found = []
+    for folder in (path.parent, path.parent / "fit"):
+        found += folder.glob(f"{sta}_*subdaily_edit.txt.withrhdotIF")
+    if not found:
+        return None
+    return max(found, key=lambda p: p.stat().st_mtime)
+
+
+def load_arcs(path: Path, hortho: float, raw_rh: bool = False):
+    """
+    Per-arc records with the most corrected RH available for `path`
+    (see "Which reflector height"), and a line saying which was used.
+    """
+    used: Counter = Counter()
+    recs = load_subdaily(path, hortho, raw_rh, used)
+    if raw_rh or not recs or set(used) != {RAW_RH_COL}:
+        cols = ", ".join(f"{RH_LABELS[k]}: {n}" for k, n in sorted(used.items()))
+        return recs, f"{path.name}: {cols or 'no arcs'}"
+
+    corrected = corrected_file_for(path)
+    if corrected is not None:
+        lo = min(r["time"] for r in recs)
+        hi = max(r["time"] for r in recs)
+        used_c: Counter = Counter()
+        crecs = [r for r in load_subdaily(corrected, hortho, False, used_c)
+                 if lo <= r["time"] <= hi]
+        if crecs:
+            return crecs, (f"{corrected.name} (the nightly fit's corrected arcs, "
+                           f"{lo:%Y-%m-%d} to {hi:%Y-%m-%d} as in {path.name}): "
+                           f"{RH_LABELS[IF_RH_COL]} -- --raw-rh compares {path.name}'s raw RH")
+    return recs, (f"{path.name}: {RH_LABELS[RAW_RH_COL]}. WARNING: no .withrhdotIF "
+                  f"file covering it, so the disagreement includes the RHdot and IF "
+                  f"corrections the spline has (review B18)")
 
 
 def load_spline(path: Path):
@@ -146,8 +252,12 @@ def report_bins(label: str, keys: np.ndarray, resid: np.ndarray,
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--subdaily", required=True)
+    p.add_argument("--subdaily", required=True,
+                   help="per-arc file: best the fit's ...subdaily_edit.txt.withrhdotIF "
+                        "(see \"Which reflector height\")")
     p.add_argument("--spline", required=True)
+    p.add_argument("--raw-rh", action="store_true",
+                   help="compare each arc's raw RH (column 3), as before review B18")
     p.add_argument("--hortho", type=float, default=None,
                    help="antenna height, m NAVD88 (default: station.json, on NAVD88)")
     args = p.parse_args()
@@ -156,7 +266,7 @@ def main() -> int:
     if args.hortho is None:
         p.error("--hortho is required: station.json has no gnssrefl_orthometric_height")
 
-    recs = load_subdaily(Path(args.subdaily), args.hortho)
+    recs, rh_note = load_arcs(Path(args.subdaily), args.hortho, args.raw_rh)
     st, sv = load_spline(Path(args.spline))
 
     if not recs or not st:
@@ -185,6 +295,7 @@ def main() -> int:
     print("  PER-ARC QUALITY vs GEOMETRY")
     print("=" * 68)
     print(f"  {len(resid)} arcs compared against the spline consensus")
+    print(f"  RH: {rh_note}")
     print(f"  Overall spread: {np.abs(resid).mean():.3f} m mean absolute")
     print()
     print("  Each arc's water level is compared against the spline at the")

@@ -110,5 +110,84 @@ class TestOtherZeroPaddedReaders(unittest.TestCase):
             self.assertTrue(manager._has_real_results_for_day(date(2026, 1, 8)))
 
 
+# ------------------------------------------------------------
+# B18
+# ------------------------------------------------------------
+
+def subdaily_line(dt: datetime, rh: float, rhdot_rh: float | None = None,
+                  if_rh: float | None = None, azim: float = 80.0,
+                  freq: int = 1) -> str:
+    """One row of gnssrefl subdaily output (22, 24 or 25 columns)."""
+    doy = dt.timetuple().tm_yday
+    hour = dt.hour + dt.minute / 60
+    cols = [dt.year, doy, f"{rh:.3f}", 1, f"{hour:.3f}", f"{azim:.2f}", "12.00",
+            "5.00", "15.00", 300, freq, 1, "0.10000", "4.00", "30.00", "60000.000000",
+            1, dt.month, dt.day, dt.hour, dt.minute, dt.second]
+    if rhdot_rh is not None:
+        cols += [f"{rhdot_rh:.3f}", f"{rh - rhdot_rh:.3f}"]
+    if if_rh is not None:
+        cols += [f"{if_rh:.3f}"]
+    return " " + " ".join(str(c) for c in cols) + " \n"
+
+
+class TestElevationQualityUsesCorrectedRH(unittest.TestCase):
+
+    def setUp(self) -> None:
+        import elevation_quality as eq
+        self.eq = eq
+        self._tmp = tempfile.TemporaryDirectory()
+        self.files = Path(self._tmp.name) / "Files" / "abcd"
+        (self.files / "fit").mkdir(parents=True)
+        self.times = [datetime(2026, 7, 1, h, 0, 0) for h in range(0, 24, 2)]
+        self.edit = self.files / "abcd_2026_subdaily_edit.txt"
+        self.edit.write_text("% plain\n" + "".join(subdaily_line(t, 19.5) for t in self.times))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_column_choice(self) -> None:
+        eq = self.eq
+        t = self.times[0]
+        self.assertEqual(eq.rh_column(subdaily_line(t, 19.5).split()), eq.RAW_RH_COL)
+        self.assertEqual(eq.rh_column(subdaily_line(t, 19.5, 19.3).split()), eq.RHDOT_RH_COL)
+        self.assertEqual(eq.rh_column(subdaily_line(t, 19.5, 19.3, 19.2).split()), eq.IF_RH_COL)
+        # gnssrefl leaves column 25 at 0 for a frequency not in its table
+        self.assertEqual(eq.rh_column(subdaily_line(t, 19.5, 19.3, 0.0).split()), eq.RHDOT_RH_COL)
+        self.assertEqual(eq.rh_column(subdaily_line(t, 19.5, 19.3, 19.2).split(), raw_rh=True),
+                         eq.RAW_RH_COL)
+
+    def test_corrected_file_is_read_as_given(self) -> None:
+        corrected = self.files / "fit" / "abcd_2026_subdaily_edit.txt.withrhdotIF"
+        corrected.write_text("".join(subdaily_line(t, 19.5, 19.3, 19.2) for t in self.times))
+        recs, note = self.eq.load_arcs(corrected, hortho=19.0)
+        self.assertEqual(len(recs), len(self.times))
+        self.assertAlmostEqual(recs[0]["wl"], -0.2, places=6)       # 19.0 - 19.2
+        self.assertIn("column 25", note)
+
+    def test_plain_edit_file_uses_the_fit_corrected_arcs_of_its_span(self) -> None:
+        corrected = self.files / "fit" / "abcd_2026_2027_subdaily_edit.txt.withrhdotIF"
+        later = datetime(2027, 1, 2, 3, 0, 0)        # outside the edit file's span
+        corrected.write_text("".join(subdaily_line(t, 19.5, 19.3, 19.2) for t in self.times)
+                             + subdaily_line(later, 19.5, 19.3, 19.2))
+        recs, note = self.eq.load_arcs(self.edit, hortho=19.0)
+        self.assertEqual(len(recs), len(self.times))
+        self.assertTrue(all(abs(r["wl"] + 0.2) < 1e-9 for r in recs))
+        self.assertIn(corrected.name, note)
+        self.assertIn("--raw-rh", note)
+
+    def test_raw_rh_keeps_the_old_comparison(self) -> None:
+        (self.files / "fit" / "abcd_2026_subdaily_edit.txt.withrhdotIF").write_text(
+            "".join(subdaily_line(t, 19.5, 19.3, 19.2) for t in self.times))
+        recs, note = self.eq.load_arcs(self.edit, hortho=19.0, raw_rh=True)
+        self.assertAlmostEqual(recs[0]["wl"], -0.5, places=6)       # 19.0 - 19.5
+        self.assertIn("column 3", note)
+
+    def test_no_corrected_file_warns(self) -> None:
+        recs, note = self.eq.load_arcs(self.edit, hortho=19.0)
+        self.assertEqual(len(recs), len(self.times))
+        self.assertIn("WARNING", note)
+        self.assertIn("B18", note)
+
+
 if __name__ == "__main__":
     unittest.main()
