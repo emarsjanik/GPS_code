@@ -216,6 +216,12 @@ runs. Processing genuinely takes real time (RINEX conversion plus
 orbit-data-dependent analysis, per file) — this is expected, not a
 sign that anything has stalled.
 
+A step that fails (the fit, a plot, the tide comparison) does not stop
+the run or change its exit status: the next steps still run, and the
+end of the output lists the ones that failed. How every step of the
+last run went is in `logs/process_and_plot_status.json`, and the daily
+health mail reports it.
+
 When it finishes, it tells you exactly where the plots were saved. The
 main result is gnssrefl's last plot, copied to
 `products/refl_code/Files/<station>/<station>_last.png` (the rest of the

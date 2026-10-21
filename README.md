@@ -150,7 +150,7 @@ Verifies every expected file is present and non-empty/non-stub — useful after 
 | `rinex/` | RINEX `.obs`/`.nav` files |
 | `products/refl_code/` | `gnssrefl`'s entire working directory (`$REFL_CODE`) — analysis strategy JSON, staged RINEX, SNR files, results, logs |
 | `database/` | `station.db` (SQLite) |
-| `logs/` | `database.log`, and (cron setup) `station_manager.pid`/`station_manager.out` |
+| `logs/` | `database.log`, `process_and_plot_status.json` (how each step of the last `process_and_plot.sh` run went), and (cron setup) `station_manager.pid`/`station_manager.out` |
 | `archive/` | Raw files moved here after successful processing |
 
 None of the above are tracked in git (see `.gitignore`) — they're all generated data, along with `gnssrefl_venv/`.

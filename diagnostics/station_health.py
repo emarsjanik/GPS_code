@@ -52,6 +52,7 @@ _here = Path(__file__).resolve().parent
 PROJECT_DIR = _here.parent if _here.name == "diagnostics" else _here
 sys.path.insert(0, str(PROJECT_DIR / "analysis_tools"))
 import gnss_record  # noqa: E402
+import run_status  # noqa: E402
 from gnss_record import results_days  # noqa: E402
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
@@ -888,6 +889,124 @@ def check_cron_ran() -> None:
 
 
 # ------------------------------------------------------------------
+# 4b. Did every step of the last processing run work?
+#     process_and_plot.sh goes on after a failed step and still exits 0
+#     (so daily_gnss.sh uploads what was made), and daily_gnss.log then
+#     says "finished successfully" -- all check_cron_ran can see. A
+#     night without the fit, or with every plot crashing, passed every
+#     check here (review finding G-B6). Each step's outcome is in
+#     logs/process_and_plot_status.json (analysis_tools/run_status.py):
+#     a step that failed in the last run is a WARN; a required one (the
+#     record, the processing, the public plot) is a FAIL once no run has
+#     gone through for RUN_OK_MAX_HOURS, which a nightly run with one bad
+#     night does not reach -- one bad night is a warning, two a failure.
+#     A diagnostic that fails only warns, but a last ok run older than
+#     RUN_OK_MAX_HOURS is a FAIL whatever the diagnostics did.
+# ------------------------------------------------------------------
+RUN_STATUS_NAME = "process_and_plot_status.json"
+RUN_OK_MAX_HOURS = 36    # the run is nightly
+RUN_LONG_HOURS = 6       # normally under an hour; a backlog of recovered days takes longer
+
+
+def _run_alive(pid) -> bool | None:
+    """True if pid is a process_and_plot.sh that is still running, False
+    if it is not, None if that cannot be told."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass                     # a process of another user: the command line says
+    except OSError:
+        return None
+    try:
+        # the pid may have been reused since by something else
+        return b"process_and_plot" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return True
+
+
+def check_run_status() -> None:
+    path = PROJECT_DIR / "logs" / RUN_STATUS_NAME
+    st = run_status.load(path)
+    if st is None:
+        record(WARN, "run", (f"could not read {path.name}" if path.exists() else
+                             f"no {path.name} yet: process_and_plot.sh has not run since it "
+                             f"began writing one, so the steps of the last run are unknown"))
+        return
+    now = utcnow()
+    start = parse_ts(str(st.get("start") or ""))
+    when = f"{start:%Y-%m-%d %H:%M}Z" if start else "(start unknown)"
+    last_ok = parse_ts(str(st.get("last_ok_end") or ""))
+    since = last_ok or parse_ts(str(st.get("first_run_start") or "")) or start
+    stale = since is not None and (now - since).total_seconds() / 3600 > RUN_OK_MAX_HOURS
+    if last_ok:
+        ok_text = f"the last run without a failed step ended {last_ok:%Y-%m-%d %H:%M}Z"
+    elif since:
+        ok_text = f"no run without a failed step since {since:%Y-%m-%d %H:%M}Z"
+    else:
+        ok_text = "no run without a failed step yet"
+    steps = [s for s in (st.get("steps") or []) if isinstance(s, dict)]
+
+    if not st.get("end"):
+        # running now -- or killed (or the machine went down) mid-run
+        last = run_status.step_label(steps[-1]) if steps else "none"
+        age_h = (now - start).total_seconds() / 3600 if start else 0.0
+        alive = _run_alive(st.get("pid"))
+        if alive is False or (alive is None and age_h > 2 * RUN_LONG_HOURS):
+            record(FAIL, "run", f"the run started {when} stopped before it finished (killed, or "
+                                f"the machine went down?) -- the last step it recorded is {last}, "
+                                f"the steps after it did not run; {ok_text}")
+        elif stale:
+            record(FAIL, "run", f"a run is in progress since {when}, but {ok_text}")
+        elif age_h > RUN_LONG_HOURS:
+            record(WARN, "run", f"the run started {when} is still running after {age_h:.0f} h "
+                                f"(last step done: {last})")
+        else:
+            record(OK, "run", f"a run is in progress since {when}")
+        return
+
+    failed = [s for s in steps if s.get("status") == "failed"]
+    for s in failed:
+        rc = f" (exit {s['rc']})" if s.get("rc") is not None else ""
+        text = (f"{run_status.step_label(s)} failed in the run of {when}{rc}: "
+                f"{s.get('message') or 'see logs/daily_gnss.log'}")
+        if not s.get("required", True):
+            record(WARN, "run", text)
+        elif stale:
+            record(FAIL, "run", f"{text} -- {ok_text}, so this is not a single bad night")
+        else:
+            record(WARN, "run", f"{text} ({ok_text})")
+    if any(s.get("required", True) for s in failed):
+        return                   # said above, a FAIL once it is not a single bad night
+    # Only diagnostics failed, or nothing did. The age of the last ok run
+    # still counts: a tide comparison that fails every night must not
+    # hide that the run itself stopped coming.
+    if st.get("ok") is False:
+        # an exit status the steps do not account for, or the run was
+        # stopped inside a diagnostic step (said above, unless it is old)
+        if stale or not failed:
+            rc_text = (f"exited {st['rc']}" if st.get("rc") is not None
+                       else "ended without an exit status (killed?)")
+            record(FAIL if stale else WARN, "run",
+                   f"process_and_plot.sh {rc_text} in the run of {when}; {ok_text}")
+    elif stale:
+        age_d = (now - since).total_seconds() / 86400
+        record(FAIL, "run", f"the last run, {when}, went through, but that was {age_d:.1f} "
+                            f"days ago: process_and_plot.sh has not run since")
+    elif not failed:
+        n_skip = sum(1 for s in steps if s.get("status") == "skipped")
+        record(OK, "run", f"last run {when}: {len(steps) - n_skip} step(s) ok"
+                          + (f", {n_skip} skipped" if n_skip else ""))
+
+
+# ------------------------------------------------------------------
 # 5. Is the station still recording?
 # ------------------------------------------------------------------
 def check_recording(db: sqlite3.Connection) -> None:
@@ -1018,6 +1137,7 @@ def main() -> int:
     check_tide_coverage(station_code, d if isinstance(d, dict) else {})
     check_raw_backlog()
     check_cron_ran()
+    check_run_status()
     check_recording(db)
     check_disk()
 
