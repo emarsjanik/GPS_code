@@ -703,9 +703,11 @@ class StationManager:
     # may lie and still be copied again. File times come from the
     # kernel's coarse clock (a few ms behind time.time()), some
     # filesystems keep whole seconds, and an NTP step can set the
-    # clock back: a file changed just after the previous export
-    # started can carry a time just before it, and would never be
-    # exported. Copying a few files twice costs nothing.
+    # clock back a little: a file changed just after the previous
+    # export started can carry a time just before it, and would never
+    # be exported. Copying a few files twice costs nothing. A larger
+    # step is not covered by this; see the marker check in
+    # _export_products_directory().
     _EXPORT_TIME_SLACK_S = 60.0
 
     @staticmethod
@@ -752,6 +754,16 @@ class StationManager:
         written. The marker is only written after an export that
         copied everything it found, so after a failed export the
         next one copies everything changed since the last good one.
+        A marker later than the clock now says the clock was ahead
+        when it was written (a wrong clock at boot, before NTP set
+        it) and has since been set back: by it, every file changed
+        since then would be skipped, write-once results/<doy>.txt
+        files for good, so that export copies everything instead.
+        A clock that ran ahead by less than the time to the next
+        export is not caught this way: files changed after it was
+        set back and before the marker's time (less the slack) are
+        not copied by that export, and not by a later one unless
+        they change again.
         A file that disappears while the export walks products/
         (a temporary file, a staged RINEX file being cleaned up) is
         skipped, not a failure: there is nothing left to copy.
@@ -809,6 +821,15 @@ class StationManager:
         # Taken before the walk: a file changed while it runs is
         # copied again next time rather than missed.
         started = time.time()
+        if since is not None and since > started:
+            self._logger.warning(
+                "Last export marker %s is %.0f s after the clock now "
+                "(the clock was ahead when it was written) -- copying "
+                "all of products/ this time",
+                marker,
+                since - started,
+            )
+            since = None
 
         files_copied = 0
         files_vanished = 0

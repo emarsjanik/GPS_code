@@ -792,6 +792,30 @@ class TestExternalStorageExport(StationManagerTestCase):
             "rewritten during the export",
         )
 
+    def test_marker_ahead_of_the_clock_copies_everything(self) -> None:
+        # The clock was an hour ahead when the last export ran (a wrong
+        # clock at boot, before NTP) and has been set back since: by
+        # that marker every file changed in the hour since is skipped,
+        # and nothing would copy them again.
+        results = self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        day = results / "190.txt"
+        day.write_text("day 190")
+        marker = self.external_root / "Products" / self.manager._EXPORT_MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{time.time() + 3600:.3f}\n")
+
+        with self._by_mtime(), self.assertLogs("station.manager", level="WARNING") as logs:
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (self.external_root / "Products" / "20260709" / "results" / "2026"
+             / "usgs" / "190.txt").read_text(),
+            "day 190",
+        )
+        self.assertIn("after the clock now", "\n".join(logs.output))
+        self.assertLessEqual(self._marker_time(), time.time())
+
     def test_file_put_in_place_with_an_old_mtime_is_exported(self) -> None:
         # A file moved in (a rename keeps its mtime), restored with
         # cp -p / rsync -a, or copied with shutil.copy2 (as the RINEX
