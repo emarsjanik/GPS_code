@@ -693,9 +693,36 @@ class StationManager:
         "phase", "rinex", "orbits", "exe",
     )
 
-    # Written into products/ after each export; only files changed
-    # since then are copied by the next one (see below).
+    # Written into the external Products/ folder after each export
+    # that copied everything it found: the time that export started.
+    # Only files changed since then are copied by the next one (see
+    # below).
     _EXPORT_MARKER = ".last_external_export"
+
+    # How far before the previous export's start a file's change time
+    # may lie and still be copied again. File times come from the
+    # kernel's coarse clock (a few ms behind time.time()), some
+    # filesystems keep whole seconds, and an NTP step can set the
+    # clock back a little: a file changed just after the previous
+    # export started can carry a time just before it, and would never
+    # be exported. Copying a few files twice costs nothing. A larger
+    # step is not covered by this; see the marker check in
+    # _export_products_directory().
+    _EXPORT_TIME_SLACK_S = 60.0
+
+    @staticmethod
+    def _changed_time(stat_result) -> float:
+        """
+        When a file last changed, for the export: the later of its
+        mtime and ctime. A file put in place with an old mtime --
+        moved in (a rename keeps the mtime), restored with cp -p,
+        rsync -a or tar, or copied with shutil.copy2 as
+        gnssrefl_processor._stage_rinex_file does -- has an mtime
+        before the last export but a fresh ctime, which no tool can
+        set back. By mtime alone such a file was never exported.
+        """
+
+        return max(stat_result.st_mtime, stat_result.st_ctime)
 
     def _export_products_directory(self, day: date, destination_dir: Path) -> None:
         """
@@ -718,28 +745,51 @@ class StationManager:
 
         To keep a daily per-day copy from re-copying the whole
         record every day, only files changed since the previous
-        export (the _EXPORT_MARKER file's time) are copied; the
-        first export copies everything. The marker is only written
-        after every copy succeeded, so a failed export is redone in
-        full by the next one.
+        export started are copied (see _changed_time() and
+        _EXPORT_TIME_SLACK_S); the first export copies everything.
+        That time is kept in the _EXPORT_MARKER file in
+        `destination_dir` -- the external storage, not products/ --
+        so a new or emptied external disk gets the whole record
+        again rather than only what changed since the last disk was
+        written. The marker is only written after an export that
+        copied everything it found, so after a failed export the
+        next one copies everything changed since the last good one.
+        A marker later than the clock now says the clock was ahead
+        when it was written (a wrong clock at boot, before NTP set
+        it) and has since been set back: by it, every file changed
+        since then would be skipped, write-once results/<doy>.txt
+        files for good, so that export copies everything instead.
+        A clock that ran ahead by less than the time to the next
+        export is not caught this way: files changed after it was
+        set back and before the marker's time (less the slack) are
+        not copied by that export, and not by a later one unless
+        they change again.
+        A file that disappears while the export walks products/
+        (a temporary file, a staged RINEX file being cleaned up) is
+        skipped, not a failure: there is nothing left to copy.
 
         Confirmed necessary to flatten rather than copy the whole
         tree as-is: gnssrefl's own internal layout nests everything
         several levels deep (a year, then a category, then a station
         code, sometimes another year) purely for its own working
-        needs, not because any of that structure is meaningful once
-        archived. This walks every real file, identifies which known
+        needs. This walks every real file, identifies which known
         category it belongs to from its actual path (not an assumed
-        fixed layout), and re-homes it under a flat
-        <category>/<station code>/... structure instead -- collapsing
-        the redundant year/refl_code nesting while still keeping
-        files from different station codes safely separated by
-        keeping the station code as one subfolder level, so nothing
-        from two different station codes can collide under the same
-        filename. Anything that doesn't match a known category is
-        kept under "other/" with its original relative path intact,
-        rather than silently dropped, in case gnssrefl ever adds a
-        new category this doesn't already know about.
+        fixed layout), and re-homes it under
+        <category>/<what sat above the category>/<station code>/...
+        -- the default refl_code/ level is dropped, and so is nothing
+        else. In particular the year above results/ and snr/ is KEPT
+        (results/<year>/<sta>/<doy>.txt): a results file's name
+        carries no year, and collapsing that level let 2025's
+        292.txt and 2026's 292.txt overwrite each other in the
+        export. Likewise another REFL_CODE beside refl_code/ (the
+        same-day check's refl_code_ultra/) keeps its own folder, so
+        its 4-day spline cannot land on, and replace, the
+        whole-record Files/<sta>/<sta>_spline_out.txt. Files from
+        different station codes stay apart by the station code's
+        own subfolder level. Anything that doesn't match a known
+        category is kept under "other/" with its original relative
+        path intact, rather than silently dropped, in case gnssrefl
+        ever adds a new category this doesn't already know about.
         """
 
         assert self.cfg is not None
@@ -763,16 +813,26 @@ class StationManager:
             )
             return
 
-        marker = products_dir / self._EXPORT_MARKER
+        marker = destination_dir / self._EXPORT_MARKER
         try:
-            since = marker.stat().st_mtime
-        except OSError:
+            since = float(marker.read_text().strip())
+        except (OSError, ValueError):
             since = None
         # Taken before the walk: a file changed while it runs is
         # copied again next time rather than missed.
         started = time.time()
+        if since is not None and since > started:
+            self._logger.warning(
+                "Last export marker %s is %.0f s after the clock now "
+                "(the clock was ahead when it was written) -- copying "
+                "all of products/ this time",
+                marker,
+                since - started,
+            )
+            since = None
 
         files_copied = 0
+        files_vanished = 0
 
         for root, _dirs, files in os.walk(products_dir):
             if not files:
@@ -786,7 +846,10 @@ class StationManager:
             for index, part in enumerate(relative_parts):
                 if part in self._KNOWN_EXPORT_CATEGORIES:
                     category = part
-                    remainder_parts = relative_parts[index + 1:]
+                    above = relative_parts[:index]
+                    if above[:1] == ("refl_code",):
+                        above = above[1:]
+                    remainder_parts = above + relative_parts[index + 1:]
                     break
 
             dest_subdir = (
@@ -797,23 +860,30 @@ class StationManager:
 
             for filename in files:
                 source = root_path / filename
-                if source == marker:
+                try:
+                    if (since is not None and self._changed_time(source.stat())
+                            < since - self._EXPORT_TIME_SLACK_S):
+                        continue
+                    dest_subdir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(source), str(dest_subdir / filename))
+                except FileNotFoundError:
+                    # Gone since os.walk listed it (or a dangling
+                    # symlink): nothing left to copy.
+                    files_vanished += 1
                     continue
-                if since is not None and source.stat().st_mtime < since:
-                    continue
-                dest_subdir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(source), str(dest_subdir / filename))
                 files_copied += 1
 
-        marker.touch()
-        os.utime(marker, (started, started))
+        tmp_marker = marker.with_name(marker.name + ".tmp")
+        tmp_marker.write_text(f"{started:.3f}\n")
+        os.replace(str(tmp_marker), str(marker))
 
         self._logger.info(
             "Exported and flattened products/ to external storage "
-            "(copied, products/ left in place): %s -> %s (%d files)",
+            "(copied, products/ left in place): %s -> %s (%d files%s)",
             products_dir,
             destination,
             files_copied,
+            f"; {files_vanished} vanished while copying" if files_vanished else "",
         )
 
     @staticmethod
