@@ -33,6 +33,20 @@ NAVD88. Over a 47-day overlap the model ensemble sat 0.257 m above the
 CGVD2013-based GNSS-IR level, i.e. 0.257 - 0.349 = ~0.09 m BELOW
 NAVD88. "tide_model_navd88_offset" in station.json (default +0.09 m)
 is added to model heights to put them on NAVD88.
+
+LOCAL MEAN SEA LEVEL. The public 7-day plot alone is drawn above local
+mean sea level: "water_level_msl_offset" in station.json is the height
+of mean sea level in the datum of the water levels (msl_navd88).
+
+ONE TIDE CONVERSION. Every product that sets a tide model beside the
+water levels puts it on the levels' datum with tide_model_in_datum: onto
+NAVD88 by tide_model_navd88_offset, then, for the public plot only,
+down by the same mean-sea-level height as the levels. Water level
+minus tide is then the same number in every product. The public plot
+used to draw the model raw, so each of its departure labels carried
+(tide_model_navd88_offset - water_level_msl_offset), about 1 cm: a
+revised mean-sea-level height moved every label, and a recalibrated
+tide offset never reached the plot.
 """
 
 from __future__ import annotations
@@ -104,6 +118,67 @@ def tide_model_to_navd88(cfg: dict | None = None) -> float:
     cfg = load_station() if cfg is None else cfg
     v = cfg.get("tide_model_navd88_offset")
     return float(v) if v is not None else DEFAULT_TIDE_MODEL_TO_NAVD88_M
+
+
+def msl_navd88(cfg: dict | None = None) -> float:
+    """Height of local mean sea level on NAVD88 (m): the zero of the
+    public 7-day plot.
+
+    water_level_msl_offset in station.json is in station.json's own
+    datum: before maintenance/migrate_to_navd88.py that is the old
+    CGVD2013 antenna height, so it is moved onto NAVD88 here exactly as
+    the water levels are (config_to_navd88). Zero if unset or
+    unreadable -- an unset offset should produce an unshifted plot, not
+    a guess."""
+    cfg = load_station() if cfg is None else cfg
+    try:
+        v = cfg.get("water_level_msl_offset")
+        return float(v) + config_to_navd88(cfg) if v is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+TIDE_DATUMS = ("NAVD88", "MSL")
+
+
+def tide_model_in_datum(values, datum: str = "NAVD88", cfg: dict | None = None,
+                        model_offset: float | None = None):
+    """Tide-model heights moved onto the datum of the water levels they
+    are drawn or compared with: (heights, metres added).
+
+      "NAVD88"  + tide_model_navd88_offset (model_offset instead, when a
+                caller's --tide-datum-offset gives one). Every NAVD88
+                product: the deviation statistics, the tide plot, the
+                exported and monthly CSVs.
+      "MSL"     onto NAVD88 as above, then down by msl_navd88(): the
+                public 7-day plot, whose water levels are NAVD88 minus
+                that same height.
+
+    Going through NAVD88 both times is the point. Water level minus
+    tide is then (NAVD88 level) - (model + tide_model_navd88_offset) on
+    either datum -- the residual compare_to_tide_deviation reports --
+    and mean sea level only moves the two curves together. The models
+    are harmonic predictions (EOT20: Hart-Davis et al. 2021, Earth Syst.
+    Sci. Data 13, 3869-3884), zero-mean, so a model's zero is itself
+    mean sea level and the two station.json offsets are two estimates
+    of one height (they agree to about 1 cm here). Reading every
+    comparison through tide_model_navd88_offset alone keeps a revision
+    of water_level_msl_offset from moving it.
+
+    A list or tuple comes back as a list, anything else (a numpy array)
+    as values + shift: one addition per height either way, as each
+    product made it before."""
+    key = str(datum).upper()
+    if key not in TIDE_DATUMS:
+        raise ValueError(f"unknown datum {datum!r}: one of {', '.join(TIDE_DATUMS)}")
+    cfg = load_station() if cfg is None else cfg
+    shift = (float(model_offset) if model_offset is not None
+             else tide_model_to_navd88(cfg))
+    if key == "MSL":
+        shift -= msl_navd88(cfg)
+    if isinstance(values, (list, tuple)):
+        return [v + shift for v in values], shift
+    return values + shift, shift
 
 
 def spline_hortho(path: Path | str) -> float | None:
