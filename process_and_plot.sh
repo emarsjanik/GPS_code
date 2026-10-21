@@ -295,7 +295,9 @@ fi
 # status records as a failed step; the script's own exit status and
 # the upload do not change. Pipeline.run() holds logs/pipeline.lock,
 # so this run and station_manager's midnight run never overlap, and
-# it leaves the UTC day still being recorded alone.
+# it leaves the UTC day still being recorded alone. initialize()
+# holds it too here: it rewrites the station's gnssir json, which a
+# gnssir in station_manager's run would otherwise read half written.
 # ----------------------------------------------------------------
 
 section "Step 2: Processing new data"
@@ -325,11 +327,11 @@ else
         python3 -c "
 import sys
 sys.path.insert(0, sys.argv[1])
-from pipeline import Pipeline, PipelineBusyError
+from pipeline import PIPELINE_LOCK_WAIT_S, Pipeline, PipelineBusyError
 
 p = Pipeline()
-p.initialize()
 try:
+    p.initialize(lock_wait_s=PIPELINE_LOCK_WAIT_S)
     summary = p.run()
 except PipelineBusyError as exc:
     p.shutdown()

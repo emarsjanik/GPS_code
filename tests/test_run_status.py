@@ -65,6 +65,7 @@ sys.exit(rc)
 """
 
 PIPELINE = """import os
+PIPELINE_LOCK_WAIT_S = 3600
 class PipelineBusyError(RuntimeError):
     pass
 class _Summary:
@@ -72,7 +73,11 @@ class _Summary:
     files_failed = int(os.environ.get("STUB_PIPELINE_FILES_FAILED", "0"))
     errors = ["station_20261020.um980: simulated failure"] if files_failed else []
 class Pipeline:
-    def initialize(self): pass
+    def initialize(self, lock_wait_s=None):
+        if lock_wait_s != PIPELINE_LOCK_WAIT_S:
+            raise RuntimeError("initialize() without the run lock")
+        if os.environ.get("STUB_PIPELINE_INIT_BUSY"):
+            raise PipelineBusyError("another pipeline run has held the lock (initialize)")
     def run(self):
         if os.environ.get("STUB_PIPELINE_FAIL"):
             raise RuntimeError("simulated pipeline crash")
@@ -329,6 +334,16 @@ class ProcessAndPlotTests(unittest.TestCase):
         step2 = self.status()["steps"][2]
         self.assertEqual((step2["status"], step2["rc"]), ("failed", 1))
         self.assertIn("another pipeline run", step2["message"])
+
+    def test_an_initialize_kept_waiting_by_another_run_fails_the_step(self) -> None:
+        # initialize() rewrites the gnssir json, so the cron holds the
+        # lock for it too, and a lock held too long fails the step the
+        # same way
+        r = self.run_script(STUB_PIPELINE_INIT_BUSY="1")
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+        step2 = self.status()["steps"][2]
+        self.assertEqual((step2["status"], step2["rc"]), ("failed", 1))
+        self.assertIn("another pipeline run has held the lock (initialize)", step2["message"])
 
     def test_no_raw_data_is_a_skip(self) -> None:
         (self.proj / "raw" / "station_20261020.um980").unlink()

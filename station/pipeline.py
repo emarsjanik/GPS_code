@@ -204,6 +204,13 @@ _STATION_DAY_FILE = re.compile(r"station_\d{8}\.um980")
 # skipping: the run holding it is usually station_manager's day just
 # closed, and the cron's fit (Step 4) should see that day's results.
 # Past the wait, run() raises PipelineBusyError and does nothing.
+# The other writers of gnssrefl's shared state take the same lock
+# (run_lock): the cron's initialize(), whose GnssIrProcessor rewrites
+# the station's gnssir json, and maintenance/recover_missing_days.py.
+# A lock that cannot be taken for any other reason (a file system
+# without flock, a logs/ folder that cannot be written) is logged and
+# the work goes ahead without it: the lock must never be what stops
+# processing.
 PIPELINE_LOCK_NAME = "pipeline.lock"
 PIPELINE_LOCK_WAIT_S = 60 * 60
 _LOCK_POLL_S = 5.0
@@ -211,6 +218,73 @@ _LOCK_POLL_S = 5.0
 
 class PipelineBusyError(RuntimeError):
     """Another Pipeline.run() held the run lock for longer than the wait."""
+
+
+@contextmanager
+def run_lock(logs_dir, wait_s: float, logger: logging.Logger):
+    """
+    Hold the exclusive run lock (<logs_dir>/pipeline.lock) while inside.
+
+    Waits for another holder up to wait_s seconds, then raises
+    PipelineBusyError. Only a lock another process or thread really
+    holds (BlockingIOError, EAGAIN/EWOULDBLOCK) counts as busy; any
+    other OSError from creating, opening or locking the file is
+    logged as a warning and the body runs without the lock.
+    """
+
+    path = Path(logs_dir) / PIPELINE_LOCK_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(path, "a")
+    except OSError as exc:
+        logger.warning(
+            "Could not open the run lock %s (%s); going ahead without it",
+            path,
+            exc,
+        )
+        lock = None
+
+    if lock is None:
+        yield
+        return
+
+    with lock:
+        deadline = time.monotonic() + wait_s
+        waiting = False
+        locked = False
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise PipelineBusyError(
+                        f"another pipeline run has held {path} for over "
+                        f"{wait_s / 60:.0f} min -- this run did nothing"
+                    )
+                if not waiting:
+                    logger.info(
+                        "Another pipeline run is in progress; waiting "
+                        "up to %.0f min for it to finish",
+                        wait_s / 60,
+                    )
+                    waiting = True
+                time.sleep(min(_LOCK_POLL_S, left))
+            except OSError as exc:
+                logger.warning(
+                    "Could not take the run lock %s (%s); going ahead "
+                    "without it",
+                    path,
+                    exc,
+                )
+                break
+        try:
+            yield
+        finally:
+            if locked:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
@@ -361,11 +435,18 @@ class Pipeline:
     # Public API
     # ==========================================================
 
-    def initialize(self) -> str:
+    def initialize(self, lock_wait_s: float | None = None) -> str:
         """
         Connect the database, load configuration, verify directories
         and external executables, and prepare the RINEX/GNSS-IR
         processors.
+
+        Preparing the GNSS-IR processor rewrites the station's gnssir
+        json, which a gnssir another run has under way reads. With
+        lock_wait_s given (the cron's Step 2), that is done holding the
+        run lock (see PIPELINE_LOCK_NAME), waiting for another holder
+        up to lock_wait_s seconds. Left at None it is not
+        (station_manager, at startup, must not wait for the cron).
 
         Returns "READY" on success.
 
@@ -375,6 +456,8 @@ class Pipeline:
             If the database cannot be connected.
         FileNotFoundError
             If a required directory is missing.
+        PipelineBusyError
+            With lock_wait_s, if another run held the lock longer.
         """
 
         self._logger.info("Initializing pipeline")
@@ -393,7 +476,11 @@ class Pipeline:
 
         self._verify_directories()
         self._verify_external_executables()
-        self._initialize_processors()
+        if lock_wait_s is None:
+            self._initialize_processors()
+        else:
+            with self._run_lock(lock_wait_s):
+                self._initialize_processors()
 
         self._initialized = True
 
@@ -472,41 +559,12 @@ class Pipeline:
         assert self.db is not None
         return self.db.processing_statistics()
 
-    @contextmanager
     def _run_lock(self, wait_s: float):
         """Hold the exclusive run lock (logs/pipeline.lock) while inside."""
 
         assert self.cfg is not None
 
-        path = Path(self.cfg.logs_dir) / PIPELINE_LOCK_NAME
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(path, "a") as lock:
-            deadline = time.monotonic() + wait_s
-            waiting = False
-            while True:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError:
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        raise PipelineBusyError(
-                            f"another pipeline run has held {path} for over "
-                            f"{wait_s / 60:.0f} min -- this run did nothing"
-                        )
-                    if not waiting:
-                        self._logger.info(
-                            "Another pipeline run is in progress; waiting "
-                            "up to %.0f min for it to finish",
-                            wait_s / 60,
-                        )
-                        waiting = True
-                    time.sleep(min(_LOCK_POLL_S, left))
-            try:
-                yield
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        return run_lock(self.cfg.logs_dir, wait_s, self._logger)
 
     # ==========================================================
     # Private: initialize()

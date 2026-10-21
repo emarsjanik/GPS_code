@@ -16,6 +16,8 @@ Run with:
 from __future__ import annotations
 
 import contextlib
+import errno
+import fcntl
 import io
 import os
 import subprocess
@@ -23,6 +25,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -515,6 +518,114 @@ class TestFailuresAndInterrupts(RecoverTestCase):
         # that day and go on to the next.
         with self.assertRaises(KeyboardInterrupt):
             rmd._interrupt(15, None)
+
+
+class TestRunLock(RecoverTestCase):
+    """The days are recovered holding the pipeline's run lock
+    (logs/pipeline.lock): the gnssir json rewrite and rinex2snr/gnssir
+    never overlap a pipeline run, e.g. station_manager's midnight run
+    still going at 02:30 UTC."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.lock_path = self.project / "logs" / "pipeline.lock"
+
+    def hold_in_another_process(self) -> subprocess.Popen:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl, sys, time\n"
+             "f = open(sys.argv[1], 'a')\n"
+             "fcntl.flock(f, fcntl.LOCK_EX)\n"
+             "print('held', flush=True)\n"
+             "time.sleep(60)\n",
+             str(self.lock_path)],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return holder
+
+    def lock_is_held(self) -> bool:
+        with open(self.lock_path, "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return False
+
+    def run_main(self, *argv, lock_wait_s=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = rmd.main(list(argv), cfg=self.cfg, now=NOW,
+                            rinex_factory=lambda scratch: FakeRinex(scratch),
+                            gnssir_factory=self.gnssir_factory,
+                            lock_wait_s=lock_wait_s)
+        return code, out.getvalue()
+
+    def gnssir_factory(self):
+        # GnssIrProcessor.initialize() rewrites the gnssir json here
+        self.held_at_setup = self.lock_is_held()
+        return self.gnssir
+
+    def test_a_held_lock_is_waited_for_then_the_days_wait_for_the_next_run(self) -> None:
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        holder = self.hold_in_another_process()
+
+        code, out = self.run_main(lock_wait_s=0.2)
+
+        self.assertEqual(code, 1, out)
+        self.assertIn("!! Stopped: another pipeline run has held", out)
+        self.assertEqual(self.gnssir.calls, [])
+        self.assertEqual(self.scratch_dirs(), [])
+
+        holder.kill()
+        holder.wait()
+        code, out = self.run_main(lock_wait_s=5)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.processed_days(), [day])
+
+    def test_the_lock_is_held_from_the_json_rewrite_to_the_last_day(self) -> None:
+        days = [date(2026, 7, 1), date(2026, 7, 2)]
+        for day in days:
+            self.raw(self.external / "Raw", day)
+        held = []
+
+        class Checking(FakeGnssir):
+            def process(inner, observation_file, day):
+                held.append(self.lock_is_held())
+                return super().process(observation_file, day)
+
+        self.gnssir = Checking(self.station)
+        code, out = self.run_main()
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.processed_days(), days)
+        self.assertTrue(self.held_at_setup)
+        self.assertEqual(held, [True, True])
+        self.assertFalse(self.lock_is_held())
+
+    def test_a_lock_that_cannot_be_taken_does_not_stop_recovery(self) -> None:
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.gnssir_factory = lambda: self.gnssir    # no lock_is_held(): flock fails
+        with unittest.mock.patch.object(
+                fcntl, "flock",
+                side_effect=OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))), \
+                self.assertLogs("recover_missing_days", level="WARNING"):
+            code, out = self.run_main(lock_wait_s=30)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.processed_days(), [day])
+
+    def test_a_dry_run_does_not_wait_for_the_lock(self) -> None:
+        self.raw(self.external / "Raw", date(2026, 7, 1))
+        self.hold_in_another_process()
+        code, out = self.run_main("--dry-run", lock_wait_s=30)
+        self.assertEqual(code, 0, out)
+        self.assertIn("DRY RUN", out)
 
 
 class TestShellWrapper(unittest.TestCase):

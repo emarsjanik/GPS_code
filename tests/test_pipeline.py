@@ -20,6 +20,7 @@ a recognizable date at all (ad-hoc test recordings).
 
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
@@ -337,6 +338,55 @@ class TestRunLock(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pipeline.run()
         self.assertFalse(self.lock_path.exists())
+
+    def test_a_lock_that_cannot_be_taken_never_stops_a_run(self) -> None:
+        # Only a lock another run really holds is "busy". A flock the
+        # file system refuses (ENOLCK, EINVAL) or a logs/ that cannot
+        # hold the lock file costs the lock, not the night's processing.
+        for errno_value in (errno.ENOLCK, errno.EINVAL):
+            with self.subTest(errno=errno.errorcode[errno_value]):
+                ran: list[str] = []
+                with unittest.mock.patch.object(
+                        pipeline_module.fcntl, "flock",
+                        side_effect=OSError(errno_value, os.strerror(errno_value))), \
+                        self.assertLogs("station.pipeline", level="WARNING") as logs:
+                    pipeline = self._pipeline(lambda: ran.append("ran") or "summary")
+                    self.assertEqual(pipeline.run(lock_wait_s=30), "summary")
+                self.assertEqual(ran, ["ran"])
+                self.assertIn("going ahead without it", logs.output[0])
+
+        self.logs = Path(self._tmp.name) / "logs_is_a_file"
+        self.logs.write_text("a file where logs/ should be\n")
+        with self.assertLogs("station.pipeline", level="WARNING") as logs:
+            self.assertEqual(self._pipeline().run(lock_wait_s=30), "summary")
+        self.assertIn("Could not open the run lock", logs.output[0])
+
+    def test_the_cron_initialize_holds_the_lock_for_the_gnssir_json(self) -> None:
+        # initialize() rewrites the station's gnssir json (through
+        # GnssIrProcessor.initialize()); with lock_wait_s, as the cron
+        # calls it, that waits for a run in progress
+        done: list[str] = []
+
+        def pipeline() -> Pipeline:
+            p = Pipeline(cfg=SimpleNamespace(logs_dir=self.logs),
+                         db=SimpleNamespace(is_connected=lambda: True))
+            p._verify_directories = lambda: None
+            p._verify_external_executables = lambda: None
+            p._initialize_processors = lambda: done.append("processors")
+            return p
+
+        holder = self._hold_in_another_process()
+        with self.assertRaises(PipelineBusyError):
+            pipeline().initialize(lock_wait_s=0.2)
+        self.assertEqual(done, [])
+        # station_manager at startup does not wait
+        self.assertEqual(pipeline().initialize(), "READY")
+        self.assertEqual(done, ["processors"])
+
+        holder.kill()
+        holder.wait()
+        self.assertEqual(pipeline().initialize(lock_wait_s=5), "READY")
+        self.assertEqual(done, ["processors", "processors"])
 
 
 if __name__ == "__main__":

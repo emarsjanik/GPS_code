@@ -103,6 +103,18 @@ The station database is not changed, as before: a recovered day's
 leftover processing_queue entry is removed by clean_processing_queue.py
 once the day has results.
 
+ONE WRITER AT A TIME
+
+Recovering a day rewrites the station's gnssir json and runs rinex2snr
+and gnssir on the station's shared folders, as a pipeline run does. So
+the days are recovered holding the pipeline's run lock
+(logs/pipeline.lock, station/pipeline.py run_lock): a pipeline run in
+progress, e.g. station_manager's midnight run still working through a
+backlog, is waited for, up to an hour. Past that the script stops with
+exit 1 and the days are tried again on the next run. A lock that cannot
+be taken for any other reason is logged and the days are recovered
+without it.
+
 Usage:
     maintenance/recover_missing_days.sh                  automatic
     maintenance/recover_missing_days.sh 204 205           those days of this UTC year
@@ -113,7 +125,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import logging
 import os
 import re
 import shutil
@@ -451,7 +465,8 @@ def _interrupt(signum, frame):
 
 
 def main(argv=None, cfg=None, now: datetime | None = None,
-         rinex_factory=None, gnssir_factory=None) -> int:
+         rinex_factory=None, gnssir_factory=None,
+         lock_wait_s: float | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("doys", nargs="*", type=int,
@@ -560,15 +575,28 @@ def main(argv=None, cfg=None, now: datetime | None = None,
         print("  DRY RUN -- nothing was processed.")
         return 0
 
+    from pipeline import PIPELINE_LOCK_WAIT_S, PipelineBusyError, run_lock
+
     project_root = Path(getattr(cfg, "project_root", PROJECT_DIR))
     _remove_stale_scratch(project_root, time.time())
     scratch = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=str(project_root)))
     outcomes: dict[str, list[int]] = {}
     previous_handlers = {}
     previous_cwd = os.getcwd()
+    held = contextlib.ExitStack()
     try:
         for signum in (signal.SIGTERM, signal.SIGHUP):
             previous_handlers[signum] = signal.signal(signum, _interrupt)
+        # The pipeline's run lock, for every day: see ONE WRITER AT A
+        # TIME in the module docstring.
+        try:
+            held.enter_context(run_lock(
+                getattr(cfg, "logs_dir", project_root / "logs"),
+                PIPELINE_LOCK_WAIT_S if lock_wait_s is None else lock_wait_s,
+                logging.getLogger("recover_missing_days")))
+        except PipelineBusyError as exc:
+            print(f"  !! Stopped: {exc}; tried again on the next run.")
+            return 1
         # gnssrefl drops working copies into the current directory
         # and leaves them: keep them in scratch, which recover()
         # empties after every day.
@@ -596,6 +624,7 @@ def main(argv=None, cfg=None, now: datetime | None = None,
         return 130
 
     finally:
+        held.close()
         os.chdir(previous_cwd)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
@@ -620,8 +649,6 @@ def main(argv=None, cfg=None, now: datetime | None = None,
 
 
 if __name__ == "__main__":
-    import logging
-
     # The processors report convbin, rinex2snr and gnssir outcomes
     # through logging, as in station_manager.py.
     logging.basicConfig(
