@@ -43,10 +43,12 @@ water levels puts it on the levels' datum with tide_model_in_datum: onto
 NAVD88 by tide_model_navd88_offset, then, for the public plot only,
 down by the same mean-sea-level height as the levels. Water level
 minus tide is then the same number in every product. The public plot
-used to draw the model raw, so each of its departure labels carried
-(tide_model_navd88_offset - water_level_msl_offset), about 1 cm: a
-revised mean-sea-level height moved every label, and a recalibrated
-tide offset never reached the plot.
+does this only with "plot_7day_tide_on_msl" set (opt-in, register L1):
+otherwise it draws the model raw, as published, so each of its
+departure labels carries (tide_model_navd88_offset -
+water_level_msl_offset), about 1 cm: a revised mean-sea-level height
+moves every label, and a recalibrated tide offset never reaches the
+plot.
 """
 
 from __future__ import annotations
@@ -151,8 +153,8 @@ def tide_model_in_datum(values, datum: str = "NAVD88", cfg: dict | None = None,
                 product: the deviation statistics, the tide plot, the
                 exported and monthly CSVs.
       "MSL"     onto NAVD88 as above, then down by msl_navd88(): the
-                public 7-day plot, whose water levels are NAVD88 minus
-                that same height.
+                public 7-day plot with plot_7day_tide_on_msl set,
+                whose water levels are NAVD88 minus that same height.
 
     Going through NAVD88 both times is the point. Water level minus
     tide is then (NAVD88 level) - (model + tide_model_navd88_offset) on

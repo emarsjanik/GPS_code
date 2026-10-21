@@ -5,10 +5,11 @@ The predicted tide is put on the datum of the water levels it is drawn
 or compared with in one place, station_datum.tide_model_in_datum: onto
 NAVD88 by tide_model_navd88_offset, then, for the public 7-day plot,
 down by the mean-sea-level height the water levels are drawn above.
-The 7-day plot used to draw the model raw, so every departure label
-carried (tide_model_navd88_offset - water_level_msl_offset): revising
-the mean-sea-level height moved every label, and recalibrating the
-tide offset never reached the plot.
+The 7-day plot draws the model raw unless station.json sets
+plot_7day_tide_on_msl (opt-in, register L1), so by default every
+departure label carries (tide_model_navd88_offset -
+water_level_msl_offset): revising the mean-sea-level height moves
+every label, and recalibrating the tide offset never reaches the plot.
 
   * TideModelInDatumTests -- the helper, and that it gives the NAVD88
     products exactly the numbers they computed before.
@@ -20,9 +21,11 @@ tide offset never reached the plot.
     filter_month takes it from the station.json it read itself.
   * DepartureDatumTests -- plot_7day.main() on a synthetic week, a
     known surge on a known tide, under several station.json datums:
-    each departure is the NAVD88 water level minus the NAVD88 tide --
-    the mean offset compare_to_tide_deviation reports -- whatever
-    water_level_msl_offset says.
+    with plot_7day_tide_on_msl set, each departure is the NAVD88 water
+    level minus the NAVD88 tide -- the mean offset
+    compare_to_tide_deviation reports -- whatever
+    water_level_msl_offset says; unset, the model is drawn raw, as
+    published.
 
 Run with:
     python3 -m unittest discover -s tests -p "test_tide_datum.py" -v
@@ -314,7 +317,11 @@ class DepartureDatumTests(StationFiles):
         self.addCleanup(patch.stop)
         self.addCleanup(plt.close, "all")
 
-    def station(self, **cfg) -> dict:
+    def station(self, tide_on_msl=True, **cfg) -> dict:
+        """station.json for the run; tide_on_msl None leaves
+        plot_7day_tide_on_msl unset."""
+        if tide_on_msl is not None:
+            cfg[plot_7day.TIDE_ON_MSL_KEY] = tide_on_msl
         return self.write_station(station_name="Test Beach", tide_model_file=str(self.tide_file),
                                   tide_model_value_column="EOT20_heightm", **cfg)
 
@@ -385,6 +392,25 @@ class DepartureDatumTests(StationFiles):
         raw = plotted_model(len(blue))
         self.assertTrue(np.allclose(orange, raw + 0.09 - 0.10, atol=1e-12))
         self.assertTrue(np.allclose(blue, raw + TRUE_MODEL_ZERO + 0.30 - 0.10, atol=1e-9))
+
+    def test_by_default_the_model_is_drawn_raw_as_published(self) -> None:
+        # plot_7day_tide_on_msl unset or false: the orange line is the
+        # model as the spreadsheet gives it and every label carries
+        # 0.09 - 0.10, as on the published plot (register L1 waits for
+        # the owner)
+        for setting in (None, False, "false"):
+            with self.subTest(plot_7day_tide_on_msl=setting):
+                self.station(tide_on_msl=setting, vertical_datum="NAVD88 (GEOID18)",
+                             gnssrefl_orthometric_height=19.014,
+                             water_level_msl_offset=0.10, tide_model_navd88_offset=0.09)
+                departures, labels, blue, orange = self.run_plot(surge=0.30)
+                self.assert_departures(departures, 0.29)
+                self.assertEqual(len(labels), 2 + plot_7day.MAX_MARKED)
+                for label in labels[2:]:
+                    self.assertRegex(label, r"\n0\.29 m above predicted (high|low) tide$")
+                raw = plotted_model(len(blue))
+                self.assertTrue(np.array_equal(orange, raw))
+                self.assertTrue(np.allclose(blue, raw + TRUE_MODEL_ZERO + 0.30 - 0.10, atol=1e-9))
 
     def test_mean_sea_level_moves_both_curves_and_no_departure(self) -> None:
         runs = {}
