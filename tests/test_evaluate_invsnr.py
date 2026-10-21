@@ -7,8 +7,9 @@ the Chatham gauge and the tide model.
 
   * ComparisonTests -- the comparison on synthetic series with known
     errors: interpolation across gaps, support, the statistics, the
-    gauge transfer, sea-state classes, evaluate(), the adoption rule
-    and the report.
+    gauge transfer, sea-state classes, the QC fail share, evaluate()
+    (each series judged with the spline alone), the adoption rule and
+    the report.
   * PlanAndApiTests -- the run plan (padding, the year boundary), the
     inv.json keys and invsnr arguments against gnssrefl 4.1.5's
     signature, the output parser, the decimated SNR copies (and when
@@ -16,8 +17,9 @@ the Chatham gauge and the tide model.
   * FakeGnssreflRunTests -- the run step end to end with a stand-in
     gnssrefl package on PYTHONPATH (invsnr_cl.invsnr and
     spline_functions shaped as in 4.1.5, with its exits): the private
-    REFL_CODE, live files untouched, the gap exit, a crash, which runs
-    are reused, a reprocessed SNR day, and the whole command line.
+    REFL_CODE, live files untouched, the gap exit and the retry without
+    a pad day, a crash, which runs are reused, a reprocessed SNR day,
+    and the whole command line.
   * RealInvsnrTests -- gnssrefl's real invsnr on synthetic SNR files
     with a known tide. Skipped when gnssrefl is not importable.
 
@@ -260,6 +262,8 @@ def snr2spline(station, year, doy, azilims, elvlims, rhlims, precision, kdt, snr
     least_squares(lambda k: np.ones(5) * 0.5, np.zeros(len(knots) + 5), method="lm")
     if MODE == "crash":
         raise RuntimeError("fake crash inside the fit")
+    if MODE == "envexit":
+        print("download gpt_1wA.pickle MANUALLY"); sys.exit()
     invout = {"knots": knots, "kval_spectral": np.zeros(len(knots) - 2),
               "kval_js": truth_rh(_unix(knots))[1:-1],
               "outparams_js": np.array([1.0, 2.0, 3.0, 4.0, TRUTH.get("rough", 0.0031)])}
@@ -439,8 +443,10 @@ class ComparisonTests(unittest.TestCase):
         res = ev.evaluate(grid, levels, supported, gauge, tide_model, waves, arrays=arrays)
         self.assertEqual(res["sea_counts"]["storm"], 48)
         self.assertEqual(res["sea_counts"]["calm"], len(grid) - 48)
-        self.assertEqual(res["common_n"], int((~hole & ~failed).sum()))
         sp, iv = res["series"]["spline"], res["series"]["invsnr k2h"]
+        self.assertEqual(iv["common_n"], int((~hole & ~failed).sum()))
+        self.assertEqual(sp["common_n"], iv["common_n"])         # one invsnr series: the same epochs
+        self.assertEqual(iv["spline_common"], sp["common"])
 
         # coverage: values everywhere for the spline, its hole unsupported; invsnr lost a day
         self.assertAlmostEqual(sp["coverage"]["all"]["values"], 1.0)
@@ -485,9 +491,46 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(set(arrays), {"hs", "sea", "gauge_pred"})
         self.assertEqual(len(arrays["gauge_pred"]["spline"]), len(grid))
 
-        # the station's own QC sees the spline's storm excess, not invsnr's
-        self.assertIsNotNone(sp["qc"]["storm"])
+        # the station's own QC: the storm excess is within its setup allowance
+        # (SUSPECT, not counted), and nothing fails on calm days
+        self.assertEqual(sp["qc"]["storm"], {"n": 48, "fail": 0.0})
+        self.assertEqual(iv["qc"]["calm"]["fail"], 0.0)
         json.dumps(ev._jsonable(res))          # summary_*.json can be written
+
+    def test_qc_fail_share_counts_failed_readings_by_sea_state(self):
+        days, grid, truth, levels, supported, gauge, waves, storm, hole, failed = self._scenario()
+        lv = levels["spline"].copy()
+        spikes = [10, 70, 130, 230]                          # single calm readings, +1.5 m
+        lv[spikes] += 1.5
+        masks = ev.class_masks(ev.sea_state(np.where(storm, 3.5, 0.8)))
+        q = ev.qc_fail_share(grid, lv, gauge, waves, masks)
+        self.assertEqual(q["calm"]["n"], 240)
+        self.assertAlmostEqual(q["calm"]["fail"], 4 / 240)
+        self.assertEqual(q["storm"]["fail"], 0.0)              # SUSPECT (possible setup) is not FAIL
+        self.assertIsNone(q["rough"]["fail"])
+
+    def test_one_spacing_failing_does_not_change_another(self):
+        """A 1 h spacing that ran on day 0 only must leave the 2 h series'
+        numbers, its storm rows and its adoption verdict as they are."""
+        days, grid, truth, levels, supported, gauge, waves, storm, hole, failed = self._scenario()
+        k2 = "invsnr k2h"
+        levels[k2] = truth + 0.03 + np.random.RandomState(4).normal(0, 0.02, len(grid))
+        alone = ev.evaluate(grid, levels, supported, gauge, truth, waves)
+        k1 = truth + np.random.RandomState(6).normal(0, 0.02, len(grid))
+        k1[grid >= day0(days[1])] = np.nan
+        both = ev.evaluate(grid, dict(levels, **{"invsnr k1h": k1}),
+                           dict(supported, **{"invsnr k1h": np.isfinite(k1)}), gauge, truth, waves)
+        a, b = alone["series"][k2], both["series"][k2]
+        for key in ("common_n", "common_by_class", "common", "spline_common", "minus_spline",
+                    "daily_gauge", "daily_tide"):
+            self.assertEqual(a[key], b[key], key)
+        self.assertEqual(b["common_by_class"]["storm"], 48)
+        self.assertEqual(b["minus_spline"]["storm"]["n"], 48)
+        self.assertEqual(both["series"]["invsnr k1h"]["common_by_class"]["storm"], 0)
+        rows = {k2: self._rows(days)}
+        self.assertEqual(ev.adoption_check(alone, rows), ev.adoption_check(both, rows))
+        # the spline's own row covers the epochs any invsnr series does
+        self.assertEqual(both["series"]["spline"]["common_n"], a["common_n"])
 
     def test_evaluate_without_references(self):
         days, grid, truth, levels, supported, *_ = self._scenario()
@@ -540,7 +583,7 @@ class ComparisonTests(unittest.TestCase):
         t2 = ev.adoption_check(res2, {name: self._rows(days)})[name]
         self.assertEqual(ev.adoption_verdict(t2), "undecided")
         self.assertEqual([t[0] for t in t2 if t[3] is None], ["QC fail share, rough"])
-        self.assertEqual(res2["common_by_class"]["storm"], 48)
+        self.assertEqual(res2["series"][name]["common_by_class"]["storm"], 48)
 
         # a spline only a few mm worse is not beaten by enough
         levels3 = {"spline": levels2[name] + np.random.RandomState(5).normal(0, 0.012, len(grid)),
@@ -558,6 +601,29 @@ class ComparisonTests(unittest.TestCase):
         self.assertIn("ADOPTION RULE", text)
         self.assertIn(f"{name}: UNDECIDED", text)
         self.assertIn("storm 48", text)
+
+    def test_run_table_reads_the_snr_fit_and_the_core_day_gap(self):
+        d = date(2026, 9, 21)
+        run = ev.Run(d, d - timedelta(days=1), d + timedelta(days=1))
+        arcs = list(day0(d) - 86400 + np.arange(600.0, 3 * 86400, 1200.0))
+        arcs = [a for a in arcs if not (day0(d) + 86400 + 6 * 3600 <= a < day0(d) + 86400 + 10 * 3600)]
+        res = {"status": "ok", "arcs": {"unix": arcs}, "roughness": 0.004,
+               "spec": {"first": "2026-09-20", "last": "2026-09-22"},
+               "fits": [{"success": False, "rms": 9.0, "nfev": 3},      # the spectral fit
+                        {"success": True, "rms": 2.0, "nfev": 40}]}     # the SNR fit
+        row = ev.run_table([(run, res)], ev.InvsnrSettings(station=STA))[0]
+        self.assertIs(row["snr_fit_ok"], True)
+        self.assertEqual((row["snr_fit_rms"], row["nfev"]), (2.0, 40))
+        self.assertAlmostEqual(row["max_gap_min"], 260.0)        # in the day after
+        self.assertAlmostEqual(row["core_gap_min"], 20.0)
+        self.assertAlmostEqual(row["roughness_sigma_m"], math.sqrt(0.004))
+
+    def test_tide_model_is_put_on_navd88(self):
+        t = [datetime(2026, 9, 20, 1), datetime(2026, 9, 20, 0)]
+        with unittest.mock.patch("plot_7day.load_tide", return_value=(t, [0.5, -0.2])):
+            ep, lv = ev.load_tide_model("x.xlsx", "time", "v", 0.09)
+        self.assertEqual(list(ep), [day0(date(2026, 9, 20)), day0(date(2026, 9, 20)) + 3600])
+        np.testing.assert_allclose(lv, [-0.11, 0.59])
 
     def test_rank_correlation(self):
         r, n = ev.rank_correlation([1, 2, 3, 4, np.nan], [10, 20, 25, 40, 50])
@@ -752,12 +818,19 @@ class FakeGnssreflRunTests(unittest.TestCase):
         truth["gap"] = [day0(date(2026, 9, 21)) + 6 * 3600, day0(date(2026, 9, 21)) + 9 * 3600]
         env = {"FAKE_INVSNR_TRUTH": json.dumps(truth)}
         _, s, res = self.run_one(date(2026, 9, 21), env=env)
-        self.assertEqual(res["status"], "exit")
+        self.assertEqual((res["status"], res["reason"]), ("exit", "gap"))
+        self.assertIn("Gap in data bigger than node spacing", res["message"])
         self.run_one(date(2026, 9, 21), env=env)
         self.assertEqual(len(self.calls(s)), 1)                  # gnssrefl would stop again
         self.run_one(date(2026, 9, 22), env={"FAKE_INVSNR_MODE": "crash"})
         self.run_one(date(2026, 9, 22), env={"FAKE_INVSNR_MODE": "crash"})
         self.assertEqual(len(self.calls(s)), 3)                  # an error is not reused
+        # a stop for a missing file is not gnssrefl's verdict on the data: tried again
+        _, _, res = self.run_one(date(2026, 9, 20), env={"FAKE_INVSNR_MODE": "envexit"})
+        self.assertEqual((res["status"], res["reason"]), ("exit", "other"))
+        self.assertIn("gpt_1wA.pickle", res["message"])
+        self.run_one(date(2026, 9, 20), env={"FAKE_INVSNR_MODE": "envexit"})
+        self.assertEqual(len(self.calls(s)), 5)
 
     def test_a_reprocessed_snr_day_is_copied_and_run_again(self):
         run, s, res = self.run_one(date(2026, 9, 21))
@@ -783,18 +856,64 @@ class FakeGnssreflRunTests(unittest.TestCase):
         self.assertGreater(rows[0]["max_gap_min"], rows[0]["gap_limit_min"])
         self.assertIn("Gap in data bigger than node spacing",
                       (self.out / "runs" / s.label() / "2026-09-21" / "run.log").read_text())
-        # with --risky the same day runs
+        self.assertGreater(rows[0]["core_gap_min"], rows[0]["gap_limit_min"])
+        self.assertNotIn("pad_dropped", res)                     # the gap is in the core day
+        self.assertEqual(len(self.calls(s)), 1)
+        # with --risky the same day runs; what it writes in the gap is unsupported
         risky = ev.InvsnrSettings(station=STA, risky=True)
         _, _, res2 = self.run_one(date(2026, 9, 21), settings=risky,
                                   env={"FAKE_INVSNR_TRUTH": json.dumps(truth)})
         self.assertEqual(res2["status"], "ok")
+        ep, lv, arcs = ev.invsnr_levels([(run, res2)], risky, self.ctx(), HORTHO)
+        self.assertTrue(np.isfinite(lv).all())
+        sup = ev.supported_mask(ep, arcs)
+        in_gap = (ep >= gap[0] + 3600 + 600) & (ep < gap[1] - 3600 - 600)
+        self.assertTrue(in_gap.any() and not sup[in_gap].any())
+        self.assertTrue(sup[~((ep >= gap[0]) & (ep < gap[1]))].all())
+
+    def test_a_gap_in_a_pad_day_is_run_again_without_that_day(self):
+        """A 4 h gap on 22 Sep only: the 21 Sep run (20-22 Sep) stops on it,
+        so 21 Sep is run again on 20-21 Sep and keeps its level; 22 Sep's
+        own run stops on its own gap."""
+        truth = json.loads(self.env["FAKE_INVSNR_TRUTH"])
+        truth["gap"] = [day0(date(2026, 9, 22)) + 6 * 3600, day0(date(2026, 9, 22)) + 10 * 3600]
+        env = {"FAKE_INVSNR_TRUTH": json.dumps(truth)}
+        run, s, res = self.run_one(date(2026, 9, 21), env=env)
+        self.assertEqual(res["status"], "ok", res)
+        self.assertEqual(res["pad_dropped"], ["after"])
+        self.assertEqual((res["spec"]["first"], res["spec"]["last"]), ("2026-09-20", "2026-09-21"))
+        self.assertEqual(res["padded_run"]["reason"], "gap")
+        self.assertEqual(res["padded_run"]["spec"]["last"], "2026-09-22")
+        rd = self.out / "runs" / s.label() / "2026-09-21"
+        self.assertIn("Gap in data bigger", (rd / "run_padded.log").read_text())
+        ep, lv, _ = ev.invsnr_levels([(run, res)], s, self.ctx(), HORTHO)
+        self.assertEqual(ep[0], day0(date(2026, 9, 21)))
+        self.assertEqual(ep[-1], day0(date(2026, 9, 22)) - 2 * 3600)   # its after-edge left out
+        np.testing.assert_allclose(lv, tide(ep), atol=0.0006)
+        row = ev.run_table([(run, res)], s)[0]
+        self.assertEqual((row["pad_dropped"], row["span"]), (["after"], "2026-09-20..2026-09-21"))
+        self.assertLess(row["core_gap_min"], row["gap_limit_min"])
+        text = ev.format_report("T", ev.evaluate(ep, {"spline": lv, s.name(): lv},
+                                                 {"spline": np.ones(len(ep), bool),
+                                                  s.name(): np.ones(len(ep), bool)}),
+                                {s.name(): [row]}, [s])
+        self.assertIn("without the pad day after", text)
+        # reused as it is, from the padded spec
+        _, _, again = self.run_one(date(2026, 9, 21), env=env)
+        self.assertTrue(again["reused"])
+        self.assertEqual(len(self.calls(s)), 2)
+        # 22 Sep's gap is its own: no second try
+        _, _, own = self.run_one(date(2026, 9, 22), env=env)
+        self.assertEqual((own["status"], own["reason"]), ("exit", "gap"))
+        self.assertNotIn("pad_dropped", own)
+        self.assertEqual(len(self.calls(s)), 3)
 
     def test_failures_are_results(self):
         _, _, res = self.run_one(date(2026, 9, 21), env={"FAKE_INVSNR_MODE": "crash"})
         self.assertEqual(res["status"], "error")
         self.assertIn("fake crash", res["message"])
         _, _, res = self.run_one(date(2026, 9, 22), env={"FAKE_INVSNR_MODE": "noarcs"})
-        self.assertEqual(res["status"], "exit")
+        self.assertEqual((res["status"], res["reason"]), ("exit", "no_arcs"))
         _, _, res = self.run_one(date(2026, 9, 23), env={"FAKE_INVSNR_MODE": "nofile"})
         self.assertEqual(res["status"], "error")
         self.assertIn("without writing", res["message"])

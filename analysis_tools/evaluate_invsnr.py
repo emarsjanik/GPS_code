@@ -19,7 +19,7 @@ themselves, with the reflector height as a cubic spline in time
 (Strandberg et al. 2016). A moving surface is then part of the model
 rather than a correction to it, and every frequency and constellation
 constrains one shared curve. Published agreement with tide gauges is
-1.4-3.3 cm (Strandberg et al. 2016; 1.5-3.3 cm post-processed in
+1.4-3.1 cm (Strandberg et al. 2016; 1.5-3.3 cm post-processed in
 Strandberg et al. 2019), against about 2-5 cm for spectral spline
 series (Geremia-Nievinski et al. 2020). Two cautions from the same
 literature decide what this tool measures:
@@ -47,10 +47,16 @@ WHAT IT DOES
            failures) working on decimated COPIES of the station's SNR
            files in a private REFL_CODE under --out-dir. Only the core
            day of each run is kept, so every kept value has a day of
-           data either side of it. A run that finished (a water level,
-           or gnssrefl's own stop such as the gap rule) is reused while
-           its settings and the station's SNR files are unchanged,
-           unless --rerun; a crash or a timeout is tried again.
+           data either side of it. invsnr's gap rule covers the whole
+           padded run, so a run that stops on a gap lying in a pad day
+           is run once more without that pad day (the core day then
+           loses its edge knot spacing on that side, as at a missing
+           SNR day); a gap wholly inside the core day stops it. A run
+           that finished (a water level, or gnssrefl's gap or no-arcs
+           stop) is reused while its settings and the station's SNR
+           files are unchanged, unless --rerun; a crash, a timeout or
+           any other gnssrefl stop (e.g. a file it could not find) is
+           tried again.
   compare  Every series is put on one 30-minute grid (the spline's own
            step) and compared with
              - the Chatham gauge (8447435), through the transfer
@@ -71,11 +77,15 @@ WHAT IT DOES
   A reading is SUPPORTED when a retrieval of its own method lies within
   SUPPORT_S (1 h) of it: for the spline, gnssir's arcs in the subdaily
   azimuth window; for invsnr, its own arcs (the ones that pass its
-  peak-to-noise test and so enter the SNR fit). Both curves are smooth
-  functions that write a value across a gap, so a value is not
-  evidence of data. The headline numbers use only the epochs where
-  EVERY series compared is supported, so all series are judged on the
-  same water.
+  peak-to-noise test, which its gap rule counts; with --constel
+  withBeidou these include BeiDou B1C/B2a arcs that the SNR fit leaves
+  out, see SETTINGS). Both curves are smooth functions that write a
+  value across a gap, so a value is not evidence of data. The headline
+  numbers judge each invsnr series against the spline on the epochs
+  where BOTH are supported, so the two are judged on the same water and
+  one knot spacing's failed days never change another's numbers or
+  verdict; the spline's own rows use the epochs where it and any
+  invsnr series are supported.
 
   In storms the GNSS-IR level legitimately exceeds the harbour gauge by
   wave setup, and in the biggest storms reads the total water level at
@@ -97,11 +107,16 @@ SETTINGS (defaults, and why)
                      edges run along the shore and reflect off the beach.
   knots 2 h          invsnr's default is 3 h. 2 h resolves M2 and its
                      first overtide with room to spare. invsnr stops on
-                     any gap longer than 1.05 x the spacing, so a
-                     shorter spacing rejects more days: compare several,
-                     e.g. --knot-space 1 1.5 2 3 (3 = invsnr's own, as a
-                     reference). --risky lets a short spacing fit across
-                     the gaps; the curve is then poorly held there
+                     any gap longer than 1.05 x the spacing anywhere in
+                     the run, pad days included, so a shorter spacing
+                     rejects more days: compare several, e.g.
+                     --knot-space 1 1.5 2 3 (3 = invsnr's own, as a
+                     reference). A stop caused by a pad day is retried
+                     without it (WHAT IT DOES), so 'days ran' measures
+                     the core days; PER DAY gives the largest gap that
+                     touches the core day next to the whole run's.
+                     --risky lets a short spacing fit across the gaps;
+                     the curve is then poorly held there
                      (invsnr's own words: "risk of instabilities"), and
                      the report's IN GAPS row shows what it wrote.
   L1+L2+L5, GPS+GLONASS+Galileo
@@ -112,11 +127,16 @@ SETTINGS (defaults, and why)
                      columns: the same satellites, so no new pass times.
                      --constel withBeidou adds BeiDou's satellites, i.e.
                      new passes, which is what shortens the gaps that
-                     stop invsnr; it then models BeiDou on B1, B3 and
-                     B2b only (no C5 in kristine_dictionary,
-                     spline_functions.py:1389-1437), and keeps the
-                     GEO/IGSO satellites gnssir leaves out. Both are
-                     worth one comparison run.
+                     stop invsnr, and keeps the GEO/IGSO satellites
+                     gnssir leaves out. With L1+L2+L5 the SNR fit then
+                     models BeiDou on B1I (gnssrefl's L2) only; B3 and
+                     B2b (L6/L7) need --signal ALL. BeiDou's B1C and B2a
+                     (L1/L5) arcs pass the peak-to-noise test and count
+                     for the gap rule and for support, but are never
+                     fitted: kristine_dictionary has no C1 or C5
+                     (spline_functions.py:1389-1437) and the fit loops
+                     over its list (:623). Both are worth one
+                     comparison run.
   dec 5 s            The SNR files are 1 Hz (gnssrefl_sample_rate).
                      Nyquist: at RH 19 m and 5-15 deg the L1 SNR
                      oscillation has a period of about 35 s, so 5 s keeps
@@ -179,12 +199,18 @@ gnssrefl 4.1.5)
     accepted arcs, counting the start and end of the run, exceeds 1.05 x
     the knot spacing, unless risky (:887-898); and with exit() when no
     arc passes (:861-863, :878-880). The return code says nothing, so
-    the child catches SystemExit and the output file is checked.
+    the child catches SystemExit, the output file is checked, and the
+    run's log tells the gap stop and the no-arcs stop from any other
+    (a missing SNR or refraction file, refraction.py:350-352,
+    spline_functions.py:1171-1172).
   - ONE roughness parameter per run (:927-929), damping the modelled
     oscillation by exp(-4 k^2 rho sin^2 e) (:667-669): rho is in m^2,
     so sqrt(rho) is an effective surface-height scatter in metres. It is
     returned to snr2spline's caller only, never written to a file; the
-    child captures it. With one run per day it is one value per day.
+    child captures it. Each value is fitted over the whole padded run
+    (3 days) and given to its core day, so neighbouring days share two
+    thirds of their data and the n of the report's roughness-vs-Hs
+    correlation overstates the independent samples.
   - Refraction is Bennett's elevation bending with GPT2w pressure and
     temperature (:737-746, :811-815; refraction.py:453-478). The fixed
     MJD 59580 (:745) does not matter: gpt2_1w is called with it=1, the
@@ -248,11 +274,14 @@ HOW TO ADOPT (only if the evaluation says so)
      (ADOPTION RULE) and says what evidence it had.
   2. Then it becomes a SEPARATE nightly product, e.g.
      Files/<sta>/<sta>_invsnr_out.txt in the spline's column layout so
-     every loader reads it, made by this script's run step for the
-     newest complete day, behind an opt-in station.json switch that is
-     off by default. <sta>_spline_out.txt and the public plot stay as
-     they are; moving them to invsnr is a separate owner decision and a
-     datum change by the "invsnr minus spline" bias.
+     every loader reads it, made by this script's run step, behind an
+     opt-in station.json switch that is off by default. It must lag a
+     day to match what was evaluated: the newest complete day has no
+     day after it, so its run would lose its last knot spacing and hold
+     its end from one side only. Publish day D-1 from D-2..D, or re-run
+     the previous day each night. <sta>_spline_out.txt and the public
+     plot stay as they are; moving them to invsnr is a separate owner
+     decision and a datum change by the "invsnr minus spline" bias.
   3. Carry over the settings in the report header (also in
      summary_*.json); they are this run's, not a recommendation.
 
@@ -270,6 +299,8 @@ REFERENCES
   Strandberg, Hobiger, Haas (2016) Radio Science 51, 1286-1296.
   Strandberg, Hobiger, Haas (2019) GPS Solutions 23(3).
   Purnell et al. (2020) IEEE JSTARS 13, 4419-4428.
+  Purnell, Gomez, Minarik, Porter, Langston (2021) Earth Surf. Dynam.
+  9, 673-685.
   Geremia-Nievinski et al. (2020) J. Geodesy 94(8).
   Larson et al. (2013) Adv. Space Res.; Larson, Ray, Williams (2017)
   J. Atmos. Oceanic Technol. 34(2), 295-307.
@@ -554,8 +585,9 @@ def stage_snr(live_refl: Path, private_refl: Path, sta: str, d: date,
 # ---------------------------------------------------------------------
 
 def _plot_date_standin(x, y, fmt="o", **kwargs):
-    """pyplot.plot_date for matplotlib >= 3.10, where it was removed;
-    invsnr 4.1.5 calls it before writing its output file."""
+    """pyplot.plot_date for matplotlib >= 3.11, where it was removed
+    (deprecated in 3.9); invsnr 4.1.5 calls it before writing its
+    output file."""
     import matplotlib.pyplot as plt
     kwargs.pop("tz", None)
     kwargs.pop("xdate", None)
@@ -747,18 +779,75 @@ def live_sources(live_refl: Path, sta: str, first: date, last: date,
     return out
 
 
+# gnssrefl's own stops, told apart by what it printed (spline_functions.py
+# :861-863, :878-880, :893-898). Any other stop is 'other'.
+EXIT_REASONS = (("gap", "Gap in data bigger than node spacing"),
+                ("no_arcs", "no reflector height data"),
+                ("no_arcs", "not enough data"))
 # Outcomes that gnssrefl reaches again on the same files and settings:
-# a run that ended in one of these is reused unless --rerun. A crash
-# or a timeout is tried again, as its cause may have been fixed.
-REUSED_STATUSES = ("ok", "exit")
+# a run that ended in one of these is reused unless --rerun. A crash,
+# a timeout or another stop (e.g. a file it could not find) is tried
+# again, as its cause may have been fixed.
+REUSED_EXITS = ("gap", "no_arcs")
+
+
+def exit_reason(log_text: str) -> tuple[str, str]:
+    """(reason, the line that says so) for a run gnssrefl stopped: 'gap',
+    'no_arcs' or 'other' (then the log's last line)."""
+    lines = [x.strip() for x in log_text.splitlines() if x.strip()]
+    for reason, text in EXIT_REASONS:
+        for line in lines:
+            if text in line:
+                return reason, line
+    return "other", lines[-1] if lines else ""
+
+
+def finished(res: dict) -> bool:
+    """A run that would end the same way again (see REUSED_EXITS)."""
+    return res.get("status") == "ok" or (res.get("status") == "exit"
+                                         and res.get("reason") in REUSED_EXITS)
+
+
+def gaps_over(arc_unix, first: date, last: date, limit_s: float) -> list:
+    """invsnr's gap rule (spline_functions.py:883-898): the gaps between
+    accepted arcs, counting the run's start and end, longer than
+    limit_s, as (start, end) epochs."""
+    t = np.sort(np.array([a for a in arc_unix if a is not None], float))
+    edges = np.concatenate(([day_start(first)], t, [day_start(last) + 86400.0]))
+    i = np.flatnonzero(np.diff(edges) > limit_s)
+    return [(float(edges[k]), float(edges[k + 1])) for k in i]
+
+
+def pad_sides_to_drop(res: dict, run: Run, first: date, last: date, knot_space_h: float) -> list:
+    """The pad sides ('before', 'after') to run again without, when a
+    run stopped on the gap rule only because of gaps reaching into its
+    pad days. [] when a gap lies wholly inside the core day (the core
+    day itself fails) or nothing points at a pad day."""
+    arcs = (res.get("arcs") or {}).get("unix")
+    if res.get("status") != "exit" or res.get("reason") != "gap" or not arcs:
+        return []
+    d0 = day_start(run.day)
+    d1 = d0 + 86400.0
+    sides = set()
+    for a, b in gaps_over(arcs, first, last, 1.05 * knot_space_h * 3600.0):
+        if a >= d0 and b <= d1:
+            return []
+        if a < d0 and first < run.day:
+            sides.add("before")
+        if b > d1 and last > run.day:
+            sides.add("after")
+    return sorted(sides)
 
 
 def execute_run(run: Run, settings: InvsnrSettings, ctx: RunContext) -> dict:
     """Run invsnr for one core day and return its result (also kept in
     run_dir/result.json). A pad day without an SNR file shortens the
     run on that side; a core day without one is 'no_snr'. A run that
-    finished ('ok', or gnssrefl's own 'exit', e.g. the gap rule) with
-    the same settings, span and SNR files is reused."""
+    stops on the gap rule only because of a gap in a pad day is run
+    again without that pad day ('pad_dropped'; the padded attempt is
+    kept in 'padded_run' and its log in run_padded.log). A run that
+    finished (see finished()) with the same settings, span and SNR
+    files is reused."""
     run_dir = ctx.run_dir(settings, run)
     run_dir.mkdir(parents=True, exist_ok=True)
     result_path = run_dir / "result.json"
@@ -778,20 +867,24 @@ def execute_run(run: Run, settings: InvsnrSettings, ctx: RunContext) -> dict:
                                             settings.snr_ending):
         last += timedelta(days=1)
 
-    spec = {
-        "invsnr_kwargs": invsnr_kwargs(settings, first, last, run_dir / "invsnr"),
-        "inv_json": inv_json(settings, ctx.lat, ctx.lon, ctx.ht),
-        "first": first.isoformat(), "last": last.isoformat(),
-        "decimate_s": settings.decimate_s,
-        "sources": live_sources(ctx.live_refl, sta, first, last, settings.snr_ending),
-        "result_path": str(result_path),
-    }
+    def make_spec(a: date, b: date) -> dict:
+        return {
+            "invsnr_kwargs": invsnr_kwargs(settings, a, b, run_dir / "invsnr"),
+            "inv_json": inv_json(settings, ctx.lat, ctx.lon, ctx.ht),
+            "first": a.isoformat(), "last": b.isoformat(),
+            "decimate_s": settings.decimate_s,
+            "sources": live_sources(ctx.live_refl, sta, a, b, settings.snr_ending),
+            "result_path": str(result_path),
+        }
+
+    spec = make_spec(first, last)
     if not ctx.rerun and result_path.exists():
         try:
             old = json.loads(result_path.read_text())
         except (OSError, ValueError):
             old = {}
-        if (old.get("status") in REUSED_STATUSES and _same_spec(old.get("spec", {}), spec)
+        planned = (old.get("padded_run") or old).get("spec", {})
+        if (finished(old) and _same_spec(planned, spec)
                 and (old["status"] != "ok" or (run_dir / "invsnr.txt").exists())):
             old["reused"] = True
             return old
@@ -805,6 +898,29 @@ def execute_run(run: Run, settings: InvsnrSettings, ctx: RunContext) -> dict:
         d += timedelta(days=1)
     (private / "input").mkdir(parents=True, exist_ok=True)
     (private / "input" / f"{sta}.inv.json").write_text(json.dumps(spec["inv_json"], indent=4))
+    if (run_dir / "run_padded.log").exists():
+        (run_dir / "run_padded.log").unlink()
+
+    res = _run_child(spec, run_dir, private, sta, ctx)
+    drop = pad_sides_to_drop(res, run, first, last, settings.knot_space_h)
+    if drop:
+        padded = {k: res.get(k) for k in ("status", "reason", "message", "spec", "wall_s")}
+        padded["max_gap_min"] = max_gap_minutes((res.get("arcs") or {}).get("unix"), first, last)
+        (run_dir / "run.log").replace(run_dir / "run_padded.log")
+        res = _run_child(make_spec(run.day if "before" in drop else first,
+                                   run.day if "after" in drop else last),
+                         run_dir, private, sta, ctx)
+        res["pad_dropped"] = drop
+        res["padded_run"] = padded
+        result_path.write_text(json.dumps(res))
+    return res
+
+
+def _run_child(spec: dict, run_dir: Path, private: Path, sta: str, ctx: RunContext) -> dict:
+    """One invsnr call in a child process (worker_main), in a scratch
+    current directory; returns the result it wrote, with the spec, the
+    wall time and, for a gnssrefl stop, its reason from run.log."""
+    result_path = Path(spec["result_path"])
     files_dir = private / "Files" / sta
     files_dir.mkdir(parents=True, exist_ok=True)
     extras = ("spline_out.png", "outliers_lsp.txt")           # gnssrefl's own, moved to run_dir
@@ -845,6 +961,13 @@ def execute_run(run: Run, settings: InvsnrSettings, ctx: RunContext) -> dict:
     if res.get("status") == "ok" and not (run_dir / "invsnr.txt").exists():
         res["status"] = "error"
         res["message"] = "invsnr returned without writing its output file; see run.log"
+    if res.get("status") == "exit":
+        try:
+            log_text = (run_dir / "run.log").read_text(errors="replace")
+        except OSError:
+            log_text = ""
+        res["reason"], line = exit_reason(log_text)
+        res["message"] = f"gnssrefl stopped ({res['reason']}): {line}"
     res["spec"] = spec
     res["wall_s"] = round(time.monotonic() - started, 1)
     result_path.write_text(json.dumps(res))
@@ -925,13 +1048,19 @@ def invsnr_levels(runs_results, settings: InvsnrSettings, ctx: RunContext, horth
     return ep[order], lv[order], np.unique(ar)
 
 
-def load_spline_series(path: Path):
+def load_spline_series(path: Path, cfg: dict | None = None):
     """The published spline on NAVD88 (plot_7day.load_spline, which also
-    drops gnssrefl's 999 gap rows) as (epochs, levels)."""
+    drops gnssrefl's 999 gap rows) as (epochs, levels). load_spline
+    shifts the file to the project's station.json; with cfg (the
+    --station-json in use) it is shifted to that one instead, so the
+    spline and invsnr share one antenna height."""
     from plot_7day import load_spline
     times, values = load_spline(Path(path))
     ep = np.array([t.replace(tzinfo=timezone.utc).timestamp() for t in times], float)
-    return ep, np.asarray(values, float)
+    shift = 0.0
+    if cfg is not None and len(ep):
+        shift = spline_shift(path, cfg, quiet=True) - spline_shift(path, quiet=True)
+    return ep, np.asarray(values, float) + shift
 
 
 def results_arc_epochs(refl_code: Path, sta: str, first: date, last: date, azimuth=None):
@@ -1164,6 +1293,11 @@ def evaluate(grid, levels: dict, supported: dict, gauge=None, tide=None, waves=N
     tide: the tide model on the grid (NAVD88) or None. waves: (epochs, hs,
     tp) or None. Returns plain dicts (see format_report); `arrays`, if
     given, receives the grid arrays behind them (hs, sea, gauge_pred).
+    'common' is per series: an invsnr series with the spline, on the
+    epochs both are supported ('spline_common' is the spline there);
+    the spline on the epochs it and any invsnr series are supported.
+    So each series' numbers, and its adoption verdict, do not depend on
+    which other series are in the same call.
     """
     import water_level_qc as wq
     grid = np.asarray(grid, float)
@@ -1174,43 +1308,53 @@ def evaluate(grid, levels: dict, supported: dict, gauge=None, tide=None, waves=N
     tide = np.asarray(tide, float) if tide is not None else np.full(len(grid), np.nan)
 
     sup = {n: np.isfinite(levels[n]) & np.asarray(supported[n], bool) for n in names}
-    common = np.ones(len(grid), bool)
-    for n in names:
-        common &= sup[n]
+    others = [n for n in names if n != spline_name]
+    ref_sup = sup.get(spline_name, np.ones(len(grid), bool))
+    common = {n: ref_sup & sup[n] for n in others}
+    if spline_name in sup:
+        any_other = np.zeros(len(grid), bool)
+        for n in others:
+            any_other |= sup[n]
+        common[spline_name] = ref_sup & any_other if others else ref_sup
     calm = masks["calm"]
 
     out = {"names": names, "n_grid": int(len(grid)), "spline_name": spline_name,
            "sea_counts": {c: int((sea == c).sum()) for c in ("calm", "rough", "storm", "unknown")},
-           "common_n": int(common.sum()),
-           "common_by_class": {c: int((common & m).sum()) for c, m in masks.items()},
            "series": {}, "per_day": {}}
     days = np.floor(grid / 86400.0)
-    preds = {}
+    fits, preds = {}, {}
     for n in names:
-        lv = np.asarray(levels[n], float)
         fit_use = sup[n] & calm
         if fit_use.sum() < MIN_FIT_POINTS:          # no wave record, or too few calm readings
             fit_use = sup[n]
-        fit, pred = gauge_transfer(grid, lv, fit_use, gauge)
-        preds[n] = pred
+        fits[n], preds[n] = gauge_transfer(grid, np.asarray(levels[n], float), fit_use, gauge)
+
+    def against(lv, pred, use):
+        return {"gauge": {c: stats(lv[use & m], pred[use & m]) for c, m in masks.items()},
+                "tide": {c: stats(lv[use & m], tide[use & m]) for c, m in masks.items()}}
+
+    for n in names:
+        lv = np.asarray(levels[n], float)
+        pred, cm = preds[n], common[n]
         s = {
             "coverage": {c: {"values": float(np.isfinite(lv)[m].mean()) if m.any() else None,
                              "supported": float(sup[n][m].mean()) if m.any() else None}
                          for c, m in masks.items()},
-            "gauge_fit": fit,
-            "common": {"gauge": {c: stats(lv[common & m], pred[common & m]) for c, m in masks.items()},
-                       "tide": {c: stats(lv[common & m], tide[common & m]) for c, m in masks.items()}},
-            "own": {"gauge": {c: stats(lv[sup[n] & m], pred[sup[n] & m]) for c, m in masks.items()},
-                    "tide": {c: stats(lv[sup[n] & m], tide[sup[n] & m]) for c, m in masks.items()}},
+            "gauge_fit": fits[n],
+            "common_n": int(cm.sum()),
+            "common_by_class": {c: int((cm & m).sum()) for c, m in masks.items()},
+            "common": against(lv, pred, cm),
+            "own": against(lv, pred, sup[n]),
             "unsupported": {"gauge": stats(lv[~sup[n]], pred[~sup[n]]),
                             "tide": stats(lv[~sup[n]], tide[~sup[n]])},
             "qc": qc_fail_share(grid, lv, gauge, waves, masks),
-            "daily_gauge": daily_mean_rms(grid, lv - pred, common),
-            "daily_tide": daily_mean_rms(grid, lv - tide, common),
+            "daily_gauge": daily_mean_rms(grid, lv - pred, cm),
+            "daily_tide": daily_mean_rms(grid, lv - tide, cm),
         }
         if n != spline_name and spline_name in levels:
             ref = np.asarray(levels[spline_name], float)
-            s["minus_spline"] = {c: stats(lv[common & m], ref[common & m]) for c, m in masks.items()}
+            s["minus_spline"] = {c: stats(lv[cm & m], ref[cm & m]) for c, m in masks.items()}
+            s["spline_common"] = against(ref, preds[spline_name], cm)
         out["series"][n] = s
         for dkey in np.unique(days):
             m = (days == dkey) & sup[n]
@@ -1256,10 +1400,10 @@ def adoption_check(result: dict, runs: dict) -> dict:
     in `runs` ({name: run_table rows}): a list of
     (test, invsnr value, spline value or limit, passed), where passed is
     None when the windows cannot answer it (e.g. no storm readings).
-    Accuracy is the de-meaned SD on the calm common epochs, against the
-    gauge transfer and against the tide model; invsnr must be lower by
-    ADOPT_MIN_GAIN_M or ADOPT_MIN_GAIN_FRAC of the spline's, whichever
-    is larger.
+    Accuracy is the de-meaned SD on the calm epochs the series shares
+    with the spline, against the gauge transfer and against the tide
+    model; invsnr must be lower than the spline's there by
+    ADOPT_MIN_GAIN_M or ADOPT_MIN_GAIN_FRAC of it, whichever is larger.
     """
     ser = result["series"]
     sp = ser.get(result["spline_name"])
@@ -1279,12 +1423,12 @@ def adoption_check(result: dict, runs: dict) -> dict:
 
     for name, rows in runs.items():
         s = ser.get(name)
-        if s is None:
+        if s is None or "spline_common" not in s:
             continue
         tests = []
         for ref, label in (("gauge", "gauge SD, calm common epochs"),
                            ("tide", "tide-model SD, calm common epochs")):
-            x, y = s["common"][ref]["calm"].get("sd"), sp["common"][ref]["calm"].get("sd")
+            x, y = s["common"][ref]["calm"].get("sd"), s["spline_common"][ref]["calm"].get("sd")
             tests.append((label, x, y, lower_by_enough(x, y)))
         x, y = s["coverage"]["all"]["supported"], sp["coverage"]["all"]["supported"]
         tests.append(("supported coverage", x, y, not_worse(x, y, True)))
@@ -1310,14 +1454,20 @@ def adoption_verdict(tests) -> str:
     return "meets"
 
 
-def max_gap_minutes(arc_unix, first: date, last: date):
+def max_gap_minutes(arc_unix, first: date, last: date, day: date | None = None):
     """invsnr's gap rule quantity (spline_functions.py:883-892): the
-    largest gap between accepted arcs, counting the run's start and end."""
+    largest gap between accepted arcs, counting the run's start and end.
+    With `day`, only the gaps that reach into that day."""
     if arc_unix is None:
         return None
     t = np.sort(np.array([a for a in arc_unix if a is not None], float))
     edges = np.concatenate(([day_start(first)], t, [day_start(last) + 86400.0]))
-    return float(np.max(np.diff(edges)) / 60.0)
+    a, b = edges[:-1], edges[1:]
+    if day is not None:
+        d0 = day_start(day)
+        touch = (b > d0) & (a < d0 + 86400.0)
+        a, b = a[touch], b[touch]
+    return float(np.max(b - a) / 60.0) if len(a) else None
 
 
 def run_table(runs_results, settings: InvsnrSettings) -> list[dict]:
@@ -1336,11 +1486,13 @@ def run_table(runs_results, settings: InvsnrSettings) -> list[dict]:
         rho = res.get("roughness")
         message = (res.get("message") or "").strip().splitlines()
         rows.append({
-            "day": run.day.isoformat(), "status": res.get("status"),
+            "day": run.day.isoformat(), "status": res.get("status"), "reason": res.get("reason"),
             "message": message[-1] if message else "",
             "span": f"{first.isoformat()}..{last.isoformat()}",
+            "pad_dropped": res.get("pad_dropped") or [],
             "arcs_core_day": n_core,
             "max_gap_min": max_gap_minutes(arcs, first, last) if arcs else None,
+            "core_gap_min": max_gap_minutes(arcs, first, last, run.day) if arcs else None,
             "gap_limit_min": 1.05 * settings.knot_space_h * 60.0,
             "roughness_m2": rho,
             "roughness_sigma_m": float(np.sqrt(rho)) if rho is not None and rho > 0 else None,
@@ -1392,7 +1544,8 @@ def format_report(title: str, result: dict, runs: dict, settings_list, notes=())
             f"{_pct(cov[c]['values']):>8} /{_pct(cov[c]['supported']):>7}" for c in CLASSES))
 
     L += ["", "  AGAINST THE CHATHAM GAUGE, a * gauge(t - lag) + b fitted to each series",
-          f"  (calm supported readings), on the {result['common_n']} epochs every series covers:",
+          "  (calm supported readings), on the COMMON epochs: each invsnr series where it and the",
+          "  spline are both supported; the spline where it and any invsnr series are:",
           f"    {'':<{w}}{'a':>6}{'lag':>6}{'b':>8}  " + "".join(f"{c + ' RMSE':>12}" for c in CLASSES)
           + f"{'daily-mean RMS':>16}{'own supported RMSE':>22}"]
     for n in names:
@@ -1438,20 +1591,25 @@ def format_report(title: str, result: dict, runs: dict, settings_list, notes=())
         L.append(f"    {n:<{w}} n {u['n']:<5} bias {_f(u.get('bias'), '{:+.3f}')}  RMSE {_f(u.get('rmse'))}")
 
     for n, rows in runs.items():
-        L += ["", f"  PER DAY, {n}: run status, accepted arcs in the day, largest gap (invsnr stops "
-                  f"above the limit unless --risky), roughness rho (m^2) and sqrt(rho) (m), SNR-fit RMS,",
-              "  buoy Hs, and each series' RMSE against its own gauge transfer on its OWN supported "
-              "readings that day",
-              f"    {'day':<11}{'status':<8}{'arcs':>5}{'gap/limit min':>15}{'rho':>9}{'sqrt':>7}"
+        L += ["", f"  PER DAY, {n}: run status, accepted arcs in the day, largest gap reaching into the "
+                  f"day / in the whole run (invsnr stops",
+              "  above the limit unless --risky), roughness rho (m^2) and sqrt(rho) (m), SNR-fit RMS, "
+              "buoy Hs, and each series' RMSE",
+              "  against its own gauge transfer on its OWN supported readings that day",
+              f"    {'day':<11}{'status':<8}{'arcs':>5}{'gap day/run/limit':>20}{'rho':>9}{'sqrt':>7}"
               f"{'fitRMS':>8}{'Hs mean/max':>13}{'RMSE spline':>12}{'RMSE invsnr':>12}"]
         for r in rows:
             day_row = result["per_day"].get(r["day"], {})
             L.append(f"    {r['day']:<11}{str(r['status']):<8}{_f(r['arcs_core_day'], '{:d}'):>5}"
-                     f"{_f(r['max_gap_min'], '{:.0f}'):>8}/{r['gap_limit_min']:<6.0f}"
+                     f"{_f(r.get('core_gap_min'), '{:.0f}'):>7}/{_f(r['max_gap_min'], '{:.0f}'):>5}"
+                     f"/{r['gap_limit_min']:<6.0f}"
                      f"{_f(r['roughness_m2'], '{:.4f}'):>9}{_f(r['roughness_sigma_m'], '{:.3f}'):>7}"
                      f"{_f(r['snr_fit_rms'], '{:.2f}'):>8}"
                      f"{_f(day_row.get('hs_mean'), '{:.1f}'):>7}/{_f(day_row.get('hs_max'), '{:.1f}'):<5}"
                      f"{_f(day_row.get(result['spline_name'])):>12}{_f(day_row.get(n)):>12}")
+            if r.get("pad_dropped"):
+                L.append(f"      ran {r['span']} without the pad day {' and '.join(r['pad_dropped'])}: "
+                         f"the padded run stopped on a gap there")
             if r["status"] != "ok" and r["message"]:
                 L.append(f"      {r['message'][:100]}")
         rho = [r["roughness_m2"] for r in rows if r["status"] == "ok"]
@@ -1460,17 +1618,18 @@ def format_report(title: str, result: dict, runs: dict, settings_list, notes=())
                                   [np.nan if v is None else v for v in hs])
         ok_days = sum(1 for r in rows if r["status"] == "ok")
         L.append(f"    {ok_days} of {len(rows)} days ran; daily roughness vs buoy Hs: Spearman "
-                 f"{_f(rc, '{:+.2f}')} over {nc} days (a usable sea-state term would be clearly positive)")
+                 f"{_f(rc, '{:+.2f}')} over {nc} days (a usable sea-state term would be clearly positive;")
+        L.append("    each rho is fitted over its whole padded run, so neighbouring days are not independent)")
 
     adopt = adoption_check(result, runs)
     if adopt:
-        cc = result.get("common_by_class", {})
         L += ["", "  ADOPTION RULE (HOW TO ADOPT, step 1) on these windows alone; the rule asks for at "
                   "least two calm weeks and a storm.",
-              f"  Evidence here: common epochs calm {cc.get('calm', 0)} ({cc.get('calm', 0) * GRID_S / 86400:.1f} d), "
-              f"rough {cc.get('rough', 0)}, storm {cc.get('storm', 0)}."]
+              "  Each invsnr series against the spline on the epochs both cover; evidence = those epochs."]
         for n, tests in adopt.items():
-            L.append(f"    {n}: {adoption_verdict(tests).upper()}")
+            cc = ser[n]["common_by_class"]
+            L.append(f"    {n}: {adoption_verdict(tests).upper()} (evidence: common epochs calm {cc['calm']} "
+                     f"({cc['calm'] * GRID_S / 86400:.1f} d), rough {cc['rough']}, storm {cc['storm']})")
             for label, x, y, ok in tests:
                 fmt = _pct if ("share" in label or "coverage" in label or "days" in label) else _f
                 L.append(f"      {label:<36}{fmt(x):>8}  vs {fmt(y):>7}   "
@@ -1519,7 +1678,7 @@ def compare(windows, settings_list, results_by_label, ctx: RunContext, args, cfg
     first, last = window_days(windows)[0], window_days(windows)[-1]
     levels, supported, notes = {}, {}, []
 
-    s_ep, s_lv = load_spline_series(Path(args.spline_file))
+    s_ep, s_lv = load_spline_series(Path(args.spline_file), cfg)
     in_win = (s_ep >= grid[0] - 86400) & (s_ep <= grid[-1] + 86400)
     if in_win.sum() == 0:
         notes.append(f"the spline has no rows in the window ({args.spline_file})")
@@ -1591,8 +1750,9 @@ def main(argv=None) -> int:
                    help="UTC days START[:END], inclusive, e.g. 2026-09-20:2026-09-30 (repeatable)")
     p.add_argument("--station", default=None, help="gnssrefl 4-character code (default: station.json)")
     p.add_argument("--station-json", default=str(STATION_JSON))
-    p.add_argument("--refl-code", default=os.environ.get("REFL_CODE") or str(PROJECT_DIR / "products" / "refl_code"),
-                   help="the station's REFL_CODE, only read (default: $REFL_CODE, else products/refl_code)")
+    p.add_argument("--refl-code", default=None,
+                   help="the station's REFL_CODE, only read (default: gnssrefl_refl_code in station.json, "
+                        "else $REFL_CODE, else products/refl_code)")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="everything this writes (default: %(default)s)")
     p.add_argument("--knot-space", type=float, nargs="+", default=list(KNOT_SPACE_H),
                    help="invsnr knot spacing(s) in hours, one set of runs each (default: 2)")
@@ -1638,6 +1798,8 @@ def main(argv=None) -> int:
     args.station = (args.station or cfg.get("gnssrefl_station_code") or "").lower()
     if len(args.station) != 4:
         p.error("need the 4-character gnssrefl station code (--station, or gnssrefl_station_code in station.json)")
+    args.refl_code = (args.refl_code or cfg.get("gnssrefl_refl_code") or os.environ.get("REFL_CODE")
+                      or str(PROJECT_DIR / "products" / "refl_code"))
     refl = Path(args.refl_code).resolve()
     files_dir = refl / "Files" / args.station
     args.spline_file = args.spline_file or str(files_dir / f"{args.station}_spline_out.txt")
