@@ -62,15 +62,33 @@ gnssrefl 4.1.5's subdaily writes three per-arc files:
   ..._subdaily_edit.txt.withrhdot             + RH with RHdot (column 23)
   ..._subdaily_edit.txt.withrhdotIF           + RH with RHdot and IF bias (column 25)
 The last two are written by the nightly fit in Files/<sta>/fit/,
-named for the years it spans (gnss_record.py). This reads the most
-corrected RH the given file has. Given the plain edit file, it uses
-the .withrhdotIF file found next to it or in its fit/ folder,
-restricted to the edit file's time span, and says so; --raw-rh
+named for the years it spans (gnss_record.py), and they hold only
+the arcs the fit kept: gnssrefl drops every arc more than 3 sigma
+from its spline before writing .withrhdot (rhdot_correction2), and
+again before writing .withrhdotIF. The arcs this test exists to find
+(wet sand or beach at the top of the window, a bad bearing) are the
+ones those edits remove, so a report on either file alone is censored
+by the quantity it measures and looks cleaner than the data is.
+
+So give the plain edit file, which has every arc. Each arc is joined
+to its row of the .withrhdotIF file found next to it or in its fit/
+folder (on year, day, UTC time, satellite and frequency) and takes
+that row's corrected RH. Every other arc is corrected here the same
+way: the RHdot term is EdotF (column 13) times dRH/dt from the
+spline being compared, and the IF bias is the fit's own for that
+frequency (the median of column 23 minus column 25 over its rows).
+On the fit's own arcs this gives its column 25 to about 0.04 m rms
+(a synthetic record run through gnssrefl 4.1.5; the slope is the
+spline's, not that of the fit's first spline). Each table then also counts, per bin, the arcs the fit's edits
+dropped. The RH line says how many arcs took the fit's RH, how many
+were corrected here, and the span the fit's file covers. Given a
+.withrhdot or .withrhdotIF file itself, its corrected column is read
+and a WARNING says the arcs the fit dropped are missing. --raw-rh
 compares the raw RH instead, as this script did before.
 
 Usage:
     python3 elevation_quality.py \\
-        --subdaily products/refl_code/Files/usgs/fit/usgs_2026_subdaily_edit.txt.withrhdotIF \\
+        --subdaily products/refl_code/Files/usgs/usgs_2026_subdaily_edit.txt \\
         --spline products/refl_code/Files/usgs/usgs_spline_out.txt
 """
 
@@ -120,9 +138,10 @@ def rh_column(c: list[str], raw_rh: bool = False) -> int:
 def load_subdaily(path: Path, hortho: float, raw_rh: bool = False, used: Counter | None = None):
     """
     Returns per-arc records: time, water level, mean elevation,
-    azimuth, peak-to-noise. The water level is Hortho minus the most
-    corrected RH of each row (rh_column()); `used` counts the columns
-    taken.
+    azimuth, peak-to-noise, and what load_arcs() needs to join and
+    correct arcs (key, freq, EdotF, the RH and its column, the RHdot
+    RH). The water level is Hortho minus the most corrected RH of each
+    row (rh_column()); `used` counts the columns taken.
     """
     recs = []
     with open(path, errors="replace") as f:
@@ -140,6 +159,11 @@ def load_subdaily(path: Path, hortho: float, raw_rh: bool = False, used: Counter
                 emin = float(c[7])
                 emax = float(c[8])
                 pknoise = float(c[13])
+                freq = int(float(c[10]))
+                edotf = float(c[12])
+                key = (int(float(c[0])), int(float(c[1])), round(float(c[4]), 3),
+                       int(float(c[3])), freq)
+                rhdot_rh = float(c[RHDOT_RH_COL]) if len(c) > RHDOT_RH_COL else None
                 month, day = int(float(c[17])), int(float(c[18]))
                 hh, mm, ss = int(float(c[19])), int(float(c[20])), int(float(c[21]))
             except (ValueError, IndexError):
@@ -157,6 +181,12 @@ def load_subdaily(path: Path, hortho: float, raw_rh: bool = False, used: Counter
                 "emax": emax,
                 "azim": azim,
                 "pknoise": pknoise,
+                "key": key,
+                "freq": freq,
+                "edotf": edotf,
+                "rh": rh,
+                "rh_col": col,
+                "rhdot_rh": rhdot_rh,
             })
     return recs
 
@@ -177,31 +207,87 @@ def corrected_file_for(path: Path) -> Path | None:
     return max(found, key=lambda p: p.stat().st_mtime)
 
 
-def load_arcs(path: Path, hortho: float, raw_rh: bool = False):
+def rhdot_at(times, spline) -> np.ndarray:
+    """
+    dRH/dt in m/hour at `times`, from the spline of water level being
+    compared (RH falls as the water rises: dRH/dt = -d(wl)/dt). Zero
+    without a usable spline. Its 999 gap values are left out.
+    """
+    if spline is None:
+        return np.zeros(len(times))
+    st, sv = spline
+    sv = np.asarray(sv, float)
+    good = np.isfinite(sv) & (np.abs(sv) < 900)
+    if good.sum() < 2:
+        return np.zeros(len(times))
+    base = st[0]
+    sx = np.array([(t - base).total_seconds() / 3600.0 for t in st])[good]
+    sx, idx = np.unique(sx, return_index=True)
+    sv = sv[good][idx]
+    if len(sx) < 2:
+        return np.zeros(len(times))
+    qx = np.array([(t - base).total_seconds() / 3600.0 for t in times])
+    return -np.interp(qx, sx, np.gradient(sv, sx))
+
+
+def load_arcs(path: Path, hortho: float, raw_rh: bool = False, spline=None):
     """
     Per-arc records with the most corrected RH available for `path`
     (see "Which reflector height"), and a line saying which was used.
+
+    Given the plain edit file, every arc is kept: an arc in the fit's
+    .withrhdotIF takes its corrected RH, any other is corrected here
+    with the RHdot term from `spline` (load_spline()'s times and
+    levels) and the fit's IF bias for its frequency. Records then
+    carry "fit_dropped": the arc lies in the fit's span but its edits
+    removed it.
     """
     used: Counter = Counter()
     recs = load_subdaily(path, hortho, raw_rh, used)
     if raw_rh or not recs or set(used) != {RAW_RH_COL}:
         cols = ", ".join(f"{RH_LABELS[k]}: {n}" for k, n in sorted(used.items()))
-        return recs, f"{path.name}: {cols or 'no arcs'}"
+        note = f"{path.name}: {cols or 'no arcs'}"
+        if not raw_rh and set(used) - {RAW_RH_COL}:
+            note += ("\n  WARNING: this file holds only the arcs the nightly fit kept "
+                     "(gnssrefl drops arcs over 3 sigma from its spline before\n"
+                     "  writing it), so the outlying arcs this test looks for are "
+                     "missing. Give the plain <sta>_<year>_subdaily_edit.txt.")
+        return recs, note
 
     corrected = corrected_file_for(path)
+    fit = {}
     if corrected is not None:
-        lo = min(r["time"] for r in recs)
-        hi = max(r["time"] for r in recs)
-        used_c: Counter = Counter()
-        crecs = [r for r in load_subdaily(corrected, hortho, False, used_c)
-                 if lo <= r["time"] <= hi]
-        if crecs:
-            return crecs, (f"{corrected.name} (the nightly fit's corrected arcs, "
-                           f"{lo:%Y-%m-%d} to {hi:%Y-%m-%d} as in {path.name}): "
-                           f"{RH_LABELS[IF_RH_COL]} -- --raw-rh compares {path.name}'s raw RH")
-    return recs, (f"{path.name}: {RH_LABELS[RAW_RH_COL]}. WARNING: no .withrhdotIF "
-                  f"file covering it, so the disagreement includes the RHdot and IF "
-                  f"corrections the spline has (review B18)")
+        fit = {r["key"]: r for r in load_subdaily(corrected, hortho)}
+    matched = [r for r in recs if r["key"] in fit]
+    if not matched:
+        return recs, (f"{path.name}: {RH_LABELS[RAW_RH_COL]}. WARNING: no .withrhdotIF "
+                      f"file covering it, so the disagreement includes the RHdot and IF "
+                      f"corrections the spline has (review B18)")
+
+    # The fit's IF bias per frequency: its column 23 minus column 25.
+    diffs: dict = {}
+    for r in fit.values():
+        if r["rh_col"] == IF_RH_COL:
+            diffs.setdefault(r["freq"], []).append(r["rhdot_rh"] - r["rh"])
+    bias = {f: float(np.median(v)) for f, v in diffs.items()}
+    lo = min(r["time"] for r in fit.values())
+    hi = max(r["time"] for r in fit.values())
+
+    for r in matched:
+        r["wl"] = fit[r["key"]]["wl"]
+        r["fit_dropped"] = False
+    others = [r for r in recs if r["key"] not in fit]
+    for r, rhdot in zip(others, rhdot_at([r["time"] for r in others], spline)):
+        r["wl"] = hortho - (r["rh"] - r["edotf"] * rhdot - bias.get(r["freq"], 0.0))
+        r["fit_dropped"] = lo <= r["time"] <= hi
+    dropped = sum(r["fit_dropped"] for r in others)
+
+    return recs, (f"{path.name}, every arc. {len(matched)} take the fit's "
+                  f"{RH_LABELS[IF_RH_COL]}\n"
+                  f"  from {corrected.name} ({lo:%Y-%m-%d} to {hi:%Y-%m-%d}). "
+                  f"Corrected here (RHdot from the spline, the fit's IF bias):\n"
+                  f"  {dropped} the fit's 3-sigma edits dropped, {len(others) - dropped} "
+                  f"outside its span. --raw-rh compares the raw RH")
 
 
 def load_spline(path: Path):
@@ -224,10 +310,23 @@ def load_spline(path: Path):
     return times, np.asarray(values, float) + spline_shift(path)
 
 
+def dropped_header(dropped: np.ndarray | None) -> str:
+    return "" if dropped is None else f"  {'fit dropped':>13}"
+
+
+def dropped_cell(dropped: np.ndarray | None, m: np.ndarray) -> str:
+    """Arcs of the bin the fit's 3-sigma edits removed (see load_arcs())."""
+    if dropped is None:
+        return ""
+    d = int(dropped[m].sum())
+    return f"  {d:5d} ({100.0 * d / m.sum():4.1f}%)"
+
+
 def report_bins(label: str, keys: np.ndarray, resid: np.ndarray,
-                edges: list[float], unit: str = "deg") -> None:
+                edges: list[float], unit: str = "deg",
+                dropped: np.ndarray | None = None) -> None:
     print(f"  {label}")
-    print(f"    {'range':>14}  {'n':>6}  {'mean |resid|':>12}")
+    print(f"    {'range':>14}  {'n':>6}  {'mean |resid|':>12}{dropped_header(dropped)}")
     stats = []
     for lo, hi in zip(edges, edges[1:]):
         m = (keys >= lo) & (keys < hi)
@@ -235,7 +334,8 @@ def report_bins(label: str, keys: np.ndarray, resid: np.ndarray,
             continue
         v = float(np.abs(resid[m]).mean())
         stats.append((lo, hi, int(m.sum()), v))
-        print(f"    {lo:5.0f}-{hi:<5.0f}{unit}  {m.sum():6d}  {v:10.3f} m")
+        print(f"    {lo:5.0f}-{hi:<5.0f}{unit}  {m.sum():6d}  {v:10.3f} m"
+              f"{dropped_cell(dropped, m)}")
 
     if len(stats) >= 2:
         vals = [s[3] for s in stats]
@@ -253,8 +353,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--subdaily", required=True,
-                   help="per-arc file: best the fit's ...subdaily_edit.txt.withrhdotIF "
-                        "(see \"Which reflector height\")")
+                   help="per-arc file: the plain <sta>_<year>_subdaily_edit.txt, "
+                        "which has every arc (see \"Which reflector height\")")
     p.add_argument("--spline", required=True)
     p.add_argument("--raw-rh", action="store_true",
                    help="compare each arc's raw RH (column 3), as before review B18")
@@ -266,8 +366,8 @@ def main() -> int:
     if args.hortho is None:
         p.error("--hortho is required: station.json has no gnssrefl_orthometric_height")
 
-    recs, rh_note = load_arcs(Path(args.subdaily), args.hortho, args.raw_rh)
     st, sv = load_spline(Path(args.spline))
+    recs, rh_note = load_arcs(Path(args.subdaily), args.hortho, args.raw_rh, (st, sv))
 
     if not recs or not st:
         print("Could not load data.")
@@ -286,10 +386,14 @@ def main() -> int:
     emax = np.array([r["emax"] for r in recs])
     azim = np.array([r["azim"] for r in recs])
     pkn = np.array([r["pknoise"] for r in recs])
+    dropped = (np.array([r["fit_dropped"] for r in recs])
+               if "fit_dropped" in recs[0] else None)
 
-    ok = np.isfinite(spline_at)
+    ok = np.isfinite(spline_at) & np.isfinite(wl)
     resid = wl[ok] - spline_at[ok]
     elev, emax, azim, pkn = elev[ok], emax[ok], azim[ok], pkn[ok]
+    if dropped is not None:
+        dropped = dropped[ok]
 
     print("=" * 68)
     print("  PER-ARC QUALITY vs GEOMETRY")
@@ -305,14 +409,14 @@ def main() -> int:
     print()
 
     report_bins("By mean arc elevation (higher = footprint closer to shore):",
-                elev, resid, [5, 7, 9, 11, 13, 15.1])
+                elev, resid, [5, 7, 9, 11, 13, 15.1], dropped=dropped)
 
     report_bins("By arc upper elevation (emaxO):",
-                emax, resid, [8, 10, 12, 14, 15.1])
+                emax, resid, [8, 10, 12, 14, 15.1], dropped=dropped)
 
     az_edges = [0, 30, 60, 90, 120, 150, 175, 353, 361]
     print("  By azimuth (which direction the reflection came from):")
-    print(f"    {'range':>14}  {'n':>6}  {'mean |resid|':>12}")
+    print(f"    {'range':>14}  {'n':>6}  {'mean |resid|':>12}{dropped_header(dropped)}")
     stats = []
     for lo, hi in zip(az_edges, az_edges[1:]):
         m = (azim >= lo) & (azim < hi)
@@ -320,7 +424,8 @@ def main() -> int:
             continue
         v = float(np.abs(resid[m]).mean())
         stats.append((lo, hi, v))
-        print(f"    {lo:5.0f}-{hi:<5.0f}deg  {m.sum():6d}  {v:10.3f} m")
+        print(f"    {lo:5.0f}-{hi:<5.0f}deg  {m.sum():6d}  {v:10.3f} m"
+              f"{dropped_cell(dropped, m)}")
     if len(stats) >= 2:
         vals = [s[2] for s in stats]
         worst = stats[int(np.argmax(vals))]

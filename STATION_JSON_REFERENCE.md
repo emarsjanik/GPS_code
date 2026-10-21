@@ -183,6 +183,9 @@ project's own station the result was stark:
 | 120-150 deg | 0.719 m |
 | 150-175 deg | 1.253 m |
 
+(Made with each arc's raw RH, before review B18; `--raw-rh`
+reproduces that comparison.)
+
 Trimming the mask from `[353, 360, 0, 173]` to `[353, 360, 0, 130]`
 discarded 9% of arcs and improved agreement against an independent
 tide model by 18%:

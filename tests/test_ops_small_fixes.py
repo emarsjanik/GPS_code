@@ -36,7 +36,7 @@ import tempfile
 import unittest
 import unittest.mock
 import urllib.error
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -116,12 +116,13 @@ class TestOtherZeroPaddedReaders(unittest.TestCase):
 
 def subdaily_line(dt: datetime, rh: float, rhdot_rh: float | None = None,
                   if_rh: float | None = None, azim: float = 80.0,
-                  freq: int = 1) -> str:
+                  freq: int = 1, emin: float = 5.0, emax: float = 15.0) -> str:
     """One row of gnssrefl subdaily output (22, 24 or 25 columns)."""
     doy = dt.timetuple().tm_yday
     hour = dt.hour + dt.minute / 60
     cols = [dt.year, doy, f"{rh:.3f}", 1, f"{hour:.3f}", f"{azim:.2f}", "12.00",
-            "5.00", "15.00", 300, freq, 1, "0.10000", "4.00", "30.00", "60000.000000",
+            f"{emin:.2f}", f"{emax:.2f}", 300, freq, 1, "0.10000", "4.00", "30.00",
+            "60000.000000",
             1, dt.month, dt.day, dt.hour, dt.minute, dt.second]
     if rhdot_rh is not None:
         cols += [f"{rhdot_rh:.3f}", f"{rh - rhdot_rh:.3f}"]
@@ -163,6 +164,7 @@ class TestElevationQualityUsesCorrectedRH(unittest.TestCase):
         self.assertEqual(len(recs), len(self.times))
         self.assertAlmostEqual(recs[0]["wl"], -0.2, places=6)       # 19.0 - 19.2
         self.assertIn("column 25", note)
+        self.assertIn("WARNING", note)          # the arcs the fit dropped are missing
 
     def test_plain_edit_file_uses_the_fit_corrected_arcs_of_its_span(self) -> None:
         corrected = self.files / "fit" / "abcd_2026_2027_subdaily_edit.txt.withrhdotIF"
@@ -174,6 +176,59 @@ class TestElevationQualityUsesCorrectedRH(unittest.TestCase):
         self.assertTrue(all(abs(r["wl"] + 0.2) < 1e-9 for r in recs))
         self.assertIn(corrected.name, note)
         self.assertIn("--raw-rh", note)
+
+    def test_arcs_the_fit_dropped_are_kept_and_corrected(self) -> None:
+        # Arc 3 is missing from the fit (its 3-sigma edit dropped it):
+        # it is kept, with the RHdot term from the spline slope and the
+        # fit's IF bias for its frequency (19.3 - 19.2 = 0.1 m).
+        (self.files / "fit" / "abcd_2026_subdaily_edit.txt.withrhdotIF").write_text(
+            "".join(subdaily_line(t, 19.5, 19.3, 19.2)
+                    for i, t in enumerate(self.times) if i != 3))
+        t0 = self.times[0]
+        spline = ([t0, t0 + timedelta(hours=1)], [0.0, -0.5])   # RH rising 0.5 m/hour
+        recs, note = self.eq.load_arcs(self.edit, hortho=19.0, spline=spline)
+        self.assertEqual(len(recs), len(self.times))
+        self.assertEqual([i for i, r in enumerate(recs) if r["fit_dropped"]], [3])
+        # RH 19.5 - EdotF 0.1 h * 0.5 m/h - bias 0.1 = 19.35
+        self.assertAlmostEqual(recs[3]["wl"], 19.0 - 19.35, places=6)
+        self.assertAlmostEqual(recs[0]["wl"], -0.2, places=6)      # the fit's column 25
+        self.assertIn("1 the fit's 3-sigma edits dropped, 0 outside its span", note)
+
+    def test_outlying_arcs_the_fit_dropped_still_count(self) -> None:
+        # The top elevation bin has arcs 0.6 m off (land), which the
+        # fit's 3-sigma edits removed from its .withrhdotIF. They must
+        # still show in that bin and make the verdict "Systematic".
+        import elevation_quality as eq
+        start = datetime(2026, 7, 1)
+        plain, fit = ["% plain\n"], []
+        bins = [(5, 7), (7, 9), (9, 11), (11, 13), (13, 15)]
+        n = 0
+        for lo, hi in bins:
+            for i in range(40):
+                t = start + timedelta(minutes=3 * n)
+                n += 1
+                rh = 19.5 + (0.05 if i % 2 else -0.05)
+                land = (lo, hi) == (13, 15) and i % 4 == 0
+                plain.append(subdaily_line(t, rh - 0.6 if land else rh, emin=lo, emax=hi))
+                if not land:
+                    fit.append(subdaily_line(t, rh, rh, rh, emin=lo, emax=hi))
+        self.edit.write_text("".join(plain))
+        (self.files / "fit" / "abcd_2026_subdaily_edit.txt.withrhdotIF").write_text("".join(fit))
+        spline = self.files / "abcd_spline_out.txt"
+        spline.write_text("".join(
+            f"  0 19.5 2026 7 1 {h} {m} 0 -0.5\n" for h in range(24) for m in (0, 30)))
+
+        out = io.StringIO()
+        argv = ["elevation_quality.py", "--subdaily", str(self.edit),
+                "--spline", str(spline), "--hortho", "19.0"]
+        with unittest.mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), \
+                eq.np.errstate(invalid="ignore"):        # peak-to-noise is constant here
+            self.assertEqual(eq.main(), 0)
+        text = out.getvalue()
+        elevation = text.split("By mean arc elevation")[1].split("By arc upper")[0]
+        self.assertIn("worst is 13-15deg. Systematic", elevation)
+        self.assertIn("   10 (25.0%)", elevation)
+        self.assertIn("200 arcs compared", text)
 
     def test_raw_rh_keeps_the_old_comparison(self) -> None:
         (self.files / "fit" / "abcd_2026_subdaily_edit.txt.withrhdotIF").write_text(
