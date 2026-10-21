@@ -31,7 +31,18 @@
 #   ./compress_rinex.sh              (dry run)
 #   ./compress_rinex.sh --execute    (actually compress)
 #   ./compress_rinex.sh --execute --keep-days 14
-#       leaves the most recent 14 days uncompressed
+#       leaves today's UTC day and the 14 UTC days before it
+#       uncompressed
+#
+# Days are UTC days, as the file names are (station_manager.py names
+# each raw file, and so each RINEX file, for its UTC day). The window
+# used to be counted from the local clock (`date -d "N days ago"`)
+# against the file date read as local midnight, so where it fell
+# depended on the time zone and the time of day the script ran
+# (review B22). At the 23:30 local nightly run (US Eastern), already
+# the next UTC day, the UTC rule keeps exactly the days the old one
+# kept; at other times or in other zones it keeps a day or two more,
+# never fewer.
 
 set -uo pipefail
 
@@ -69,11 +80,13 @@ if [ ! -d "$RINEX_DIR" ]; then
 fi
 
 if [ "$KEEP_DAYS" -gt 0 ]; then
-    cutoff_epoch=$(date -d "$KEEP_DAYS days ago" +%s)
-    echo "  Leaving the most recent $KEEP_DAYS day(s) uncompressed."
+    # YYYYMMDD of the oldest UTC day left alone: today (UTC) minus
+    # KEEP_DAYS. Compared with the file names' YYYYMMDD as numbers.
+    cutoff_day=$(date -u -d "$KEEP_DAYS days ago" +%Y%m%d)
+    echo "  Leaving today (UTC) and the $KEEP_DAYS UTC day(s) before it uncompressed (from $cutoff_day)."
     echo ""
 else
-    cutoff_epoch=$(date -d "2100-01-01" +%s)   # effectively "compress everything"
+    cutoff_day=99999999   # effectively "compress everything"
 fi
 
 # Collect the distinct basenames (one per day) that have at least a
@@ -173,8 +186,7 @@ for base in "${basenames[@]}"; do
     # series).
     datestr=$(echo "$base" | grep -oE '[0-9]{8}' | head -1)
     if [ -n "$datestr" ] && [ "$KEEP_DAYS" -gt 0 ]; then
-        file_epoch=$(date -d "${datestr:0:4}-${datestr:4:2}-${datestr:6:2}" +%s 2>/dev/null || echo 0)
-        if [ "$file_epoch" -ge "$cutoff_epoch" ]; then
+        if [ "$((10#$datestr))" -ge "$((10#$cutoff_day))" ]; then
             echo "  [skip] $base -- within the most recent $KEEP_DAYS day(s)"
             skipped_count=$((skipped_count + 1))
             continue

@@ -288,5 +288,157 @@ class TestGageDatum(unittest.TestCase):
         self.assertAlmostEqual(v[1], -1.0 * 0.3048)
 
 
+# ------------------------------------------------------------
+# B22
+# ------------------------------------------------------------
+
+FAKE_DATE = """#!/bin/bash
+# `date`, with "now" = $FAKE_NOW for relative dates and for no -d.
+args=(); have_d=0
+while [ $# -gt 0 ]; do
+  if [ "$1" = -d ]; then
+    case "$2" in *ago*) args+=(-d "$FAKE_NOW $2");; *) args+=(-d "$2");; esac
+    have_d=1; shift 2
+  else args+=("$1"); shift; fi
+done
+[ $have_d = 1 ] || args+=(-d "$FAKE_NOW")
+exec /bin/date "${args[@]}"
+"""
+
+
+class ShellDatesTestCase(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        (self.bin / "date").write_text(FAKE_DATE)
+        (self.bin / "date").chmod(0o755)
+        self.proj = self.tmp / "proj"
+        (self.proj / "maintenance").mkdir(parents=True)
+        (self.proj / "rinex").mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def run_script(self, name, *args, now, tz, extra_env=None):
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+                   FAKE_NOW=now, TZ=tz, **(extra_env or {}))
+        return subprocess.run(["bash", str(self.proj / "maintenance" / name), *args],
+                              env=env, capture_output=True, text=True, timeout=120)
+
+
+class TestCompressRinexUtcDays(ShellDatesTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.proj / "maintenance" / "compress_rinex.sh").write_text(
+            (ROOT / "maintenance" / "compress_rinex.sh").read_text())
+        for day in range(15, 23):
+            (self.proj / "rinex" / f"station_202610{day:02d}.obs").write_text("x\n")
+
+    def kept(self, keep_days, now, tz):
+        r = self.run_script("compress_rinex.sh", "--keep-days", str(keep_days), now=now, tz=tz)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return sorted(line.split()[1] for line in r.stdout.splitlines()
+                      if line.strip().startswith("[skip]"))
+
+    def test_window_is_today_utc_and_the_n_days_before(self) -> None:
+        # 22:30 EDT on 21 Oct is already 22 Oct UTC
+        self.assertEqual(self.kept(1, "2026-10-22 02:30 UTC", "America/New_York"),
+                         ["station_20261021", "station_20261022"])
+        self.assertEqual(self.kept(3, "2026-10-22 02:30 UTC", "America/New_York"),
+                         ["station_20261019", "station_20261020", "station_20261021",
+                          "station_20261022"])
+
+    def test_same_days_whatever_the_time_zone(self) -> None:
+        now = "2026-10-21 23:59 UTC"
+        expected = self.kept(2, now, "UTC")
+        for tz in ("America/New_York", "Asia/Tokyo", "Pacific/Kiritimati"):
+            with self.subTest(tz=tz):
+                self.assertEqual(self.kept(2, now, tz), expected)
+        # (22 Oct is in the future here: never compressed)
+        self.assertEqual(expected, ["station_20261019", "station_20261020", "station_20261021",
+                                    "station_20261022"])
+
+
+class TestPruneLocalRinexUtcDays(ShellDatesTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.proj / "maintenance" / "prune_local_rinex.sh").write_text(
+            (ROOT / "maintenance" / "prune_local_rinex.sh").read_text())
+        aws = self.bin / "aws"
+        aws.write_text("#!/bin/sh\nexit 1\n")     # nothing is in S3: nothing pruned
+        aws.chmod(0o755)
+        (self.proj / "archive.conf").write_text(
+            f'S3_BASE="s3://bucket/x"\nSTATION_CODE="abcd"\nAWS_CLI="{aws}"\n')
+        sync = self.tmp / "s3SyncRinex.sh"
+        sync.write_text("aws s3 sync rinex/ s3://bucket/x/rinex\n")
+        self.env = {"SYNC_SCRIPT": str(sync)}
+        for day in range(15, 23):
+            (self.proj / "rinex" / f"station_202610{day:02d}.tar.gz").write_text("x\n")
+
+    def kept(self, keep_days, now, tz):
+        r = self.run_script("prune_local_rinex.sh", "--keep-days", str(keep_days),
+                            now=now, tz=tz, extra_env=self.env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return sorted(line.split()[1].replace(".tar.gz", "") for line in r.stdout.splitlines()
+                      if line.strip().startswith("[keep]"))
+
+    def test_same_rule_as_compress_rinex(self) -> None:
+        now = "2026-10-21 23:59 UTC"
+        for tz in ("UTC", "America/New_York", "Asia/Tokyo"):
+            with self.subTest(tz=tz):
+                self.assertEqual(self.kept(2, now, tz),
+                                 ["station_20261019", "station_20261020", "station_20261021",
+                                  "station_20261022"])
+
+
+class TestCleanProcessingQueueDayMapping(unittest.TestCase):
+
+    def setUp(self) -> None:
+        import clean_processing_queue as cpq
+        self.cpq = cpq
+        self._tmp = tempfile.TemporaryDirectory()
+        self.proj = Path(self._tmp.name)
+        (self.proj / "station" / "resources").mkdir(parents=True)
+        (self.proj / "station" / "resources" / "station.json").write_text(
+            json.dumps({"gnssrefl_station_code": "abcd"}))
+        (self.proj / "raw").mkdir()
+        (self.proj / "database").mkdir()
+        self.results = self.proj / "products" / "refl_code" / "2026" / "results" / "abcd"
+        self.results.mkdir(parents=True)
+        db = sqlite3.connect(str(self.proj / "database" / "station.db"))
+        db.execute("CREATE TABLE processing_queue (id INTEGER PRIMARY KEY, filename TEXT, "
+                   "retry_count INTEGER, completed INTEGER)")
+        for i, name in enumerate(("station_20260108.um980",     # results 008.txt
+                                  "station_20260109.um980",     # none; next day has some
+                                  "station_20260110.um980")):   # results 010.txt
+            db.execute("INSERT INTO processing_queue VALUES (?, ?, 3, 0)", (i + 1, name))
+        db.commit()
+        db.close()
+        (self.results / "008.txt").write_text("x\n")
+        (self.results / "010.txt").write_text("x\n")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_own_utc_day_only_and_zero_padded(self) -> None:
+        out = io.StringIO()
+        with unittest.mock.patch.object(self.cpq, "PROJECT_DIR", self.proj), \
+                unittest.mock.patch.object(sys, "argv", ["clean_processing_queue.py", "--execute"]), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(self.cpq.main(), 0)
+        db = sqlite3.connect(str(self.proj / "database" / "station.db"))
+        left = [r[0] for r in db.execute("SELECT filename FROM processing_queue")]
+        db.close()
+        # day 9 has no results of its own: kept and reported, although
+        # day 10 has results (the old doy+1 rule removed it)
+        self.assertEqual(left, ["station_20260109.um980"])
+        self.assertIn("no results for 2026-01-09, doy 9", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

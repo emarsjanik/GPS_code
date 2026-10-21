@@ -34,6 +34,11 @@
 #   ./prune_local_rinex.sh                 (dry run, 30-day window)
 #   ./prune_local_rinex.sh --keep-days 60  (dry run, 60-day window)
 #   ./prune_local_rinex.sh --execute       (actually prune)
+#
+# The window is today's UTC day and the KEEP_DAYS UTC days before it,
+# compared with the UTC date in each archive's name -- the same rule
+# as compress_rinex.sh (review B22: both used to count local days
+# against UTC-named files).
 
 set -uo pipefail
 
@@ -106,7 +111,8 @@ if [ ! -d "$RINEX_DIR" ]; then
     exit 0
 fi
 
-cutoff_epoch=$(date -d "$KEEP_DAYS days ago" +%s)
+# YYYYMMDD of the oldest UTC day kept: today (UTC) minus KEEP_DAYS.
+cutoff_day=$(date -u -d "$KEEP_DAYS days ago" +%Y%m%d)
 
 # ----------------------------------------------------------------
 # SAFETY GUARD -- do not remove.
@@ -171,8 +177,7 @@ for archive in "$RINEX_DIR"/*.tar.gz; do
         continue
     fi
 
-    file_epoch=$(date -d "${datestr:0:4}-${datestr:4:2}-${datestr:6:2}" +%s 2>/dev/null || echo 0)
-    if [ "$file_epoch" -ge "$cutoff_epoch" ]; then
+    if [ "$((10#$datestr))" -ge "$((10#$cutoff_day))" ]; then
         echo "  [keep] $base -- within the most recent $KEEP_DAYS day(s)"
         kept=$((kept + 1))
         continue
