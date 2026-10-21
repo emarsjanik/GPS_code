@@ -337,6 +337,25 @@ section "Step 5: Rolling 7-day plot"
 SEVEN_DAY_PLOT="$REFL_CODE/Files/$STATION_CODE/7_day_plot.png"
 SPLINE_FILE="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
 
+# Opt-in: refresh the rolling tide prediction before anything reads it,
+# only when station.json has a "tide_prediction" section (and it is not
+# "enabled": false). The plot uses it only once tide_model_file points
+# at the file it writes (analysis_tools/make_tide_prediction.py). A
+# failed refresh leaves the previous file as it was.
+if python3 -c "
+import json, sys
+tp = json.load(open('$STATION_JSON')).get('tide_prediction')
+sys.exit(0 if isinstance(tp, dict) and tp.get('enabled', True) is not False else 1)
+" 2>/dev/null; then
+    if python3 "$PROJECT_DIR/analysis_tools/make_tide_prediction.py"; then
+        echo ""
+    else
+        echo "  The tide prediction could not be refreshed -- see above. The"
+        echo "  previous file is unchanged; the next run will try again."
+        echo ""
+    fi
+fi
+
 if [ ! -f "$SPLINE_FILE" ]; then
     echo "  No spline output yet -- skipping."
 elif [ ! -f "$PROJECT_DIR/analysis_tools/plot_7day.py" ]; then
