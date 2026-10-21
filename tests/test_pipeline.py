@@ -21,17 +21,24 @@ a recognizable date at all (ad-hoc test recordings).
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "station"))
 
-from pipeline import Pipeline, _date_from_filename, _in_progress_reason  # noqa: E402
+import pipeline as pipeline_module  # noqa: E402
+from pipeline import (  # noqa: E402
+    PIPELINE_LOCK_NAME, Pipeline, PipelineBusyError, _date_from_filename,
+    _in_progress_reason,
+)
 
 
 class TestDateFromFilename(unittest.TestCase):
@@ -204,6 +211,132 @@ class TestInProgressDaySkipped(unittest.TestCase):
         pipeline._process_queue()
 
         self.assertEqual(processed, ["station_20200101.um980"])
+
+    def test_a_whole_run_leaves_todays_file_alone(self) -> None:
+        # Through run() and its lock, as process_and_plot.sh's Step 2
+        # and station_manager's midnight run call it (finding H1 + L4):
+        # cron now reaches the pipeline, and must still not touch the
+        # UTC day being recorded, even when it was queued before.
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        self._raw("station_20200101.um980")
+        self._raw(f"station_{today}.um980", mtime=time.time() - 2)
+
+        queued: list[str] = [f"station_{today}.um980"]
+        db = SimpleNamespace(processing_history=lambda filename=None: [
+            SimpleNamespace(filename=name, completed=False) for name in queued])
+        pipeline = Pipeline(cfg=SimpleNamespace(raw_dir=self.raw_dir,
+                                                logs_dir=self.raw_dir / "logs"), db=db)
+        pipeline._initialized = True
+        pipeline._find_new_files = lambda scanned: scanned
+        pipeline._verify_raw_file = lambda path: True
+        pipeline._queue_processing = lambda path: queued.append(path.name)
+        pipeline._update_database = lambda: None
+        processed: list[str] = []
+        pipeline._process_one_job = processed.append
+
+        pipeline.run()
+
+        self.assertEqual(processed, ["station_20200101.um980"])
+        self.assertNotIn(f"station_{today}.um980", queued[1:])
+
+
+class TestRunLock(unittest.TestCase):
+    """
+    station_manager's run at each UTC midnight and the cron's
+    (process_and_plot.sh Step 2) never run Pipeline at the same time
+    (finding H1): run() holds logs/pipeline.lock for the whole pass.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs = Path(self._tmp.name) / "logs"
+        self.lock_path = self.logs / PIPELINE_LOCK_NAME
+        poll = unittest.mock.patch.object(pipeline_module, "_LOCK_POLL_S", 0.02)
+        poll.start()
+        self.addCleanup(poll.stop)
+
+    def _pipeline(self, body=None) -> Pipeline:
+        pipeline = Pipeline(cfg=SimpleNamespace(logs_dir=self.logs))
+        pipeline._initialized = True
+        pipeline._run = body or (lambda: "summary")
+        return pipeline
+
+    def _hold_in_another_process(self) -> subprocess.Popen:
+        self.logs.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl, sys, time\n"
+             "f = open(sys.argv[1], 'a')\n"
+             "fcntl.flock(f, fcntl.LOCK_EX)\n"
+             "print('held', flush=True)\n"
+             "time.sleep(60)\n",
+             str(self.lock_path)],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return holder
+
+    def test_a_run_held_off_by_another_process_does_nothing(self) -> None:
+        holder = self._hold_in_another_process()
+        ran: list[str] = []
+        pipeline = self._pipeline(lambda: ran.append("ran"))
+
+        with self.assertRaises(PipelineBusyError):
+            pipeline.run(lock_wait_s=0.2)
+        self.assertEqual(ran, [])
+
+        holder.kill()
+        holder.wait()
+        pipeline.run(lock_wait_s=5)
+        self.assertEqual(ran, ["ran"])
+
+    def test_a_run_waits_for_the_other_to_finish(self) -> None:
+        holder = self._hold_in_another_process()
+        threading.Timer(0.3, holder.kill).start()
+
+        self.assertEqual(self._pipeline().run(lock_wait_s=30), "summary")
+
+    def test_two_runs_in_one_process_never_overlap(self) -> None:
+        # station_manager's background thread and anything else in the
+        # same process take the lock through their own open file, so
+        # threads are kept apart too
+        inside, most, done = [0], [0], []
+        guard = threading.Lock()
+
+        def body():
+            with guard:
+                inside[0] += 1
+                most[0] = max(most[0], inside[0])
+            time.sleep(0.1)
+            with guard:
+                inside[0] -= 1
+            done.append(1)
+
+        threads = [threading.Thread(target=self._pipeline(body).run, kwargs={"lock_wait_s": 30})
+                   for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual((len(done), most[0]), (3, 1))
+
+    def test_the_lock_is_released_when_a_run_raises(self) -> None:
+        def crash():
+            raise RuntimeError("simulated crash")
+
+        with self.assertRaises(RuntimeError):
+            self._pipeline(crash).run(lock_wait_s=0)
+        self.assertEqual(self._pipeline().run(lock_wait_s=0), "summary")
+
+    def test_run_before_initialize_still_refuses(self) -> None:
+        pipeline = Pipeline(cfg=SimpleNamespace(logs_dir=self.logs))
+        with self.assertRaises(RuntimeError):
+            pipeline.run()
+        self.assertFalse(self.lock_path.exists())
 
 
 if __name__ == "__main__":

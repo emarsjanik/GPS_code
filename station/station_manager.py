@@ -47,12 +47,15 @@ is under 5 h, so gnssrefl's subdaily spline bridged it with
 interpolated values, as if they had been observed (review B8).
 
 The run is not dropped, although the 22:30 cron runs the same
-pipeline: it is the run the record depends on. The cron's pipeline
-step imports pipeline.py by a path relative to cron's working
-directory, so with the documented crontab it does not run (verified
-finding H1). Instead the run, the health snapshot and the export go
-to one background thread, in that order, and the main thread goes
-straight back to recording.
+pipeline: it is the run the record depends on. Until verified finding
+H1 was fixed, the cron's pipeline step imported pipeline.py by a path
+relative to cron's working directory, so with the documented crontab
+it never ran, and this was the only run that processed anything. The
+two now share Pipeline.run()'s lock (logs/pipeline.lock), so they
+never overlap: whichever comes second waits for the other, up to an
+hour (pipeline.PIPELINE_LOCK_WAIT_S). Instead of running inline, the
+run, the health snapshot and the export go to one background thread,
+in that order, and the main thread goes straight back to recording.
 
 A thread rather than a separate process, because everything the run
 needs is already safe to share. database.py opens SQLite with
@@ -73,7 +76,8 @@ pipeline runs never overlap. A stop request waits for the running
 work to finish before run() returns, as it waited for the inline run
 before. "manager_pipeline_in_background": false in station.json
 restores the old inline order, as a way back if the thread ever
-causes trouble on the station.
+causes trouble on the station (inline, a wait for the cron's run to
+release the lock also holds back recording).
 
 Chunked recording, not one call per day
 -----------------------------------------

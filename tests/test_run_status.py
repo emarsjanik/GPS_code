@@ -65,15 +65,19 @@ sys.exit(rc)
 """
 
 PIPELINE = """import os
+class PipelineBusyError(RuntimeError):
+    pass
 class _Summary:
     files_found = files_processed = products_created = 1
-    files_failed = 0
-    errors = []
+    files_failed = int(os.environ.get("STUB_PIPELINE_FILES_FAILED", "0"))
+    errors = ["station_20261020.um980: simulated failure"] if files_failed else []
 class Pipeline:
     def initialize(self): pass
     def run(self):
         if os.environ.get("STUB_PIPELINE_FAIL"):
             raise RuntimeError("simulated pipeline crash")
+        if os.environ.get("STUB_PIPELINE_BUSY"):
+            raise PipelineBusyError("another pipeline run has held the lock")
         return _Summary()
     def shutdown(self): pass
 """
@@ -291,16 +295,40 @@ class ProcessAndPlotTests(unittest.TestCase):
         self.assertIn("virtual environment not found", st["steps"][0]["message"])
         self.assertEqual((st["rc"], st["ok"]), (1, False))
 
-    def test_the_pipeline_import_failing_outside_the_project_is_seen(self) -> None:
-        # cron starts the script from $HOME, and Step 2 imports the pipeline
-        # from the relative path 'station' (finding H1): that failure now
-        # reaches the status, and the mail, with its error line
+    def test_the_pipeline_imports_from_the_project_outside_it(self) -> None:
+        # cron starts the script from $HOME. Step 2 imported the pipeline
+        # from the relative path 'station' and died there (finding H1); it
+        # now imports from the project's own station/ folder, wherever it
+        # was started, and never from a 'station' folder of the cwd
+        decoy = self.root / "station"
+        decoy.mkdir()
+        (decoy / "pipeline.py").write_text("raise SystemExit('the cwd copy was imported')\n")
         r = self.run_script(cwd=self.root)
-        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
         step2 = self.status()["steps"][2]
         self.assertEqual((step2["name"], step2["status"], step2["rc"]),
-                         ("process new raw data", "failed", 1))
-        self.assertIn("ModuleNotFoundError", step2["message"])
+                         ("process new raw data", "ok", 0))
+        self.assertIn("[OK]   Running pipeline", r.stdout)
+
+    def test_a_failed_file_fails_the_step_not_the_run(self) -> None:
+        # the -c snippet exits 1 when any file failed: the step is failed
+        # in the status, the script's exit status (and so the upload) not
+        r = self.run_script(cwd=self.root, STUB_PIPELINE_FILES_FAILED="2")
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+        st = self.status()
+        step2 = st["steps"][2]
+        self.assertEqual((step2["status"], step2["rc"]), ("failed", 1))
+        self.assertIn("2 file(s) failed", step2["message"])
+        self.assertEqual(st["failed_steps"], ["Step 2 (process new raw data)"])
+        # the steps after it still ran
+        self.assertIn((4, "water-level fit", "ok"), self.steps())
+
+    def test_a_pipeline_kept_waiting_by_another_run_fails_the_step(self) -> None:
+        r = self.run_script(STUB_PIPELINE_BUSY="1")
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+        step2 = self.status()["steps"][2]
+        self.assertEqual((step2["status"], step2["rc"]), ("failed", 1))
+        self.assertIn("another pipeline run", step2["message"])
 
     def test_no_raw_data_is_a_skip(self) -> None:
         (self.proj / "raw" / "station_20261020.um980").unlink()

@@ -107,10 +107,12 @@ assuming:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+import fcntl
 import logging
 import os
 import re
@@ -176,10 +178,10 @@ def _date_from_filename(filename: str) -> str | None:
 # a day, at 00:00 UTC, when that day's file was written seconds ago and
 # is finished. Taken as in progress, the day was skipped by that run,
 # the station's own, and left to whichever came next: station_manager's
-# a day later, or the cron's only where its pipeline step works
-# (process_and_plot.sh imports pipeline by a path relative to cron's
-# working directory). With a same-day orbit (nav, ultra) that put every
-# day a day late.
+# a day later, or the cron's only where its pipeline step worked
+# (process_and_plot.sh imported pipeline by a path relative to cron's
+# working directory, verified finding H1). With a same-day orbit (nav,
+# ultra) that put every day a day late.
 #
 # Every other name keeps the IN_PROGRESS_MTIME_S rule, dated or not.
 # overnight_recording.py (QUICKSTART Step 5) writes
@@ -192,6 +194,23 @@ def _date_from_filename(filename: str) -> str | None:
 IN_PROGRESS_MTIME_S = 15 * 60
 
 _STATION_DAY_FILE = re.compile(r"station_\d{8}\.um980")
+
+# One run() at a time, across processes: station_manager's run at each
+# UTC midnight and the cron's (process_and_plot.sh Step 2) share the
+# processing_queue, the files they archive and gnssrefl's staging, and
+# nothing else keeps them apart (verified finding H1). run() holds an
+# exclusive flock on logs/pipeline.lock for the whole pass. A run that
+# finds it held waits for it, up to PIPELINE_LOCK_WAIT_S, rather than
+# skipping: the run holding it is usually station_manager's day just
+# closed, and the cron's fit (Step 4) should see that day's results.
+# Past the wait, run() raises PipelineBusyError and does nothing.
+PIPELINE_LOCK_NAME = "pipeline.lock"
+PIPELINE_LOCK_WAIT_S = 60 * 60
+_LOCK_POLL_S = 5.0
+
+
+class PipelineBusyError(RuntimeError):
+    """Another Pipeline.run() held the run lock for longer than the wait."""
 
 
 def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
@@ -382,7 +401,7 @@ class Pipeline:
 
         return "READY"
 
-    def run(self) -> PipelineSummary:
+    def run(self, lock_wait_s: float = PIPELINE_LOCK_WAIT_S) -> PipelineSummary:
         """
         Run one full pass: scan for new raw files, queue whatever
         needs work (new discoveries and previous failures alike),
@@ -392,11 +411,20 @@ class Pipeline:
         A failure on any single file is caught, logged, and recorded
         against that file; it never aborts the run. Call initialize()
         first.
+
+        Only one run, in any process, works at a time (see
+        PIPELINE_LOCK_NAME): if another holds the lock, this one waits
+        for it up to lock_wait_s seconds, then raises
+        PipelineBusyError without doing anything.
         """
 
         if not self._initialized:
             raise RuntimeError("Pipeline.initialize() must be called before run()")
 
+        with self._run_lock(lock_wait_s):
+            return self._run()
+
+    def _run(self) -> PipelineSummary:
         self._logger.info("Pipeline run starting")
 
         self._reset_run_stats()
@@ -443,6 +471,42 @@ class Pipeline:
 
         assert self.db is not None
         return self.db.processing_statistics()
+
+    @contextmanager
+    def _run_lock(self, wait_s: float):
+        """Hold the exclusive run lock (logs/pipeline.lock) while inside."""
+
+        assert self.cfg is not None
+
+        path = Path(self.cfg.logs_dir) / PIPELINE_LOCK_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(path, "a") as lock:
+            deadline = time.monotonic() + wait_s
+            waiting = False
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise PipelineBusyError(
+                            f"another pipeline run has held {path} for over "
+                            f"{wait_s / 60:.0f} min -- this run did nothing"
+                        )
+                    if not waiting:
+                        self._logger.info(
+                            "Another pipeline run is in progress; waiting "
+                            "up to %.0f min for it to finish",
+                            wait_s / 60,
+                        )
+                        waiting = True
+                    time.sleep(min(_LOCK_POLL_S, left))
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     # ==========================================================
     # Private: initialize()

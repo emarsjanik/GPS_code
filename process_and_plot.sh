@@ -286,6 +286,16 @@ fi
 
 # ----------------------------------------------------------------
 # Step 2: process any new raw data
+#
+# pipeline.py is imported from this project's station/ folder by its
+# full path (the argument after the -c code), not from the working
+# directory: cron starts this script from $HOME, where a relative
+# 'station' found nothing and the step died on the import (verified
+# finding H1). The step exits 1 when any file failed, which the run
+# status records as a failed step; the script's own exit status and
+# the upload do not change. Pipeline.run() holds logs/pipeline.lock,
+# so this run and station_manager's midnight run never overlap, and
+# it leaves the UTC day still being recorded alone.
 # ----------------------------------------------------------------
 
 section "Step 2: Processing new data"
@@ -314,12 +324,17 @@ else
         "$expected_after" \
         python3 -c "
 import sys
-sys.path.insert(0, 'station')
-from pipeline import Pipeline
+sys.path.insert(0, sys.argv[1])
+from pipeline import Pipeline, PipelineBusyError
 
 p = Pipeline()
 p.initialize()
-summary = p.run()
+try:
+    summary = p.run()
+except PipelineBusyError as exc:
+    p.shutdown()
+    print('ERROR:', exc)
+    sys.exit(1)
 p.shutdown()
 
 print()
@@ -332,7 +347,11 @@ if summary.errors:
     print('Errors:')
     for e in summary.errors:
         print(' -', e)
-"
+if summary.files_failed:
+    print()
+    print('ERROR:', summary.files_failed, 'file(s) failed -- see the errors above')
+    sys.exit(1)
+" "$PROJECT_DIR/station"
     pipeline_exit=$?
 
     if [ "$pipeline_exit" -ne 0 ]; then
