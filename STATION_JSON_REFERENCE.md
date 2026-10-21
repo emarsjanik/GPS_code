@@ -568,6 +568,55 @@ one, rather than asking you to type a column name blind), or by hand.
 | `tide_model_value_column` | string | Required if `tide_model_file` is set | The column name containing the tide height values to compare against, e.g. `"EOT20_heightm"`. A single file may have several candidate columns (one per tide model); pick whichever is most appropriate for your site. |
 | `tide_model_time_column` | string | Optional | The column name containing timestamps. Default `"time"`. |
 
+### Generated tide prediction (optional)
+
+The tide spreadsheet above is made by hand and covers a fixed period;
+when it ends, the predicted tide and the departure markers disappear
+from the public 7-day plot. `analysis_tools/make_tide_prediction.py`
+writes the same kind of file (first sheet: `time` plus one height
+column, every 10 minutes, UTC, metres about mean sea level) for a
+rolling 30 days, from EOT20 through pyTMD or from NOAA CO-OPS harmonic
+predictions. With a `tide_prediction` section, `process_and_plot.sh`
+refreshes it every night before drawing the plot. **It changes nothing
+on its own**: the plot uses it only once `tide_model_file` is the full
+path of the generated file and `tide_model_value_column` is its height
+column (`EOT20_heightm` for EOT20, `NOAA<station>_heightm` for NOAA).
+Compare it with the existing spreadsheet first:
+`python3 analysis_tools/make_tide_prediction.py --validate` reports the
+RMS difference and the time lag between the two. Against pyTMD/EOT20,
+a lag of about 10 min or 4-5 h points to a timestamp error rather than
+a model difference. Against NOAA the lag also holds the gauge's own
+delay, so only the difference between two spreadsheets' lags (printed
+when you give both with `--reference OLD NEW`) means that.
+
+Once `tide_model_file` points at it, the file is also the tide column
+of the monthly CSVs that `maintenance/s3UploadTimeseries.sh` publishes.
+That script uploads each month again for 10 days after it ends, and
+every month of a year again when `gnss_record.py` freezes the year, and
+a month outside the file gets an empty tide column. That is why
+`keep_history` is on by default, and why the first run (no file of its
+own yet) starts with the rows of the spreadsheet `tide_model_file`
+still names, copied as they are, when it has the same height column.
+So let it run once before you point `tide_model_file` at it.
+
+```json
+"tide_prediction": {"source": "pytmd", "pytmd_directory": "/home/argus_user/tide_models"}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `enabled` | boolean | `false` stops the nightly refresh without deleting the section. Default `true`. Anything but `true` or `false` is refused. |
+| `source` | string | `"pytmd"` (EOT20 via pyTMD, tested with 3.0.9 plus dask, or 2.2.9.1: `pip freeze > before.txt; pip install 'pyTMD==3.0.9' dask -c before.txt` in the virtual environment, so pip refuses rather than upgrades what gnssrefl uses; about 2.5 GB of memory with pyTMD 3, 0.5 GB with pyTMD 2; and the EOT20 `ocean_tides` files in `<pytmd_directory>/EOT20/ocean_tides/`), `"noaa"` (CO-OPS predictions, needs the internet) or `"auto"` (pyTMD if it works, else NOAA; once `tide_model_file` is this file it takes the source of `tide_model_value_column`'s column, and once the file exists it keeps that file's source). Default `"auto"`; an explicit source is safer. |
+| `file` | string (path) | Where to write it. Default `tides/tide_prediction.xlsx` in the project; a relative path is taken from the project directory, and `~` is expanded. It never overwrites a spreadsheet it did not make. |
+| `point` | `[lat, lon]` | Where to predict the tide. Default: `latitude`/`longitude` above. The station sits on a narrow strip of land between the Atlantic and Cape Cod Bay: if the model has no ocean value there and fills it from the bay side, give a point a little offshore on the Atlantic side. |
+| `pytmd_directory` | string (path) | Directory holding the tide models for pyTMD. Default: pyTMD's own. |
+| `model` | string | pyTMD model name. Default `"EOT20"`. |
+| `extrapolate_km` | number | How far pyTMD may look for ocean when the point's grid cell is land. Default `10`. |
+| `noaa_station` | string | CO-OPS harmonic station. Default `"8447435"` (Chatham, Lydia Cove, the gauge the quality check uses). |
+| `noaa_time_offset_minutes`, `noaa_height_ratio` | number | NOAA's subordinate-station corrections: the tide here is the station's, this many minutes later and this many times as large. Default `0` and `1` (none). |
+| `keep_history` | boolean | Keep the earlier rows of the previous generated file (same source only), so the file grows instead of rolling (about 52,000 rows a year); on the first run, start with the rows of the spreadsheet `tide_model_file` names (see above). Default `true`. Step 6, the morning mail and the published monthly CSVs read the whole file: with `false` their tide covers only the file's roughly 10 past days, and a month uploaded again later loses its tide column. |
+| `value_column` | string | Name of the height column. Default as above. |
+
 ## External storage (optional)
 
 | Field | Type | Description |
