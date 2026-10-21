@@ -521,7 +521,7 @@ class TestInitialize(GnssIrProcessorTestCase):
         call = calls["make_gnssir_input"][0]
         self.assertEqual(call["polyV"], 2)
 
-    # ---- opt-in arc-level QC (known finding G-B9) -------------------
+    # ---- opt-in arc-level QC ------------------------------------------
 
     def _gnssir_json_path(self) -> Path:
         return self.root / "products" / "refl_code" / "input" / "usgs" / "usgs.json"

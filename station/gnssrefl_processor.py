@@ -861,20 +861,28 @@ class GnssIrProcessor:
         #     deviation, the robust definition gnssrefl credits to
         #     Felipe Geremia-Nievinski. A day's spread is mostly tide,
         #     so this clip rarely fires either way.
-        #   * the two spline fits drop arcs more than 3 sigma of the
-        #     WHOLE fit's residual RMS from the spline; spline_outlier1/2
-        #     replace that by a fixed limit in metres (the first fit,
-        #     before RHdot, and the second, after the RHdot and
-        #     inter-frequency corrections -- gnssrefl's subdaily, Larson
-        #     2024; the RHdot correction, Larson et al. 2013, 2017).
-        #     Only the first one changes the published spline: the
-        #     final spline is refitted on every arc that survived it.
-        # In a synthetic repro of the Sep 2026 storm (known finding
-        # G-B9), 0.30/0.25 m with alt_sigma left a sustained +1.7 m
-        # storm bias where it was and cost 12% of calm arcs: the limits
-        # are relative to a spline that follows the bias. That is why
-        # these are opt-in and evaluated on the station's own results
-        # first.
+        #   * the two spline clips drop arcs more than 3 standard
+        #     deviations (of their residuals over the WHOLE fit) from a
+        #     spline; spline_outlier1/2 replace that by a fixed limit in
+        #     metres. The first clip tests the RHdot-corrected RH (no
+        #     inter-frequency correction yet) against the first spline,
+        #     which is fitted to the UNCORRECTED RH -- so its residual
+        #     carries that spline's misfit and each signal's bias and is
+        #     wider than the final scatter (a limit sized on the final
+        #     arcs is several times too tight there). The second tests
+        #     the RHdot- and inter-frequency-corrected RH against the
+        #     final spline (gnssrefl's subdaily, Larson 2024; the RHdot
+        #     correction, Larson et al. 2013, 2017). Only the first one
+        #     changes the published spline: the final spline is refitted
+        #     on every arc that survived it.
+        # In a synthetic reproduction of the Sep 2026 storm with
+        # gnssrefl's real subdaily, fixed limits of 0.30/0.25 m with
+        # alt_sigma left a sustained +1.7 m storm bias where it was (the
+        # limits are relative to a spline that follows the bias) and
+        # cost 12% of calm arcs (0.30 m was 1.5 x the scatter the first
+        # clip tested there). That is why these are opt-in and evaluated
+        # on the station's own results first
+        # (analysis_tools/evaluate_qc_variants.py).
         alt_sigma = station_section.get("gnssrefl_subdaily_alt_sigma")
         if alt_sigma is not None:
             kwargs["subdaily_alt_sigma"] = self._as_bool(

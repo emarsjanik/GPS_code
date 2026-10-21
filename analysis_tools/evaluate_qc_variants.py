@@ -14,8 +14,9 @@ gnssrefl every arc test is relative to the data themselves: a 2.5-sigma
 clip per UTC day (mostly tide, so it rarely fires), and a 3-sigma clip
 against a first spline, sigma being one plain standard deviation over
 the whole ~10-month fit. In the 25-27 Sep 2026 storm the spline read up
-to ~3 m above what the gauge implied (known finding G-B9). gnssrefl has
-three knobs for this, each now an opt-in station.json key:
+to ~3 m above what the Chatham gauge implied: the arcs that survive a
+rough sea are the biased ones. gnssrefl has three knobs for this, each
+now an opt-in station.json key:
 
   -alt_sigma         part 1 uses the median and 1.4826 x the median
                      absolute deviation (the robust sigma gnssrefl
@@ -30,13 +31,56 @@ three knobs for this, each now an opt-in station.json key:
                      for all (amplitude_thresholds.py)
                          -> "gnssrefl_amplitude_min_by_frequency"
 
-A synthetic repro of the storm (G-B9's verdict) found 0.30/0.25 m with
-alt_sigma did NOT remove a sustained storm bias (+1.65 vs +1.68 m at
-high water) and cost 12% of calm arcs: the limits are relative to a
-spline that follows the bias. Whether any of them helps on this
-station's real arcs is an empirical question; this script answers it
-with the station's own results, the way gnssrefl itself suggests trying
-strategies -- one -extension per variant.
+A synthetic reproduction of that storm with gnssrefl's real subdaily
+found that fixed limits of 0.30/0.25 m with alt_sigma did NOT remove a
+sustained storm bias (+1.65 vs +1.68 m at high water): the limits are
+relative to a spline that follows the bias. They also cost 12% of calm
+arcs, because the residual the first clip tests had a scatter of about
+0.2 m there, so 0.30 m was only 1.5 sigma (THE TWO CLIPS). Whether any
+of the knobs helps on this station's real arcs is an empirical
+question; this script answers it with the station's own results, the
+way gnssrefl itself suggests trying strategies -- one -extension per
+variant.
+
+THE TWO CLIPS (gnssrefl 4.1.5, subdaily.py rhdot_correction2)
+
+  first   A spline (-knots per day; the series mirrored a day at each
+          end and every gap over 5 h bridged, sd_libs.flipit3) is
+          fitted to the part-1 arcs' UNCORRECTED RH. Its slope gives
+          each arc's RHdot correction (Larson et al. 2013, 2017), and
+          an arc is dropped if
+              |RHdot-corrected RH - that spline| > limit,
+          limit = 3 x the standard deviation of those residuals over the
+          whole fit, or -spline_outlier1. There is no inter-frequency
+          correction yet, and the spline was fitted before the RHdot
+          correction, so this residual carries the first spline's
+          misfit and each signal's bias: it is always wider than the
+          final arcs' scatter (0.12 m against 0.08 m on a synthetic
+          station with 0.08 m of noise). The arcs that pass are what
+          the published spline is fitted on.
+  second  After the inter-frequency correction a new spline is fitted
+          to those arcs, and an arc is dropped if |IF-corrected RH -
+          that spline| > 3 x their standard deviation, or
+          -spline_outlier2. It decides the edit and outlier files and
+          where gaps fall, not the published spline.
+
+  So abs_outliers takes each limit from the residual its own clip
+  tests, in the baseline's calm week:
+    limit 1  OUTLIER_SIGMAS x the robust scale of the first-clip
+             residuals (first_clip_scatter): gnssrefl's first spline
+             rebuilt from the baseline's part-1 edit files
+             (first_spline), and used only if it gives the RHdot-
+             corrected RH of the baseline's .withrhdot file to within
+             FIRST_SPLINE_TOL_M -- otherwise no limit is derived;
+    limit 2  OUTLIER_SIGMAS x the robust scale of the baseline's final
+             arcs about its spline (arc_scatter).
+  The robust scale is 1.4826 x the median of |residual|: about zero,
+  since both clips test |residual|, and normal-consistent like the
+  1.4826 x MAD that -alt_sigma uses in part 1, so a storm in the span
+  barely moves it. On a storm-free span, limit 1 then lands near the
+  baseline's own 3-sigma limit and drops about as many calm arcs; with
+  storms or bad days in the span it is tighter by as much as they
+  widen the whole fit's standard deviation.
 
 HOW
 
@@ -57,13 +101,30 @@ HOW
              else --settings) with the arc-QC options of the variant's
              json in place of last night's -- on the command line, as
              gnss_record.py puts them there (gnssrefl 4.1.5's subdaily
-             never reads alt_sigma from its json), over the span the
-             nightly fit covers, widened to the windows (--span
-             production, the default), or over the windows +- PAD_DAYS
-             only (--span windows: faster, but subdaily's 3-sigma limits
-             then come from that short span; the G-B9 repro saw the
-             stage-1 sigma rise 18% in a storm over 30 days against 5%
-             over 122).
+             never reads alt_sigma from its json).
+  span       --span production (the default): the span of the nightly
+             fit that wrote the windows' rows of the production record
+             (record_fit), so the baseline reproduces it:
+               a window in a frozen year -- the fit named in that
+                 year's <sta>_<year>_spline_frozen.txt header ("from the
+                 fit of A..B"; a year fitted by itself: that year);
+               a window in the live part -- record_status.json's
+                 fit_start..fit_end, the fit that last wrote the record
+                 (also right on the day after a freeze, when tonight's
+                 fit would start later);
+               else (last night's update failed or used the fallback)
+                 the span tonight's fit would cover.
+             Widened to the windows if they reach past it. If the calm
+             week and the storm were written by different fits, one run
+             cannot reproduce both: it covers both fits and says so.
+             --span windows: the windows +- PAD_DAYS only (faster, but
+             subdaily's 3-sigma limits then come from that short span;
+             the synthetic reproduction of the storm saw the first-clip
+             sigma rise 18% with the storm in a 30-day span against 5%
+             in a 122-day one).
+             The report prints the baseline's largest difference from
+             the production record in the windows: ~0 means it is the
+             nightly fit.
   windows    The storm (default 25-27 Sep 2026) and a calm week: --calm,
              or the CALM_DAYS consecutive results days with the lowest
              mean buoy Hs within CALM_SEARCH_DAYS of the storm and at
@@ -90,16 +151,18 @@ HOW
   variants   baseline         the production json as it is
              alt_sigma        + alt_sigma
              abs_outliers     + spline_outlier1/2 = OUTLIER_SIGMAS x the
-                              robust scatter of the baseline's arcs about
-                              its spline in the calm week (what 3 sigma
-                              is when no storm is in it); --outliers sets
-                              them
-             review_outliers  + 0.30/0.25 m (the code review's numbers,
-                              the ones G-B9's repro tested)
+                              robust scale of the residuals each clip
+                              tests, in the baseline's calm week (THE
+                              TWO CLIPS: what each clip's 3 sigma is in
+                              calm weather); --outliers sets them
+             fixed_outliers   + 0.30/0.25 m, the fixed limits tested in
+                              the synthetic reproduction of the storm
              amp_by_freq      + per-frequency amplitudes from
                               amplitude_thresholds.derive on the calm
                               week: today's overall strictness spread
-                              over the signals (--fraction, --amp-json)
+                              over the signals (--fraction), or the
+                              thresholds of an amplitude_thresholds.py
+                              --json file (--amp-json)
              amp_half         + per-frequency amplitudes at AMP_HALF of
                               each signal's calm median: an arc whose
                               reflection lost half its calm amplitude
@@ -136,6 +199,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -164,7 +228,9 @@ WORK_NAME = "refl_code_qc_eval"
 EVAL_SUBDIR = "eval"       # subdaily -subdir <sta>/eval
 QC_OPTIONS = ("-alt_sigma", "-spline_outlier1", "-spline_outlier2")
 OUTLIER_SIGMAS = 3.0
-REVIEW_OUTLIERS = (0.30, 0.25)
+FIXED_OUTLIERS = (0.30, 0.25)   # the fixed limits tested in the synthetic storm reproduction
+FIRST_SPLINE_TOL_M = 0.002     # rebuilt first spline vs the .withrhdot file (it prints mm)
+DEFAULT_KNOTS = 8              # subdaily's knots per day when neither settings nor json say
 CALM_RMSE_TOL_M = 0.005
 CALM_ARCS_KEEP = 0.90
 STORM_READINGS_KEEP = 0.90
@@ -172,7 +238,7 @@ STORM_GAIN = 0.10
 GAP_VISIBLE_H = 6.0        # subdaily's gap_min_val: a gap this long is a break in the plot
 MJD_UNIX = 40587.0         # MJD of 1970-01-01
 AMP_HALF = 0.5             # amp_half: half of each signal's calm median amplitude
-VARIANT_NAMES = ("baseline", "alt_sigma", "abs_outliers", "review_outliers",
+VARIANT_NAMES = ("baseline", "alt_sigma", "abs_outliers", "fixed_outliers",
                  "amp_by_freq", "amp_half", "combined")
 
 
@@ -268,11 +334,57 @@ def pick_calm(days, storm, waves) -> tuple[tuple[date, date], str]:
                f"{CALM_CLEAR_DAYS + 1} days before the storm -- check they were calm")
 
 
-def eval_span(mode, plan, windows, newest) -> tuple[date, date]:
-    first = min(w[0] for w in windows) - timedelta(days=PAD_DAYS)
-    last = max(w[1] for w in windows) + timedelta(days=PAD_DAYS)
+# gnss_record.frozen_text's note on a year frozen from a nightly fit
+FROZEN_FIT = re.compile(r"from the fit of (\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
+
+
+def _status_fit(files_dir: Path) -> tuple[date, date] | None:
+    """fit_start..fit_end of the last update, if it succeeded without the
+    fallback: the fit that wrote the live part of the record."""
+    try:
+        st = json.loads((files_dir / gr.FIT_SUBDIR / gr.STATUS_NAME).read_text())
+        if st.get("ok") and not st.get("fallback"):
+            return date.fromisoformat(st["fit_start"]), date.fromisoformat(st["fit_end"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def record_fit(refl_code: Path, sta: str, plan, w) -> tuple[tuple[date, date], str]:
+    """The span of the fit that wrote window w's rows of the production
+    record, and where that comes from ("span" in the module docstring):
+    a frozen year's header, record_status.json, else tonight's plan."""
+    files_dir = Path(refl_code) / "Files" / sta
+    year = w[0].year
+    if year in plan.frozen:
+        head, _ = gr.read_spline(gr.frozen_path(files_dir, sta, year))
+        for line in head:
+            m = FROZEN_FIT.search(line)
+            if m:
+                return ((date.fromisoformat(m.group(1)), date.fromisoformat(m.group(2))),
+                        f"{year} frozen from that fit")
+            if f"from a fit of {year} by itself" in line:
+                days = [d for d in plan.days if d.year == year]
+                return (days[0], days[-1]), f"{year} frozen from a fit of it by itself"
+    elif year >= plan.first_live:
+        fit = _status_fit(files_dir)
+        if fit is not None:
+            return fit, "the last nightly update (record_status.json)"
+    return (plan.start, plan.end), "the span tonight's fit would cover"
+
+
+def eval_span(mode, plan, windows, newest, fits=None) -> tuple[date, date]:
+    """The days the variants are fitted over. production: the fits that
+    wrote the windows (record_fit; tonight's plan without them), widened
+    to the windows if they reach past it; windows: the windows +-
+    PAD_DAYS."""
+    lo, hi = min(w[0] for w in windows), max(w[1] for w in windows)
     if mode == "production" and plan is not None:
-        first, last = min(plan.start, first), max(plan.end, last)
+        spans = fits or [(plan.start, plan.end)]
+        first = min([lo] + [f[0] for f in spans])
+        last = max([hi] + [f[1] for f in spans])
+    else:
+        first, last = lo - timedelta(days=PAD_DAYS), hi + timedelta(days=PAD_DAYS)
     return first, min(last, newest)
 
 
@@ -412,10 +524,20 @@ def arc_counts(work: Path, sta: str, v: Variant, w, azim) -> dict:
     return counts
 
 
+def robust_scale(r) -> float:
+    """1.4826 x the median of |r|: the normal-consistent robust sigma,
+    taken about ZERO because both spline clips test |residual| (THE TWO
+    CLIPS). NaN for no values."""
+    r = np.asarray(r, dtype=float)
+    r = r[np.isfinite(r)]
+    return float(1.4826 * np.median(np.abs(r))) if len(r) else float("nan")
+
+
 def arc_scatter(work: Path, sta: str, v: Variant, w) -> float:
-    """Robust sigma (1.4826 x MAD) of the variant's final arcs (RH with
-    the RHdot and inter-frequency corrections, column 25 of the IF file)
-    about its spline RH, in window w. NaN without arcs."""
+    """What the SECOND clip tests, in window w: the robust scale of the
+    variant's final arcs (RH with the RHdot and inter-frequency
+    corrections, column 25 of the .withrhdotIF file -- not column 3, the
+    raw RH) about its spline RH. NaN without arcs."""
     out_ = out_dir(work, sta, v)
     sp = [(m, float(line.split()[1])) for m, line in
           gr.read_spline(out_ / f"{sta}_spline_out.txt")[1] if abs(float(line.split()[8])) < 900]
@@ -431,10 +553,131 @@ def arc_scatter(work: Path, sta: str, v: Variant, w) -> float:
     rh = np.array([c[24] for c in rows])
     j = np.clip(np.searchsorted(sm, m), 1, len(sm) - 1)
     near = (sm[j] - sm[j - 1]) <= 1.0 / 24 + 1e-9         # no spline gap around the arc
-    r = rh[near] - np.interp(m[near], sm, srh)
-    if not len(r):
-        return float("nan")
-    return float(1.4826 * np.median(np.abs(r - np.median(r))))
+    return robust_scale(rh[near] - np.interp(m[near], sm, srh))
+
+
+def subdaily_option(settings: str, name: str, default=None):
+    """The value given to one subdaily option in a settings string."""
+    a = shlex.split(settings)
+    for i in range(len(a) - 1):
+        if a[i] == name:
+            return a[i + 1]
+    return default
+
+
+def _subdaily_bool(value) -> bool:
+    """A boolean subdaily option as gnssrefl reads it (utils.str2bool)."""
+    return str(value).strip().lower() in ("yes", "true", "t", "y", "1")
+
+
+def flipit3(t, y):
+    """gnssrefl 4.1.5's sd_libs.flipit3, rule for rule: what subdaily fits
+    its splines to. The first day's values are mirrored before the series
+    (at 2 t0 - t), the last day's put after it in reverse order (at
+    t + 1 day), and every gap over 5 hours is bridged with hourly values
+    on the straight line across it. As in gnssrefl the earliest point of
+    the mirrored series is not kept, nor the point that ends a gap. t
+    sorted (MJD)."""
+    day0, day_n = t[0], t[-1]
+    left, right = t < day0 + 1, t > day_n - 1
+    th = np.hstack((np.hstack((-(t[left] - day0), t - day0)), t[right] - day0 + 1))
+    h = np.hstack((np.hstack((y[left], y)), np.flip(y[right])))
+    o = np.argsort(th)
+    th, h = th[o] + day0, h[o]
+    fill, gap = 1 / 24, 5 / 24
+    tt, yy = [], []
+    for i in range(1, len(th)):
+        if th[i] - th[i - 1] > gap:
+            fake = np.arange(th[i - 1] + fill, th[i], fill)
+            tt.extend(fake)
+            yy.extend(np.interp(fake, th[i - 1:i + 1], h[i - 1:i + 1]))
+        else:
+            tt.append(th[i])
+            yy.append(h[i])
+    tt, yy = np.array(tt), np.array(yy)
+    o = np.argsort(tt)
+    return tt[o], yy[o]
+
+
+def first_spline(edit_files, knots: int, apply_rhdot: bool = True):
+    """gnssrefl 4.1.5's FIRST spline (subdaily.py rhdot_correction2),
+    rebuilt from the part-1 edit files <sta>_<year>_subdaily_edit.txt
+    it is fitted on: the arcs stacked in year order and sorted by MJD,
+    a least-squares cubic spline with knots per day (the first and last
+    15 minutes in) through flipit3 of their UNCORRECTED RH (column 3),
+    its slope on a 3-minute grid as RHdot, the correction EdotF x RHdot
+    (column 13; Larson et al. 2013), and the residual the first clip
+    tests: RHdot-corrected RH - spline (THE TWO CLIPS). Returns
+    (arcs, corrected RH, residual), arcs being the stacked rows; None
+    without arcs. Needs scipy (part of gnssrefl)."""
+    from scipy import interpolate
+    rows = _mjd_rows(edit_files)
+    if len(rows) < 2:
+        return None
+    width = min(len(c) for c in rows)
+    tvd = np.array([c[:width] for c in rows])
+    tvd = tvd[np.argsort(tvd[:, at.MJD_COL]).T, :]
+    th, h, xfac = tvd[:, at.MJD_COL], tvd[:, 2], tvd[:, 12]
+    tnew, ynew = flipit3(th, h)
+    n_days = tnew.max() - tnew.min()
+    first_knot = 15 / 60 / 24
+    kn = np.linspace(tnew.min() + first_knot, tnew.max() - first_knot, num=int(knots * n_days))
+    t, c, k = interpolate.splrep(tnew, ynew, s=0, k=3, t=kn, task=-1)
+    spline = interpolate.BSpline(t, c, k, extrapolate=False)
+    per_day = 24 * 20                                    # every 3 minutes
+    n = int(n_days * per_day)
+    xx = np.linspace(tnew.min(), tnew.max(), n)
+    rhdot = np.interp(th, xx[1:n], per_day / 24 * np.diff(spline(xx)))
+    corrected = h - xfac * rhdot if apply_rhdot else h
+    return tvd, corrected, corrected - spline(th)
+
+
+def _arc_key(c) -> tuple:
+    """An arc in every subdaily file: (MJD to the microday, satellite, frequency)."""
+    return (int(round(c[at.MJD_COL] * 1e6)), int(c[3]), int(c[at.FREQ_COL]))
+
+
+def first_clip_scatter(work: Path, sta: str, v: Variant, w, settings: str,
+                       cfg: dict) -> tuple[float, str]:
+    """What the FIRST clip tests, in window w: the robust scale of the
+    residuals of first_spline() on the variant's own part-1 edit files,
+    with its knots (-knots, else the json's subdaily_knots, else
+    DEFAULT_KNOTS) and -apply_rhdot. The rebuilt spline must give the
+    RHdot-corrected RH (column 23) of every arc in the variant's
+    .withrhdot file to within FIRST_SPLINE_TOL_M; if it does not -- or
+    there is no first clip -- (NaN, why). Else (scale, what was checked)."""
+    if not _subdaily_bool(subdaily_option(settings, "-rhdot", "True")):
+        return float("nan"), "subdaily runs no spline clips with -rhdot False"
+    out_ = out_dir(work, sta, v)
+    edits = sorted(out_.glob(f"{sta}_[0-9][0-9][0-9][0-9]_subdaily_edit.txt"))
+    kept = _mjd_rows(out_.glob("*_subdaily_edit.txt.withrhdot"))
+    if not edits or not kept:
+        return float("nan"), f"no part-1 edit or .withrhdot file in {out_}"
+    knots = subdaily_option(settings, "-knots") or cfg.get("subdaily_knots") or DEFAULT_KNOTS
+    try:
+        got = first_spline(edits, int(knots),
+                           _subdaily_bool(subdaily_option(settings, "-apply_rhdot", "True")))
+    except ImportError:
+        return float("nan"), "scipy is not installed (activate gnssrefl_venv)"
+    except Exception as exc:              # a spline gnssrefl itself could fit; say why not
+        return float("nan"), f"could not rebuild gnssrefl's first spline: {exc}"
+    if got is None:
+        return float("nan"), "no arcs in the part-1 edit files"
+    arcs, corrected, residual = got
+    index = {_arc_key(c): i for i, c in enumerate(arcs)}
+    pairs = [(index[_arc_key(c)], c[22]) for c in kept if len(c) > 22 and _arc_key(c) in index]
+    if len(pairs) < len(kept):
+        return float("nan"), (f"{len(kept) - len(pairs)} of the {len(kept)} arcs of the "
+                              f".withrhdot file are not in the part-1 edit files")
+    diff = max(abs(corrected[i] - x) for i, x in pairs)
+    if not diff <= FIRST_SPLINE_TOL_M:
+        return float("nan"), (f"the rebuilt first spline does not reproduce gnssrefl's RHdot "
+                              f"correction (max |difference| {diff:.3f} m over {len(pairs)} arcs)")
+    t0, t1 = (e / 86400.0 + MJD_UNIX for e in window_epochs(w))
+    inw = (arcs[:, at.MJD_COL] >= t0) & (arcs[:, at.MJD_COL] < t1)
+    return robust_scale(residual[inw]), (f"gnssrefl's first spline rebuilt: RHdot-corrected RH "
+                                         f"within {diff * 1000:.1f} mm of the .withrhdot file "
+                                         f"for all {len(pairs)} arcs")
 
 
 # ----------------------------------------------------------------
@@ -587,7 +830,8 @@ def print_report(results, variants, windows, calm_why, waves, ref_name, fit, spa
     if repro is not None:
         print(f"  baseline against the production record in the windows: max |difference| "
               f"{repro:.3f} m" + ("" if repro < 0.01 else
-                                 "  (not the nightly fit: other span or settings)"))
+                                 "  (not the nightly fit: other settings or results since, "
+                                 "or windows from different fits)"))
     print()
     for v in variants:
         print(f"  {v.name:<16} {v.about}")
@@ -659,23 +903,26 @@ def print_recommendation(results, variants, best, reasons) -> None:
 # Main
 # ----------------------------------------------------------------
 
-def build_variants(names, base_scatter, outliers, amp, amp_half=None) -> list:
-    """The variants asked for, in VARIANT_NAMES order (baseline always)."""
-    if outliers is None and math.isfinite(base_scatter) and base_scatter > 0:
-        x = round(OUTLIER_SIGMAS * base_scatter, 2)
-        outliers = (x, x)
+def build_variants(names, scatter, outliers, amp, amp_half=None) -> list:
+    """The variants asked for, in VARIANT_NAMES order (baseline always).
+    scatter = (first clip, second clip) robust scales of the baseline's
+    calm week (THE TWO CLIPS); abs_outliers' limits are OUTLIER_SIGMAS x
+    each, unless --outliers gives them."""
+    s1, s2 = scatter
+    derived = outliers is None
+    if derived and all(math.isfinite(x) and x > 0 for x in (s1, s2)):
+        outliers = (round(OUTLIER_SIGMAS * s1, 2), round(OUTLIER_SIGMAS * s2, 2))
     every = {"baseline": Variant("baseline", "the production json as it is"),
              "alt_sigma": Variant("alt_sigma", "part-1 clip with the median/MAD sigma "
                                   "(-alt_sigma)", alt_sigma=True),
-             "review_outliers": Variant("review_outliers",
-                                        "spline clips at %.2f / %.2f m (code review)" % REVIEW_OUTLIERS,
-                                        outlier1=REVIEW_OUTLIERS[0], outlier2=REVIEW_OUTLIERS[1])}
+             "fixed_outliers": Variant("fixed_outliers",
+                                       "spline clips at fixed %.2f / %.2f m" % FIXED_OUTLIERS,
+                                       outlier1=FIXED_OUTLIERS[0], outlier2=FIXED_OUTLIERS[1])}
     if outliers is not None:
         every["abs_outliers"] = Variant(
             "abs_outliers", f"spline clips at {outliers[0]:.2f} / {outliers[1]:.2f} m "
-            f"({OUTLIER_SIGMAS:g} x the calm arc scatter {base_scatter:.3f} m)"
-            if math.isfinite(base_scatter) else
-            f"spline clips at {outliers[0]:.2f} / {outliers[1]:.2f} m",
+            f"({OUTLIER_SIGMAS:g} x the calm scale each clip tests, {s1:.3f} / {s2:.3f} m)"
+            if derived else f"spline clips at {outliers[0]:.2f} / {outliers[1]:.2f} m (given)",
             outlier1=outliers[0], outlier2=outliers[1])
     if amp:
         every["amp_by_freq"] = Variant("amp_by_freq", "per-frequency amplitude thresholds "
@@ -688,6 +935,34 @@ def build_variants(names, base_scatter, outliers, amp, amp_half=None) -> list:
                                     alt_sigma=True, outlier1=outliers[0], outlier2=outliers[1],
                                     amp=amp)
     return [every[n] for n in VARIANT_NAMES if n in every and (n == "baseline" or n in names)]
+
+
+def read_amp_json(path) -> dict:
+    """{frequency: threshold} of an amplitude_thresholds.py --json file
+    (its "thresholds"), or of a file holding the station.json entry or the
+    bare mapping. {} when no frequency had enough arcs for its own value.
+    ValueError for anything else."""
+    try:
+        got = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from None
+    key = "gnssrefl_amplitude_min_by_frequency"
+    if isinstance(got, dict) and "thresholds" in got:
+        got = got["thresholds"]
+    elif isinstance(got, dict) and isinstance(got.get("station_json"), dict) \
+            and key in got["station_json"]:
+        got = got["station_json"][key]
+    elif isinstance(got, dict) and key in got:
+        got = got[key]
+    if not isinstance(got, dict):
+        raise ValueError(f"{path} holds no frequency -> amplitude mapping")
+    try:
+        out = {int(k): float(v) for k, v in got.items()}
+    except (TypeError, ValueError):
+        raise ValueError(f"{path}: {got!r} is not a frequency -> amplitude mapping") from None
+    if any(not v > 0 for v in out.values()):
+        raise ValueError(f"{path}: every amplitude must be positive ({got!r})")
+    return out
 
 
 def _jsonable(x):
@@ -740,6 +1015,13 @@ def main() -> int:
     unknown = names - set(VARIANT_NAMES)
     if unknown:
         p.error(f"unknown variant(s) {sorted(unknown)}; choose from {', '.join(VARIANT_NAMES)}")
+    amp_given = None
+    if a.amp_json and names & {"amp_by_freq", "combined"}:
+        try:                              # before any fit: a bad file must not cost a run
+            amp_given = read_amp_json(a.amp_json)
+        except ValueError as exc:
+            print(f"  ERROR: --amp-json: {exc}")
+            return 1
     if shutil.which("subdaily") is None:
         print("  ERROR: gnssrefl's subdaily is not on PATH (source gnssrefl_venv/bin/activate first)")
         return 1
@@ -781,7 +1063,18 @@ def main() -> int:
     # span would reach back to the start of the record.
     plan = (gr.make_plan(refl_code, sta, variant_settings(settings, baseline, cfg), since)
             if a.span == "production" else None)
-    span = eval_span(a.span, plan, windows, days[-1])
+    fits = {}
+    if plan is not None:
+        for label, w in (("calm", calm), ("storm", storm)):
+            fit_w, source = record_fit(refl_code, sta, plan, w)
+            fits[label] = fit_w
+            print(f"  {label} window {w[0]}..{w[1]}: written by the fit of {fit_w[0]}..{fit_w[1]} "
+                  f"({source})")
+        if len(set(fits.values())) > 1:
+            print("  NOTE: the calm week and the storm were written by different nightly fits; one "
+                  "run over both cannot reproduce both -- expect cm-level differences from the "
+                  "record (give --calm in the storm's year to avoid it)")
+    span = eval_span(a.span, plan, windows, days[-1], list(fits.values()))
     span_days = [d for d in days if span[0] <= d <= span[1]]
     try:
         gr.subdaily_range(span_days)
@@ -805,27 +1098,40 @@ def main() -> int:
     if not run(baseline):
         print(f"  ERROR: the baseline fit failed -- see {logs['baseline']}")
         return 1
-    scatter = arc_scatter(work, sta, baseline, calm)
+    # what each spline clip tests, in the baseline's calm week (THE TWO CLIPS)
+    scatter1, first_check = first_clip_scatter(work, sta, baseline, calm, variant_settings(
+        settings, baseline, cfg), cfg)
+    scatter2 = arc_scatter(work, sta, baseline, calm)
+    print("  calm scale the first clip tests: "
+          + (f"{scatter1:.3f} m ({first_check})" if math.isfinite(scatter1)
+             else f"not derived -- {first_check}"))
+    print(f"  calm scale the second clip tests: {_f(scatter2, 5).strip()} m")
     amp = amp_half = None
+    no_amp = "no frequency has enough arcs in the calm week for its own amplitude threshold"
     if names & {"amp_by_freq", "amp_half", "combined"}:
         calm_days = [d for d in days if calm[0] <= d <= calm[1]]
         amps = at.amplitudes(refl_code, sta, calm_days, cfg, azim)
         current = at.current_thresholds(cfg)
-        if a.amp_json:
-            got = json.loads(Path(a.amp_json).read_text())
-            got = got.get("thresholds") or got.get("station_json", {}).get(
-                "gnssrefl_amplitude_min_by_frequency") or got
-            amp = {int(k): float(v) for k, v in got.items()}
+        if amp_given is not None:
+            amp = amp_given
+            if not amp:
+                no_amp = (f"{a.amp_json} lists no threshold: no frequency had enough arcs in "
+                          f"its window for its own amplitude threshold")
         else:
             amp = at.derive(amps, current, a.fraction)["thresholds"]
         amp_half = at.derive(amps, current, AMP_HALF)["thresholds"]
-    variants = build_variants(names, scatter, tuple(a.outliers) if a.outliers else None, amp,
-                              amp_half)
+    variants = build_variants(names, (scatter1, scatter2),
+                              tuple(a.outliers) if a.outliers else None, amp, amp_half)
     for n in sorted(names - {v.name for v in variants}, key=VARIANT_NAMES.index):
-        no_amp = n.startswith("amp") or (n == "combined" and not amp)
-        print(f"  NOTE: {n} not run -- " + (
-            "no frequency has enough arcs in the calm week for its own amplitude threshold"
-            if no_amp else "no calm arc scatter to set the outlier limits from (give --outliers)"))
+        if n == "amp_half":
+            why = "no frequency has enough arcs in the calm week for its own amplitude threshold"
+        elif n == "amp_by_freq" or (n == "combined" and not amp):
+            why = no_amp
+        else:
+            why = ("no calm scale to set the outlier limits from (give --outliers): "
+                   + (first_check if not math.isfinite(scatter1) else
+                      "no final arcs about the spline in the calm week"))
+        print(f"  NOTE: {n} not run -- {why}")
     for v in variants[1:]:
         run(v)
 
@@ -881,7 +1187,10 @@ def main() -> int:
     summary = {"station": sta, "settings": settings, "span": [str(span[0]), str(span[1])],
                "calm": [str(calm[0]), str(calm[1])], "calm_choice": calm_why,
                "storm": [str(storm[0]), str(storm[1])], "reference": ref_name,
-               "reference_fit": list(fit), "calm_arc_scatter_m": scatter,
+               "reference_fit": list(fit),
+               "calm_scale_m": {"first_clip": scatter1, "second_clip": scatter2},
+               "first_spline_check": first_check,
+               "record_fits": {k: [str(f[0]), str(f[1])] for k, f in fits.items()},
                "baseline_vs_record_max_m": repro, "variants": results,
                "recommended": best, "reasons": reasons,
                "rule": {"calm_rmse_tol_m": CALM_RMSE_TOL_M, "calm_arcs_keep": CALM_ARCS_KEEP,

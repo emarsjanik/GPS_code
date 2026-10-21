@@ -1,12 +1,12 @@
 """
 test_arc_qc.py
 
-Opt-in arc-level QC (known finding G-B9): per-frequency amplitude
-thresholds (analysis_tools/amplitude_thresholds.py) and the scoring of
-QC variants against the Chatham gauge before any is switched on
+Opt-in arc-level QC: per-frequency amplitude thresholds
+(analysis_tools/amplitude_thresholds.py) and the scoring of QC variants
+against the Chatham gauge before any is switched on
 (analysis_tools/evaluate_qc_variants.py).
 
-Three parts:
+Four parts:
   * AmplitudeThresholdTests -- which failQC arcs failed on amplitude
     alone, select_day() raising and lowering thresholds exactly as gnssir
     would, and the median rule.
@@ -14,8 +14,13 @@ Three parts:
     a whole run on a synthetic station with a stand-in `subdaily` on PATH
     (it averages the staged arcs into a 30-minute "spline"), so staging,
     fitting, scoring and the recommendation run for real without gnssrefl.
-  * RealSubdailyEvaluateTests -- a whole run with gnssrefl's real
-    subdaily; skipped when gnssrefl is not installed.
+  * FirstSplineTests -- gnssrefl's first spline rebuilt (flipit3, the
+    RHdot correction, the residual the first clip tests) and the check
+    against the .withrhdot file; the rebuild needs scipy.
+  * RealSubdailyEvaluateTests -- whole runs with gnssrefl's real
+    subdaily: the rebuilt first spline, abs_outliers on a storm-free
+    span, and the baseline reproducing the record in a frozen year and
+    on the day after a freeze; skipped when gnssrefl is not installed.
 
 Run with:
     python3 -m unittest discover -s tests -p "test_arc_qc.py" -v
@@ -40,6 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
+HAVE_SCIPY = importlib.util.find_spec("scipy") is not None
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "analysis_tools"))
 import amplitude_thresholds as at  # noqa: E402
@@ -75,8 +81,9 @@ def build_station(refl: Path, first: date, last: date, storm, seed: int = 3, rhd
     """Results and failQC files, the gnssir json and the gauge and wave
     caches of a synthetic station. In the storm every arc's amplitude is
     damped by u in 0.25..1 and, around high water, the arcs damped below
-    half read 6 m high -- what a rough sea does (see G-B9), made plain
-    enough to stand out above the wave-setup allowance."""
+    half read 6 m high -- what a rough sea does (the arcs that survive it
+    are the biased ones), made plain enough to stand out above the
+    wave-setup allowance."""
     rng = np.random.default_rng(seed)
     s0, s1 = (storm[0] - MJD0).days, (storm[1] - MJD0).days + 1
     d = first
@@ -131,7 +138,11 @@ def build_station(refl: Path, first: date, last: date, storm, seed: int = 3, rhd
 # the .withrhdot and .withrhdotIF files and <sta>_spline_out.txt -- the
 # level every 30 minutes being the mean of the arcs within 45 minutes,
 # after dropping any arc more than -spline_outlier1 m from the median of
-# those within an hour. -alt_sigma changes nothing here.
+# those within an hour. -alt_sigma changes nothing here. The .withrhdot
+# file carries the RHdot-corrected RH of gnssrefl's first spline, rebuilt
+# with the evaluator's first_spline (checked against the real subdaily in
+# RealSubdailyEvaluateTests), so the evaluator's check of it passes;
+# without scipy, the raw RH.
 FAKE_SUBDAILY = r'''#!/usr/bin/env python3
 import glob, os, sys
 from datetime import date, datetime, timedelta
@@ -170,7 +181,17 @@ def put(path, sel, extra):
             f.write(" ".join(f"{x:.6f}" for x in c + [0.0] * 5 + extra(c)) + "\n")
 for y in sorted({int(c[0]) for c in rows}):
     put(f"{out}/{sta}_{y}_subdaily_edit.txt", [int(c[0]) == y for c in rows], lambda c: [])
-put(f"{out}/{sta}_{y1}_subdaily_edit.txt.withrhdot", keep, lambda c: [c[2], 0.0])
+corrected, key = {}, lambda c: None
+try:
+    sys.path.insert(0, os.environ["FAKE_SUBDAILY_TOOLS"])
+    import evaluate_qc_variants as ev
+    got = ev.first_spline(sorted(glob.glob(f"{out}/{sta}_[0-9][0-9][0-9][0-9]_subdaily_edit.txt")),
+                          int(opt.get("-knots", 8)))
+    corrected, key = {ev._arc_key(c): x for c, x in zip(got[0], got[1])}, ev._arc_key
+except ImportError:
+    pass
+put(f"{out}/{sta}_{y1}_subdaily_edit.txt.withrhdot", keep,
+    lambda c: [corrected.get(key(c), c[2]), c[2] - corrected.get(key(c), c[2])])
 put(f"{out}/{sta}_{y1}_subdaily_edit.txt.withrhdotIF", keep, lambda c: [c[2], 0.0, c[2]])
 with open(f"{out}/{sta}_spline_out.txt", "w") as f:
     f.write("% fake spline\n%  orthometric height minus RH, where Hortho (m) is     19.000\n")
@@ -276,12 +297,14 @@ class EvaluateTests(unittest.TestCase):
         self.work = self.tmp / "work"
         bindir = self.tmp / "bin"
         bindir.mkdir()
-        (bindir / "subdaily").write_text(FAKE_SUBDAILY)
+        # this interpreter, so the stand-in has the same numpy/scipy as the test
+        (bindir / "subdaily").write_text(f"#!{sys.executable}\n" + FAKE_SUBDAILY.split("\n", 1)[1])
         (bindir / "subdaily").chmod(0o755)
         self.calls = self.tmp / "subdaily_calls.txt"
         self.env = unittest.mock.patch.dict(os.environ, {
             "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
-            "FAKE_SUBDAILY_LOG": str(self.calls)})
+            "FAKE_SUBDAILY_LOG": str(self.calls),
+            "FAKE_SUBDAILY_TOOLS": str(ROOT / "analysis_tools")})
         self.env.start()
         # no network in tests: the gauge and buoy come from the caches
         self.net = unittest.mock.patch.object(wq.urllib.request, "urlopen",
@@ -394,6 +417,126 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(w, (date(2026, 9, 15), date(2026, 9, 21)))
         self.assertIn("check they were calm", why)
 
+    def test_wave_setup_explains_a_reading_only_up_to_the_allowance(self):
+        storm = (date(2026, 9, 25), date(2026, 9, 25))
+        ep = ev.epoch(storm[0]) + 1800.0 * np.arange(48)
+        grid = np.arange(ep[0] - 7200, ep[-1] + 7200, 360.0)
+        ref = (grid, np.zeros(len(grid)))
+        t = np.arange(ep[0] - 7200, ep[-1] + 7200, 3600.0)
+        waves = (t, np.full(len(t), 3.0), np.full(len(t), 10.0))
+        setup = wq.setup_allowance(ep, waves)
+        self.assertTrue(np.all(setup > 0.1), setup)
+        lv = np.where(np.arange(48) < 24, 0.5 * setup, setup + 0.2)    # half within, half not
+        s = ev.score_window(ep, lv, ref, (1.0, 0.0, 0.0, 0.03), waves, storm)
+        self.assertAlmostEqual(s["beyond_setup_rms"], math.sqrt(0.5 * 0.2 ** 2), places=6)
+        self.assertGreater(s["rmse"], s["beyond_setup_rms"])
+        s = ev.score_window(ep, -lv, ref, (1.0, 0.0, 0.0, 0.03), waves, storm)
+        self.assertAlmostEqual(s["beyond_setup_rms"], s["rmse"], msg="setup never lowers a level")
+
+    def test_the_reference_carries_its_lag_and_high_water_has_its_own_bias(self):
+        w = (date(2026, 9, 10), date(2026, 9, 16))
+        ep = ev.epoch(w[0]) + 1800.0 * np.arange(7 * 48)
+        grid = np.arange(ep[0] - 86400, ep[-1] + 86400, 360.0)
+        ref = (grid, truth(grid / 86400 + ev.MJD_UNIX))
+        lv = truth((ep - 1800.0) / 86400 + ev.MJD_UNIX)                # 30 minutes behind
+        fit = wq.fit_reference(ep, lv, ref[0], ref[1], np.ones(len(ep), bool))
+        self.assertAlmostEqual(fit[1], 1800.0, delta=360.0)
+        s = ev.score_window(ep, lv, ref, fit, None, w)
+        self.assertLess(s["rmse"], 0.02, "the lag is applied to the reference")
+        unlagged = ev.score_window(ep, lv, ref, (fit[0], 0.0, fit[2], fit[3]), None, w)
+        self.assertGreater(unlagged["rmse"], 5 * s["rmse"])
+        pred = wq.reference_at(ref[0], ref[1], ep)             # as score_window reads it
+        high = pred >= np.percentile(pred, 75)
+        s = ev.score_window(ep, pred + np.where(high, 0.2, 0.0), ref, (1.0, 0.0, 0.0, 0.03),
+                            None, w)
+        self.assertAlmostEqual(s["high_water_bias"], 0.2, places=6)
+        self.assertAlmostEqual(s["bias"], 0.2 * high.mean(), places=6)
+
+    def test_second_clip_scale_is_of_the_corrected_rh_about_the_spline(self):
+        v = ev.Variant("baseline", "")
+        out = ev.out_dir(self.work, STA, v)
+        out.mkdir(parents=True)
+        w = (date(2026, 9, 10), date(2026, 9, 10))
+        m0 = (w[0] - MJD0).days
+        with open(out / f"{STA}_spline_out.txt", "w") as f:
+            f.write("% spline\n")
+            for t in m0 - 0.5 + np.arange(96) / 48:
+                f.write(f"{t:15.7f} {19.0:11.3f} 2026 9 10 0 0 0 {0.0:10.3f}\n")
+        rng = np.random.default_rng(1)
+        r = rng.normal(0, 0.05, 200)
+        with open(out / f"{STA}_2026_subdaily_edit.txt.withrhdotIF", "w") as f:
+            for i, t in enumerate(m0 + np.linspace(0.01, 0.99, 200)):
+                c = at.parse(line(t, rh=25.0))                  # raw RH: far off
+                f.write(" ".join(f"{x:.6f}" for x in c + [0.0] * 5 + [25.0, 0.0, 19.0 + r[i]]) + "\n")
+        got = ev.arc_scatter(self.work, STA, v, w)
+        self.assertAlmostEqual(got, 1.4826 * np.median(np.abs(r)), places=3)
+
+    def test_amp_json_with_no_thresholds_is_a_note_not_a_crash(self):
+        empty, entry, bare, bad = (self.tmp / n for n in ("e.json", "s.json", "b.json", "x.json"))
+        empty.write_text(json.dumps({"fraction": 0.5, "thresholds": {}, "station_json": {
+            "gnssrefl_amplitude_min_by_frequency": {}}, "window": ["2026-09-08", "2026-09-14"]}))
+        entry.write_text(json.dumps({"gnssrefl_amplitude_min_by_frequency": {"20": 4.5}}))
+        bare.write_text(json.dumps({"1": 7, "20": "4.5"}))
+        bad.write_text(json.dumps({"fraction": 0.5}))
+        self.assertEqual(ev.read_amp_json(empty), {})
+        self.assertEqual(ev.read_amp_json(entry), {20: 4.5})
+        self.assertEqual(ev.read_amp_json(bare), {1: 7.0, 20: 4.5})
+        with self.assertRaises(ValueError):
+            ev.read_amp_json(bad)
+        build_station(self.refl, date(2026, 9, 2), date(2026, 10, 1),
+                      (date(2026, 9, 25), date(2026, 9, 27)))
+        rc, out = self.run_main("--span", "windows", "--variants", "amp_by_freq,amp_half",
+                                "--amp-json", str(empty))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("NOTE: amp_by_freq not run", out)
+        self.assertIn("lists no threshold", out)
+        self.assertIn("amp_half", json.loads((self.work / "qc_eval_summary.json").read_text())
+                      ["variants"])
+        # a file it cannot use stops it before the first (minutes-long) fit
+        self.calls.unlink()
+        rc, out = self.run_main("--span", "windows", "--amp-json", str(bad))
+        self.assertEqual(rc, 1)
+        self.assertIn("--amp-json", out)
+        self.assertFalse(self.calls.exists(), "no subdaily run")
+
+    def test_production_span_is_the_fit_that_wrote_the_windows(self):
+        files = self.refl / "Files" / STA
+        (files / gr.FIT_SUBDIR).mkdir(parents=True)
+        days = {date(2025, 12, 1) + timedelta(days=k): None for k in range(60)}
+        plan = gr.Plan(days, max(days), [2025], 2026, date(2025, 12, 25), max(days))
+        head = ["% gnssrefl spline\n"]
+        rows = [f"{(date(2025, 12, 10) - MJD0).days:15.7f} 19.0\n"]
+        gr.write_atomic(gr.frozen_path(files, STA, 2025), gr.frozen_text(
+            head, SETTINGS, "fp", rows, "2025 frozen 2026-01-15 03:00 UTC from the fit of "
+                                        "2025-12-01..2026-01-15"))
+        calm, storm = (date(2025, 12, 10), date(2025, 12, 16)), (date(2026, 1, 5), date(2026, 1, 7))
+        self.assertEqual(ev.record_fit(self.refl, STA, plan, calm)[0],
+                         (date(2025, 12, 1), date(2026, 1, 15)), "from the frozen header")
+        self.assertEqual(ev.record_fit(self.refl, STA, plan, storm),
+                         ((plan.start, plan.end), "the span tonight's fit would cover"))
+        status = files / gr.FIT_SUBDIR / gr.STATUS_NAME
+        status.write_text(json.dumps({"ok": True, "fallback": False, "fit_start": "2025-12-01",
+                                      "fit_end": "2026-01-20"}))
+        self.assertEqual(ev.record_fit(self.refl, STA, plan, storm)[0],
+                         (date(2025, 12, 1), date(2026, 1, 20)),
+                         "the day after a freeze: the fit that wrote the record, not tonight's")
+        status.write_text(json.dumps({"ok": True, "fallback": True, "fit_start": "2025-12-01",
+                                      "fit_end": "2026-01-20"}))
+        self.assertEqual(ev.record_fit(self.refl, STA, plan, storm)[0], (plan.start, plan.end))
+        gr.write_atomic(gr.frozen_path(files, STA, 2025), gr.frozen_text(
+            head, SETTINGS, "fp", rows, "2025 frozen 2026-01-15 03:00 UTC from a fit of 2025 by "
+                                        "itself with '-rhdot True' (3 arc(s) in the azimuth window)"))
+        self.assertEqual(ev.record_fit(self.refl, STA, plan, calm)[0],
+                         (date(2025, 12, 1), date(2025, 12, 31)))
+        fits = [(date(2025, 12, 1), date(2026, 1, 15)), (date(2025, 12, 1), date(2026, 1, 20))]
+        self.assertEqual(ev.eval_span("production", plan, (calm, storm), max(days), fits),
+                         (date(2025, 12, 1), date(2026, 1, 20)))
+        late = (date(2026, 1, 25), date(2026, 1, 27))
+        self.assertEqual(ev.eval_span("production", plan, (calm, late), max(days), fits[:1]),
+                         (date(2025, 12, 1), date(2026, 1, 27)), "widened to the windows")
+        self.assertEqual(ev.eval_span("windows", None, (calm, storm), max(days)),
+                         (date(2025, 12, 7), date(2026, 1, 10)))
+
     # ---- a whole run ----------------------------------------------------
 
     def run_main(self, *args):
@@ -414,8 +557,18 @@ class EvaluateTests(unittest.TestCase):
         rc, out = self.run_main("--span", "windows")
         self.assertEqual(rc, 0, out)
         summary = json.loads((self.work / "qc_eval_summary.json").read_text())
-        names = [n for n in ev.VARIANT_NAMES]
+        names = [n for n in ev.VARIANT_NAMES
+                 if HAVE_SCIPY or n not in ("abs_outliers", "combined")]
         self.assertEqual(sorted(summary["variants"]), sorted(names))
+        if HAVE_SCIPY:
+            self.assertIn("first spline rebuilt", summary["first_spline_check"])
+            s1, s2 = summary["calm_scale_m"]["first_clip"], summary["calm_scale_m"]["second_clip"]
+            self.assertEqual(summary["variants"]["abs_outliers"]["station_json"],
+                             {"gnssrefl_subdaily_spline_outlier1_m": round(3 * s1, 2),
+                              "gnssrefl_subdaily_spline_outlier2_m": round(3 * s2, 2)})
+        else:
+            self.assertIn("NOTE: abs_outliers not run", out)
+            self.assertIn("scipy is not installed", out)
         self.assertTrue(all(v["ok"] for v in summary["variants"].values()), out)
         self.assertEqual(summary["storm"], ["2026-09-25", "2026-09-27"])
         cal = summary["calm"]
@@ -482,6 +635,114 @@ class EvaluateTests(unittest.TestCase):
         self.assertIn("subdaily is not on PATH", out)
 
 
+def write_edit_file(path: Path, mjds, rh, edotf, sat=None, freq=None) -> None:
+    """A part-1 edit file as subdaily writes it (22 columns)."""
+    with open(path, "w") as f:
+        f.write("% edit file\n")
+        for i, m in enumerate(mjds):
+            d = MJD0 + timedelta(days=int(m))
+            c = [d.year, d.timetuple().tm_yday, rh[i], 1 + i % 32 if sat is None else sat[i],
+                 (m % 1) * 24, 80.0, 10.0, 5.05, 14.95, 200, 1 if freq is None else freq[i], 1,
+                 edotf[i], 4.0, 30.0, m, 1, d.month, d.day, 0, 0, 0]
+            f.write(" ".join(f"{x:.6f}" for x in c) + "\n")
+
+
+class FirstSplineTests(unittest.TestCase):
+    """gnssrefl's first spline, rebuilt (evaluate_qc_variants.first_spline):
+    the residual the first spline clip tests."""
+
+    def test_flipit3_mirrors_the_ends_and_bridges_gaps(self):
+        t = np.array([10.0, 10.1, 10.2, 11.2, 11.3, 11.4])        # a 24-hour gap after 10.2
+        y = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        tn, yn = ev.flipit3(t, y)
+        self.assertTrue(np.all(np.diff(tn) >= 0))
+        # the first day mirrored before t0 (at 2 t0 - t; the earliest, 9.8, is
+        # not kept), then the series itself from t0
+        np.testing.assert_allclose(tn[:5], [9.9, 10.0, 10.0, 10.1, 10.2])
+        np.testing.assert_allclose(yn[:5], [2.0, 1.0, 1.0, 2.0, 3.0])
+        # the last day after the end at t + 1, in reverse order (6 5 4 at
+        # 12.2 12.3 12.4; 12.2 ends a gap, so only the bridge reaches it)
+        np.testing.assert_allclose(tn[-2:], [12.3, 12.4])
+        np.testing.assert_allclose(yn[-2:], [5.0, 4.0])
+        # the gap 10.2..11.2 bridged hourly on the straight line; 11.2 itself
+        # (the point that ends the gap) not kept
+        bridge = (tn > 10.2 + 1e-9) & (tn < 11.3 - 1e-9)
+        self.assertGreaterEqual(int(bridge.sum()), 23)
+        np.testing.assert_allclose(yn[bridge], 3.0 + (tn[bridge] - 10.2), atol=1e-9)
+        self.assertFalse(np.any(np.isclose(tn, 11.2, atol=1e-6) & np.isclose(yn, 4.0)
+                                & ~bridge))
+        if importlib.util.find_spec("gnssrefl") is not None:
+            from gnssrefl.sd_libs import flipit3
+            tvd = np.zeros((len(t), 17))
+            tvd[:, 15], tvd[:, 2] = t, y
+            with contextlib.redirect_stdout(io.StringIO()):
+                gt, gy = flipit3(tvd, 3)
+            np.testing.assert_array_equal(tn, gt)
+            np.testing.assert_array_equal(yn, gy)
+
+    @unittest.skipUnless(HAVE_SCIPY, "scipy not installed")
+    def test_first_clip_scale_and_the_check_against_withrhdot(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        work = tmp / "work"
+        v = ev.Variant("baseline", "")
+        out = ev.out_dir(work, STA, v)
+        out.mkdir(parents=True)
+        rng = np.random.default_rng(5)
+        m = np.sort(61290 + rng.uniform(0, 30, 30 * 96))
+        noise = rng.normal(0, 0.05, len(m))
+        edotf = rng.choice([-1, 1], len(m)) * rng.uniform(0.5, 0.9, len(m))
+        drh = -(truth(m + 1e-4) - truth(m - 1e-4)) / 2e-4 / 24      # RH rate, m per hour
+        rh = H - truth(m) + noise + edotf * drh                    # what an arc reads
+        sat, freq = rng.integers(1, 33, len(m)), rng.choice([1, 20], len(m))
+        write_edit_file(out / f"{STA}_2026_subdaily_edit.txt", m, rh, edotf, sat, freq)
+        arcs, corrected, residual = ev.first_spline([out / f"{STA}_2026_subdaily_edit.txt"], 8)
+        self.assertEqual(len(arcs), len(m))
+        # the RHdot correction takes out most of what the rising/setting
+        # geometry put in (0.24 m typical here) ...
+        level = H - truth(arcs[:, 15])
+        self.assertLess(ev.robust_scale(corrected - level), 1.3 * ev.robust_scale(noise))
+        self.assertGreater(ev.robust_scale(arcs[:, 2] - level), 3 * ev.robust_scale(noise))
+        # ... but the first clip's residual is about a spline fitted to the
+        # UNCORRECTED RH, so it is wider than the arcs' own noise
+        w = (date(2026, 9, 10), date(2026, 9, 16))                 # MJD 61293..61299
+        sel = (m >= 61293) & (m < 61300)
+        self.assertGreater(ev.robust_scale(residual[sel]), 1.2 * ev.robust_scale(noise[sel]))
+        self.assertLess(ev.robust_scale(residual[sel]), 2.5 * ev.robust_scale(noise[sel]))
+
+        def withrhdot(shift):
+            with open(out / f"{STA}_2026_subdaily_edit.txt.withrhdot", "w") as f:
+                f.write("% kept arcs\n")
+                for c, x in zip(arcs, corrected):
+                    x = round(x, 3) + shift
+                    f.write(" ".join(f"{y:.6f}" for y in list(c) + [x, c[2] - x]) + "\n")
+
+        withrhdot(0.0)
+        scale, why = ev.first_clip_scatter(work, STA, v, w, SETTINGS, {})
+        self.assertAlmostEqual(scale, ev.robust_scale(residual[sel]))
+        self.assertIn("first spline rebuilt", why)
+        withrhdot(0.01)                   # a gnssrefl that corrects otherwise
+        scale, why = ev.first_clip_scatter(work, STA, v, w, SETTINGS, {})
+        self.assertTrue(math.isnan(scale))
+        self.assertIn("does not reproduce", why)
+        scale, why = ev.first_clip_scatter(work, STA, v, w, "-rhdot False -knots 8", {})
+        self.assertTrue(math.isnan(scale))
+        self.assertIn("-rhdot False", why)
+
+    def test_abs_outliers_take_each_limit_from_its_own_clip(self):
+        vs = ev.build_variants({"abs_outliers"}, (0.123, 0.087), None, None)
+        self.assertEqual([v.name for v in vs], ["baseline", "abs_outliers"])
+        self.assertEqual((vs[1].outlier1, vs[1].outlier2), (0.37, 0.26))
+        self.assertEqual([v.name for v in ev.build_variants({"abs_outliers"},
+                                                            (float("nan"), 0.087), None, None)],
+                         ["baseline"], "no first-clip scale: not derived")
+        given = ev.build_variants({"abs_outliers"}, (float("nan"), 0.087), (0.5, 0.4), None)
+        self.assertEqual((given[1].outlier1, given[1].outlier2), (0.5, 0.4))
+        fixed = ev.build_variants({"fixed_outliers"}, (0.1, 0.1), None, None)[1]
+        self.assertEqual((fixed.outlier1, fixed.outlier2), ev.FIXED_OUTLIERS)
+        self.assertNotIn("review", fixed.about)
+
+
 def _gnssrefl_installed() -> bool:
     return shutil.which("subdaily") is not None and importlib.util.find_spec("gnssrefl") is not None
 
@@ -489,10 +750,11 @@ def _gnssrefl_installed() -> bool:
 @unittest.skipUnless(_gnssrefl_installed(), "gnssrefl (subdaily) not installed")
 class RealSubdailyEvaluateTests(unittest.TestCase):
     """The nightly fit, then the evaluation, with gnssrefl's real subdaily:
-    the baseline reproduces the production record, and every variant's
-    options reach subdaily."""
+    the baseline reproduces the production record, every variant's
+    options reach subdaily, and the rebuilt first spline is gnssrefl's."""
 
-    def test_real_subdaily(self):
+    def station(self, first, last, storm):
+        """A synthetic station (RHdot in its arcs) after one nightly update."""
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         refl = tmp / "refl_code"
@@ -507,22 +769,79 @@ class RealSubdailyEvaluateTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             make_gnssir_input(STA, lat=41.8915, lon=-69.9618, height=-17.0, Hortho=[H],
                               allfreq=True, e1=5, e2=15, h1=14, h2=24)
-        build_station(refl, date(2026, 9, 10), date(2026, 10, 1),
-                      (date(2026, 9, 25), date(2026, 9, 27)), rhdot=True, cfg={})
-        with contextlib.redirect_stdout(io.StringIO()):
+        build_station(refl, first, last, storm, rhdot=True, cfg={})
+        self.update(refl)
+        return tmp, refl
+
+    def update(self, refl):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                unittest.mock.patch.object(gr, "record_first_day", return_value=None):
             self.assertEqual(gr.cmd_update(refl, STA, SETTINGS, "-rhdot True -knots 8", False), 0)
+
+    def evaluate(self, tmp, refl, *args):
         argv = ["evaluate_qc_variants.py", "--refl-code", str(refl), "--station", STA,
-                "--work", str(tmp / "work"), "--variants", "alt_sigma,amp_half",
-                "--calm", "2026-09-14", "2026-09-20"]
+                "--work", str(tmp / "work"), *args]
         out = io.StringIO()
         with unittest.mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), \
                 unittest.mock.patch.object(gr, "record_first_day", return_value=None):
             self.assertEqual(ev.main(), 0, out.getvalue())
-        summary = json.loads((tmp / "work" / "qc_eval_summary.json").read_text())
-        self.assertLess(summary["baseline_vs_record_max_m"], 0.0005, out.getvalue())
-        self.assertTrue(all(v["ok"] for v in summary["variants"].values()), out.getvalue())
+        return json.loads((tmp / "work" / "qc_eval_summary.json").read_text()), out.getvalue()
+
+    def test_real_subdaily(self):
+        tmp, refl = self.station(date(2026, 9, 10), date(2026, 10, 1),
+                                 (date(2026, 9, 25), date(2026, 9, 27)))
+        summary, out = self.evaluate(tmp, refl, "--variants", "alt_sigma,amp_half",
+                                     "--calm", "2026-09-14", "2026-09-20")
+        self.assertLess(summary["baseline_vs_record_max_m"], 0.0005, out)
+        self.assertTrue(all(v["ok"] for v in summary["variants"].values()), out)
         log = (tmp / "work" / "Files" / STA / "eval" / "qc_alt_sigma" / "subdaily.log").read_text()
         self.assertTrue(log.splitlines()[0].endswith(" -alt_sigma True"))
+
+    def test_abs_outliers_first_clip_drops_what_the_baseline_does_without_a_storm(self):
+        # no storm in the span: the whole fit's 3 sigma IS the calm 3 sigma,
+        # so abs_outliers' first limit must drop about as many calm arcs
+        tmp, refl = self.station(date(2026, 8, 20), date(2026, 10, 10),
+                                 (date(2027, 9, 25), date(2027, 9, 27)))
+        summary, out = self.evaluate(tmp, refl, "--variants", "abs_outliers",
+                                     "--calm", "2026-09-07", "2026-09-13",
+                                     "--storm", "2026-09-25", "2026-09-27")
+        self.assertIn("first spline rebuilt", summary["first_spline_check"], out)
+        self.assertLess(summary["baseline_vs_record_max_m"], 0.0005, out)
+        log = (tmp / "work" / "Files" / STA / "eval" / "qc_baseline" / "subdaily.log").read_text()
+        whole = float(log.split("RMS w/ RHdot correction (m)")[1].split()[0])
+        self.assertAlmostEqual(summary["calm_scale_m"]["first_clip"], whole, delta=0.15 * whole,
+                               msg="the calm scale of what the first clip tests")
+        loss = {}
+        for name in ("baseline", "abs_outliers"):
+            arcs = summary["variants"][name]["arcs"]["calm"]
+            loss[name] = 1 - arcs["stage1"] / arcs["part1"]
+        self.assertLess(abs(loss["abs_outliers"] - loss["baseline"]), 0.01, (loss, out))
+        for k in ("calm", "storm"):
+            self.assertLess(abs(summary["variants"]["abs_outliers"][k]["rmse"]
+                                - summary["variants"]["baseline"][k]["rmse"]), 0.005, out)
+
+    def test_baseline_reproduces_the_record_in_a_frozen_year_and_after_a_freeze(self):
+        # the first update freezes 2025 (the fit runs to 20 Jan); the next
+        # night's fit would start 25 Dec, but the record was written by the
+        # fit from 1 Dec -- and 2025 in it stays that fit's for good
+        tmp, refl = self.station(date(2025, 12, 1), date(2026, 1, 20),
+                                 (date(2026, 1, 5), date(2026, 1, 7)))
+        self.assertTrue(gr.frozen_path(refl / "Files" / STA, STA, 2025).exists())
+        for calm, storm in ((("2025-12-10", "2025-12-16"), ("2025-12-20", "2025-12-22")),
+                            (("2026-01-11", "2026-01-17"), ("2026-01-05", "2026-01-07"))):
+            with self.subTest(calm=calm):
+                summary, out = self.evaluate(tmp, refl, "--variants", "baseline",
+                                             "--calm", *calm, "--storm", *storm)
+                self.assertEqual(summary["span"], ["2025-12-01", "2026-01-20"], out)
+                self.assertLess(summary["baseline_vs_record_max_m"], 0.0005, out)
+        # a night later the live part is the fit from 25 Dec; 2025 is still
+        # the frozen fit's
+        self.update(refl)
+        summary, out = self.evaluate(tmp, refl, "--variants", "baseline",
+                                     "--calm", "2026-01-11", "2026-01-17",
+                                     "--storm", "2026-01-05", "2026-01-07")
+        self.assertEqual(summary["span"], ["2025-12-25", "2026-01-20"], out)
+        self.assertLess(summary["baseline_vs_record_max_m"], 0.0005, out)
 
 
 if __name__ == "__main__":

@@ -321,7 +321,7 @@ class GnssRecordTests(unittest.TestCase):
         self.assert_whole_record(date(2026, 12, 1), date(2027, 1, 20))
         self.assertFalse(gr.frozen_path(self.files, STA, 2026).exists())
 
-    # ---- opt-in arc QC from the gnssir json (station.json, G-B9) --------
+    # ---- opt-in arc QC from the gnssir json (station.json) ------------
 
     def write_gnssir_json(self, **subdaily):
         """The station's gnssir json as gnssrefl writes it: subdaily_* null

@@ -26,8 +26,9 @@ signal the damped, doubtful arcs still pass. Purnell et al. (2020)
 find the moving sea surface dominates the error budget of the
 inverse method (noise dominates that of the spectral one gnssir
 uses), and Sepulveda et al. (2023) see errors rise abruptly at high
-waves at an exposed pier. Known finding G-B9: the arcs that survive a
-storm are the biased ones.
+waves at an exposed pier. In the 25-27 Sep 2026 storm the spline read
+up to ~3 m above what the Chatham gauge implied: the arcs that survive
+a storm are the biased ones.
 
 THE RULE
 
