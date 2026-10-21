@@ -19,10 +19,10 @@
 # WHY THIS IS SAFE FOR THIS PROJECT:
 # Nothing in this codebase reads existing files back out of rinex/.
 # rinex_processor.py only WRITES new .obs/.nav there; pipeline.py
-# just passes the directory through. recover_missing_days.sh
-# reprocesses old days from EXTERNAL storage using RINEX 3 long
-# filenames, not from rinex/ at all -- confirmed by direct review
-# before this script was written.
+# just passes the directory through. recover_missing_days.py
+# converts a missed day's raw file again into its own scratch
+# folder (or reads RINEX 3 long-named files from external storage),
+# never from rinex/.
 #
 # To unpack a day again by hand:
 #     tar -xzf rinex/station_20260725.tar.gz -C rinex/

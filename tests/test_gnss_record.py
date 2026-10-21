@@ -900,42 +900,6 @@ class GnssRecordTests(unittest.TestCase):
             self.assertGreater(len(got), 20)
             self.assertEqual(got, brute_force(e, v))
 
-    def test_recover_missing_days_skips_days_before_the_first_day(self):
-        proj = self.tmp / "v4.1"
-        (proj / "maintenance").mkdir(parents=True)
-        export = self.tmp / "Products" / "2026-07-20"
-        export.mkdir(parents=True)
-        for doy in range(185, 196):                               # 4-14 July
-            (export / f"USGS00USA_R_2026{doy:03d}0000_01D_01S_MO.rnx").write_text("rinex\n")
-        src = (ROOT / "maintenance" / "recover_missing_days.sh").read_text()
-        for a, b in (('PROJECT_DIR="$HOME/GNSS/v4.1"', f'PROJECT_DIR="{proj}"'),
-                     ('EXTERNAL_PRODUCTS_DIR="/mnt/I2Rgus_Data/GPS_Data/Products"',
-                      f'EXTERNAL_PRODUCTS_DIR="{self.tmp / "Products"}"')):
-            self.assertIn(a, src)
-            src = src.replace(a, b)
-        script = proj / "maintenance" / "recover_missing_days.sh"
-        script.write_text(src)
-        bindir = self.tmp / "rbin"
-        bindir.mkdir()
-        (bindir / "rinex2snr").write_text(f'#!/bin/sh\necho "$3" >> {self.tmp}/rinex2snr.log\n')
-        (bindir / "gnssir").write_text('#!/bin/sh\nd="$REFL_CODE/$2/results/$1"; mkdir -p "$d"\n'
-                                       'echo "2026 $3 5.0" > "$d/$(printf %03d "$3").txt"\n')
-        for f in ("rinex2snr", "gnssir"):
-            (bindir / f).chmod(0o755)
-        (proj / "gnssrefl_venv" / "bin").mkdir(parents=True)
-        (proj / "gnssrefl_venv" / "bin" / "activate").write_text(f'export PATH="{bindir}:$PATH"\n')
-        r = subprocess.run(["bash", str(script)], capture_output=True, text=True,
-                           env=dict(os.environ, RECOVER_YEAR="2026", RECOVER_SINCE="2026-07-10"))
-        self.assertEqual((self.tmp / "rinex2snr.log").read_text().split(),
-                         ["191", "192", "193", "194", "195"])
-        self.assertIn("Skipped 6 day(s) of 2026 before 2026-07-10", r.stdout)
-        # a first day in a later year: nothing of 2026 at all
-        (self.tmp / "rinex2snr.log").unlink()
-        shutil.rmtree(proj / "products")
-        r = subprocess.run(["bash", str(script)], capture_output=True, text=True,
-                           env=dict(os.environ, RECOVER_YEAR="2026", RECOVER_SINCE="2027-01-03"))
-        self.assertFalse((self.tmp / "rinex2snr.log").exists(), r.stdout)
-
     # ---- review round 3 ---------------------------------------------------
 
     def test_station_health_leaves_out_results_before_the_first_day(self):

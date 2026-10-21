@@ -164,8 +164,8 @@ if [ -f "$PROJECT_DIR/maintenance/recover_missing_days.sh" ]; then
     # Last year too, so a late-December day is still recoverable in
     # January -- but only once the record has a last year (its results
     # folder exists), and never before gnss_record_first_day: those days
-    # are not part of the record, and each recovered day is a ~400 MB
-    # copy plus rinex2snr and gnssir.
+    # are not part of the record, and each recovered day is a convbin
+    # run plus rinex2snr and gnssir.
     this_year=$(date -u +%Y)
     first_year=0
     [[ "$RECORD_FIRST_DAY" =~ ^[0-9]{4}- ]] && first_year=$((10#${RECORD_FIRST_DAY:0:4}))
