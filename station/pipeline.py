@@ -166,19 +166,32 @@ def _date_from_filename(filename: str) -> str | None:
 # its name was already in the database (UNIQUE filename) with a
 # completed queue entry, so results/<doy>.txt kept only the first ~2.5 h
 # and the rest of the day was silently missing from the record. A file
-# is in progress if its name carries today's UTC date, or, for a name
-# without a date, if it was written to in the last IN_PROGRESS_MTIME_S
-# seconds.
+# is in progress if its name carries today's UTC date, or, unless it is
+# station_manager's file of a past UTC day, if it was written to in the
+# last IN_PROGRESS_MTIME_S seconds.
 #
-# The time it was written is not asked of a dated file: station_manager
-# runs the pipeline right after the last chunk of a day, at 00:00 UTC,
-# when that day's file was written seconds ago and is finished. Taken
-# as in progress, the day was skipped by that run, the station's own,
-# and left to whichever came next: station_manager's a day later, or
-# the cron's only where its pipeline step works (process_and_plot.sh
-# imports pipeline by a path relative to cron's working directory).
-# With a same-day orbit (nav, ultra) that put every day a day late.
+# The time it was written is not asked of station_manager's own day
+# file (station_<UTC date>.um980, _STATION_DAY_FILE) once its date is
+# past: station_manager runs the pipeline right after the last chunk of
+# a day, at 00:00 UTC, when that day's file was written seconds ago and
+# is finished. Taken as in progress, the day was skipped by that run,
+# the station's own, and left to whichever came next: station_manager's
+# a day later, or the cron's only where its pipeline step works
+# (process_and_plot.sh imports pipeline by a path relative to cron's
+# working directory). With a same-day orbit (nav, ultra) that put every
+# day a day late.
+#
+# Every other name keeps the IN_PROGRESS_MTIME_S rule, dated or not.
+# overnight_recording.py (QUICKSTART Step 5) writes
+# raw/overnight_<LOCAL start YYYYMMDD_HHMMSS>.um980: the date in that
+# name is the local day the recording began, not a UTC day, so a
+# recording started on an evening (EDT) is still being written when the
+# UTC date has already moved past it. Taken as finished, a run then
+# converted it mid-recording and _archive() moved it out from under the
+# recorder, the same loss as above.
 IN_PROGRESS_MTIME_S = 15 * 60
+
+_STATION_DAY_FILE = re.compile(r"station_\d{8}\.um980")
 
 
 def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
@@ -186,11 +199,13 @@ def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
 
     now = now or datetime.now(timezone.utc)
 
+    today = now.date().isoformat()
     file_date = _date_from_filename(path.name)
-    if file_date is not None:
-        # station_manager writes only today's UTC file
-        if file_date == now.date().isoformat():
-            return "its date is today (UTC)"
+    if file_date is not None and file_date == today:
+        return "its date is today (UTC)"
+    if (file_date is not None and file_date < today
+            and _STATION_DAY_FILE.fullmatch(path.name)):
+        # a past UTC day of station_manager's: closed at its midnight
         return None
 
     try:

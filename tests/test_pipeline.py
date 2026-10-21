@@ -133,6 +133,33 @@ class TestInProgressDaySkipped(unittest.TestCase):
         today = self._raw("station_20261020.um980", mtime=rollover.timestamp() - 3)
         self.assertIsNotNone(_in_progress_reason(today, now=rollover))
 
+    def test_evening_overnight_recording_is_in_progress(self) -> None:
+        # overnight_recording.py names its file by the LOCAL start time:
+        # begun 20:30 EDT on 20 Oct (00:30 UTC on the 21st), it is still
+        # being written at 02:30 UTC though its date is not today's.
+        now = datetime(2026, 10, 21, 2, 30, tzinfo=timezone.utc)
+        path = self._raw("overnight_20261020_203000.um980", mtime=now.timestamp() - 30)
+        self.assertIsNotNone(_in_progress_reason(path, now=now))
+        path = self._raw("overnight_20261020_203000.um980", mtime=now.timestamp() - 5)
+        self.assertIsNotNone(_in_progress_reason(path, now=now))
+        # finished once nothing has been written to it for a while
+        os.utime(path, (now.timestamp() - 3600, now.timestamp() - 3600))
+        self.assertIsNone(_in_progress_reason(path, now=now))
+
+    def test_only_station_managers_name_skips_the_written_time(self) -> None:
+        now = datetime(2026, 10, 21, 0, 0, 5, tzinfo=timezone.utc)
+        for name in ("test_20261020.um980", "station_20261020_extra.um980",
+                     "mystation_20261020.um980"):
+            path = self._raw(name, mtime=now.timestamp() - 3)
+            self.assertIsNotNone(_in_progress_reason(path, now=now), name)
+        path = self._raw("station_20261020.um980", mtime=now.timestamp() - 3)
+        self.assertIsNone(_in_progress_reason(path, now=now))
+
+    def test_station_file_dated_after_today_keeps_the_written_time(self) -> None:
+        # a clock that was set back since recording began: not a closed day
+        path = self._raw("station_20261021.um980", mtime=self.now.timestamp() - 60)
+        self.assertIsNotNone(_in_progress_reason(path, now=self.now))
+
     def test_rollover_run_scans_the_day_just_closed(self) -> None:
         now = datetime.now(timezone.utc)
         yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
