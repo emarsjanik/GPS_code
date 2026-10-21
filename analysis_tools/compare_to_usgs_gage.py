@@ -14,9 +14,25 @@ about 6 cm RSS in coastal waters), and it carries no absolute datum.
 So it cannot say whether the measured water level is correct in an
 absolute sense, only whether it varies correctly.
 
-A USGS gage measures actual water against a surveyed NAVD88
-benchmark. That makes it a genuine reference for the constant
+A USGS gage measures actual water against a surveyed benchmark.
+Tied to NAVD88, that makes it a genuine reference for the constant
 offset, which the model comparison could never resolve.
+
+WHICH GAGE SERIES IS NAVD88 (review B19)
+
+NWIS parameter 00065 is gage height: feet above the gage's own datum,
+an arbitrary local zero. It is NAVD88 only when that datum is NAVD88
+zero. Parameter 62620 is the water-surface elevation above NAVD88
+itself. This script used to fetch 00065 and call it NAVD88, so every
+offset it printed was off by the gage datum's elevation, unknown.
+
+Now (--parameter auto) it asks for 62620 first. If the site has none,
+it takes 00065 and adds the gage datum's altitude from the NWIS site
+file (alt_va, when its alt_datum_cd is NAVD88), or the value given
+with --gage-datum-navd88-ft (from the station description). Without
+either, the levels stay on the gage datum and the offsets are labelled
+as such: not a datum tie. The amplitude, timing and slope do not
+depend on the datum.
 
 WHAT THIS COMPARISON CAN AND CANNOT SHOW
 
@@ -49,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,40 +79,135 @@ import numpy as np
 FEET_TO_M = 0.3048
 DEFAULT_SITE = "420259070105600"   # Provincetown, MA
 
+# NWIS parameter codes (see "Which gage series is NAVD88").
+NAVD88_ELEVATION = "62620"   # water-surface elevation above NAVD 1988, ft
+GAGE_HEIGHT = "00065"        # gage height above the gage datum, ft
 
-def fetch_gage(site: str, start: str, end: str):
-    """Returns (times_utc, heights_m) from the USGS instantaneous
-    values service. Heights are gage height in feet above NAVD88,
-    converted to metres."""
-    url = ("https://waterservices.usgs.gov/nwis/iv/"
-           f"?sites={site}&parameterCd=00065"
-           f"&startDT={start}&endDT={end}&format=rdb")
-    with urllib.request.urlopen(url, timeout=120) as r:
-        text = r.read().decode("utf-8", errors="replace")
 
-    times, values = [], []
+def _get(url: str) -> str | None:
+    """The response text, or None when NWIS has no such series (it
+    answers 404 'No sites found matching all criteria')."""
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def read_rdb(text: str) -> list[dict]:
+    """Rows of an NWIS RDB table as dicts keyed by its header names
+    (the line after the header is the column-format line)."""
+    rows, header, skip_format = [], None, False
     for line in text.splitlines():
         if line.startswith("#") or not line.strip():
             continue
         parts = line.split("\t")
-        if parts[0] != "USGS":
-            continue          # header or format row
-        if len(parts) < 5:
+        if header is None:
+            header, skip_format = parts, True
+            continue
+        if skip_format:
+            skip_format = False
+            continue
+        rows.append(dict(zip(header, parts)))
+    return rows
+
+
+def fetch_series(site: str, start: str, end: str, parameter: str):
+    """(times_utc, values_m) of one parameter from the instantaneous
+    values service, or None if the site does not report it."""
+    text = _get("https://waterservices.usgs.gov/nwis/iv/"
+                f"?sites={site}&parameterCd={parameter}"
+                f"&startDT={start}&endDT={end}&format=rdb")
+    if text is None:
+        return None
+    rows = read_rdb(text)
+    times, values = [], []
+    for row in rows:
+        if row.get("agency_cd") != "USGS":
+            continue
+        # the value column is <ts_id>_<parameter>; <...>_cd is its flag
+        keys = [k for k in row if k.endswith(f"_{parameter}")]
+        if not keys:
+            continue
+        raw = row[keys[0]]
+        if not raw or raw in ("Ice", "Eqp", "Bkw"):
             continue
         try:
-            stamp, tz, raw = parts[2], parts[3], parts[4]
-            if not raw or raw in ("Ice", "Eqp", "Bkw"):
-                continue
-            naive = datetime.strptime(stamp, "%Y-%m-%d %H:%M")
-            # EDT is UTC-4, EST is UTC-5. The gage reports local
-            # time with the zone named per record, so honour it
-            # rather than assuming one or the other.
-            offset = 4 if tz.upper() == "EDT" else 5
-            times.append(naive + timedelta(hours=offset))
-            values.append(float(raw) * FEET_TO_M)
-        except (ValueError, IndexError):
+            naive = datetime.strptime(row["datetime"], "%Y-%m-%d %H:%M")
+            value = float(raw)
+        except (KeyError, ValueError):
             continue
+        # EDT is UTC-4, EST is UTC-5. The gage reports local
+        # time with the zone named per record, so honour it
+        # rather than assuming one or the other.
+        offset = 4 if row.get("tz_cd", "").upper() == "EDT" else 5
+        times.append(naive + timedelta(hours=offset))
+        values.append(value * FEET_TO_M)
+    if not times:
+        return None
     return times, np.asarray(values, dtype=float)
+
+
+def fetch_gage_datum(site: str):
+    """(altitude_ft, datum_code, accuracy_ft) of the gage datum from
+    the NWIS site file, or None. accuracy_ft may be None."""
+    text = _get("https://waterservices.usgs.gov/nwis/site/"
+                f"?sites={site}&siteOutput=expanded&format=rdb")
+    if text is None:
+        return None
+    for row in read_rdb(text):
+        try:
+            altitude = float(row.get("alt_va", ""))
+        except ValueError:
+            continue
+        try:
+            accuracy = float(row.get("alt_acy_va", ""))
+        except ValueError:
+            accuracy = None
+        return altitude, row.get("alt_datum_cd", "").strip(), accuracy
+    return None
+
+
+def fetch_gage(site: str, start: str, end: str, parameter: str = "auto",
+               gage_datum_navd88_ft: float | None = None):
+    """
+    Returns (times_utc, heights_m, on_navd88, note): the gage series in
+    metres, whether it is on NAVD88, and a line saying where its datum
+    came from. See "Which gage series is NAVD88".
+    """
+    if parameter in ("auto", NAVD88_ELEVATION):
+        series = fetch_series(site, start, end, NAVD88_ELEVATION)
+        if series is not None:
+            return (*series, True,
+                    f"parameter {NAVD88_ELEVATION}, water-surface elevation above NAVD88")
+        if parameter == NAVD88_ELEVATION:
+            return [], np.asarray([], float), True, f"no parameter {NAVD88_ELEVATION}"
+
+    series = fetch_series(site, start, end, GAGE_HEIGHT)
+    if series is None:
+        return [], np.asarray([], float), False, f"no parameter {GAGE_HEIGHT}"
+    times, heights = series
+    label = f"parameter {GAGE_HEIGHT}, gage height"
+
+    if gage_datum_navd88_ft is not None:
+        return (times, heights + gage_datum_navd88_ft * FEET_TO_M, True,
+                f"{label} + gage datum {gage_datum_navd88_ft:+.3f} ft NAVD88 "
+                f"(--gage-datum-navd88-ft)")
+
+    datum = fetch_gage_datum(site)
+    if datum is not None and datum[1].upper().replace(" ", "") == "NAVD88":
+        altitude, _code, accuracy = datum
+        acy = f" +/-{accuracy:g} ft" if accuracy is not None else ""
+        return (times, heights + altitude * FEET_TO_M, True,
+                f"{label} + gage datum {altitude:+.3f} ft NAVD88{acy} (NWIS site file)")
+
+    why = (f"the site file gives the gage datum on {datum[1] or 'no datum'}"
+           if datum is not None else "the site file gives no gage datum")
+    return (times, heights, False,
+            f"{label} above the gage datum, NOT NAVD88: {why}; "
+            f"give --gage-datum-navd88-ft to tie it")
 
 
 def load_spline(path: Path):
@@ -153,16 +265,27 @@ def main() -> int:
     p.add_argument("--site", default=DEFAULT_SITE)
     p.add_argument("--start", required=True, help="YYYY-MM-DD")
     p.add_argument("--end", required=True, help="YYYY-MM-DD")
+    p.add_argument("--parameter", choices=("auto", NAVD88_ELEVATION, GAGE_HEIGHT),
+                   default="auto",
+                   help=f"NWIS series: {NAVD88_ELEVATION} (NAVD88 elevation), "
+                        f"{GAGE_HEIGHT} (gage height), or auto = {NAVD88_ELEVATION} "
+                        f"if the site has it")
+    p.add_argument("--gage-datum-navd88-ft", type=float, default=None,
+                   help=f"NAVD88 elevation of the gage datum, ft, for {GAGE_HEIGHT} "
+                        "(default: the NWIS site file's, if it is on NAVD88)")
     args = p.parse_args()
 
     print(f"Fetching USGS site {args.site}, {args.start} to {args.end} ...")
-    gage_t, gage_v = fetch_gage(args.site, args.start, args.end)
+    gage_t, gage_v, on_navd88, datum_note = fetch_gage(
+        args.site, args.start, args.end, args.parameter, args.gage_datum_navd88_ft)
     if not gage_t:
-        print("No gage data returned.")
+        print(f"No gage data returned ({datum_note}).")
         return 1
+    gage_ref = "NAVD88" if on_navd88 else "gage datum, NOT NAVD88"
     print(f"  {len(gage_t)} observations, "
           f"{gage_t[0]} to {gage_t[-1]} UTC")
-    print(f"  range {gage_v.min():+.3f} to {gage_v.max():+.3f} m (NAVD88)")
+    print(f"  {datum_note}")
+    print(f"  range {gage_v.min():+.3f} to {gage_v.max():+.3f} m ({gage_ref})")
 
     gnss_t, gnss_v = load_spline(Path(args.spline_file))
     lo, hi = gage_t[0], gage_t[-1]
@@ -239,7 +362,7 @@ def main() -> int:
         print("  SCALE AND OFFSET  (the datum-relevant fit)")
         print("=" * 68)
 
-        x = interp[ok]          # gage, NAVD88 metres
+        x = interp[ok]          # gage, metres (NAVD88 if on_navd88)
         y = gv[ok]              # this station, its own reference
 
         # Ordinary least squares. Both series carry error, so a
@@ -264,7 +387,10 @@ def main() -> int:
         print(f"  Slope     : {slope:.4f} +/- {se_slope:.4f}")
         print(f"              (amplitude ratio; 1.0 would mean identical range)")
         print(f"  Intercept : {intercept:+.4f} +/- {se_intercept:.4f} m")
-        print(f"              (offset at gage zero, i.e. at NAVD88 datum)")
+        if on_navd88:
+            print(f"              (offset at gage zero, i.e. at NAVD88 datum)")
+        else:
+            print(f"              (offset at the gage's own zero: NOT a NAVD88 tie)")
         print()
         print(f"  Residual scatter about the fit: {resid.std():.3f} m")
         print(f"  ({n} points)")
@@ -279,12 +405,19 @@ def main() -> int:
         print("  apart. A single remote gage cannot separate those. Treat it")
         print("  as narrowing the datum question, not settling it.")
         print()
-        print("  The gage is referenced to NAVD88, surveyed to 0.02 ft.")
-        print("  This station's water levels are NAVD88 too, through the")
-        print("  OPUS antenna height (GEOID18, +/-0.061 m). The mean above")
-        print("  is therefore mostly the real difference in mean water level")
-        print("  between two sites 27 km apart in different tidal regimes,")
-        print("  plus the antenna-height uncertainty -- not a datum offset.")
+        if on_navd88:
+            print(f"  The gage series is on NAVD88 ({datum_note}).")
+            print("  This station's water levels are NAVD88 too, through the")
+            print("  OPUS antenna height (GEOID18, +/-0.061 m). The mean above")
+            print("  is therefore mostly the real difference in mean water level")
+            print("  between two sites 27 km apart in different tidal regimes,")
+            print("  plus the antenna-height and gage-datum uncertainties --")
+            print("  not a datum offset.")
+        else:
+            print("  The gage series is NOT on NAVD88 (gage height above the")
+            print("  gage's own zero), so the mean and the intercept above")
+            print("  contain the gage datum's elevation: they say nothing")
+            print("  about this station's datum. Give --gage-datum-navd88-ft.")
 
     print()
     print("=" * 68)

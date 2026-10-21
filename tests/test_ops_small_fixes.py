@@ -189,5 +189,104 @@ class TestElevationQualityUsesCorrectedRH(unittest.TestCase):
         self.assertIn("B18", note)
 
 
+# ------------------------------------------------------------
+# B19
+# ------------------------------------------------------------
+
+def iv_rdb(parameter: str, rows: list[tuple[str, str, str]]) -> str:
+    head = ("# comment\n"
+            f"agency_cd\tsite_no\tdatetime\ttz_cd\t69928_{parameter}\t69928_{parameter}_cd\n"
+            "5s\t15s\t20d\t6s\t14n\t10s\n")
+    return head + "".join(f"USGS\t420259070105600\t{t}\t{tz}\t{v}\tP\n" for t, tz, v in rows)
+
+
+def site_rdb(alt_va: str, alt_datum_cd: str, alt_acy_va: str = ".01") -> str:
+    return ("# comment\n"
+            "agency_cd\tsite_no\tstation_nm\talt_va\talt_meth_cd\talt_acy_va\talt_datum_cd\n"
+            "5s\t15s\t50s\t8s\t1s\t3s\t10s\n"
+            f"USGS\t420259070105600\tPROVINCETOWN\t{alt_va}\tL\t{alt_acy_va}\t{alt_datum_cd}\n")
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestGageDatum(unittest.TestCase):
+
+    ROWS = [("2026-09-01 00:00", "EDT", "3.00"), ("2026-09-01 00:06", "EDT", "-1.00")]
+
+    def setUp(self) -> None:
+        import compare_to_usgs_gage as cg
+        self.cg = cg
+
+    def fake_nwis(self, series: dict[str, str], site: str | None):
+        def urlopen(url, timeout=None):
+            if "/site/" in url:
+                if site is None:
+                    raise urllib.error.HTTPError(url, 404, "No sites", {}, None)
+                return FakeResponse(site.encode())
+            for parameter, text in series.items():
+                if f"parameterCd={parameter}" in url:
+                    return FakeResponse(text.encode())
+            raise urllib.error.HTTPError(url, 404, "No sites found matching all criteria",
+                                         {}, None)
+        return unittest.mock.patch.object(self.cg.urllib.request, "urlopen", urlopen)
+
+    def test_navd88_elevation_parameter_is_preferred(self) -> None:
+        series = {"62620": iv_rdb("62620", self.ROWS), "00065": iv_rdb("00065", self.ROWS)}
+        with self.fake_nwis(series, site_rdb("-2.00", "NGVD29")):
+            t, v, navd88, note = self.cg.fetch_gage("x", "2026-09-01", "2026-09-02")
+        self.assertTrue(navd88)
+        self.assertIn("62620", note)
+        self.assertAlmostEqual(v[0], 3.0 * 0.3048)
+        self.assertEqual(t[0], datetime(2026, 9, 1, 4, 0))         # EDT -> UTC
+
+    def test_gage_height_plus_navd88_gage_datum(self) -> None:
+        with self.fake_nwis({"00065": iv_rdb("00065", self.ROWS)}, site_rdb("-2.00", "NAVD88")):
+            _t, v, navd88, note = self.cg.fetch_gage("x", "2026-09-01", "2026-09-02")
+        self.assertTrue(navd88)
+        self.assertAlmostEqual(v[0], (3.0 - 2.0) * 0.3048)
+        self.assertIn("NWIS site file", note)
+
+    def test_gage_height_on_another_datum_is_not_called_navd88(self) -> None:
+        # The old script's case: 00065 labelled NAVD88 whatever the datum.
+        with self.fake_nwis({"00065": iv_rdb("00065", self.ROWS)}, site_rdb("-2.00", "NGVD29")):
+            _t, v, navd88, note = self.cg.fetch_gage("x", "2026-09-01", "2026-09-02")
+        self.assertFalse(navd88)
+        self.assertAlmostEqual(v[0], 3.0 * 0.3048)
+        self.assertIn("NOT NAVD88", note)
+        self.assertIn("NGVD29", note)
+
+    def test_given_gage_datum_ties_gage_height(self) -> None:
+        with self.fake_nwis({"00065": iv_rdb("00065", self.ROWS)}, None):
+            _t, v, navd88, note = self.cg.fetch_gage(
+                "x", "2026-09-01", "2026-09-02", gage_datum_navd88_ft=-1.5)
+        self.assertTrue(navd88)
+        self.assertAlmostEqual(v[1], (-1.0 - 1.5) * 0.3048)
+        self.assertIn("--gage-datum-navd88-ft", note)
+
+    def test_no_site_file_and_no_value_stays_on_gage_datum(self) -> None:
+        with self.fake_nwis({"00065": iv_rdb("00065", self.ROWS)}, None):
+            _t, _v, navd88, note = self.cg.fetch_gage("x", "2026-09-01", "2026-09-02")
+        self.assertFalse(navd88)
+        self.assertIn("no gage datum", note)
+
+    def test_flagged_rows_skipped_and_value_column_found_by_name(self) -> None:
+        rows = self.ROWS + [("2026-09-01 00:12", "EST", "Eqp")]
+        text = iv_rdb("62620", rows).replace(
+            "agency_cd\tsite_no\tdatetime\ttz_cd\t69928_62620\t69928_62620_cd",
+            "agency_cd\tsite_no\tdatetime\ttz_cd\t69928_62620_cd\t69928_62620")
+        text = text.replace("\t3.00\tP\n", "\tP\t3.00\n").replace("\t-1.00\tP\n", "\tP\t-1.00\n")
+        text = text.replace("\tEqp\tP\n", "\tP\tEqp\n")
+        with self.fake_nwis({"62620": text}, None):
+            t, v, _navd88, _note = self.cg.fetch_gage("x", "2026-09-01", "2026-09-02")
+        self.assertEqual(len(t), 2)
+        self.assertAlmostEqual(v[1], -1.0 * 0.3048)
+
+
 if __name__ == "__main__":
     unittest.main()
