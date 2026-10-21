@@ -167,6 +167,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
+import json
 import logging
 import os
 import shutil
@@ -652,6 +653,17 @@ class GnssIrProcessor:
         wrong -- e.g. a site with a partially obstructed view needs
         its own azimuth mask, or a site with a much taller antenna
         needs a wider reflector height search range.
+
+        Arc-level QC (opt-in, all unset by default, so the json
+        gnssrefl writes is byte for byte what it was before):
+        "gnssrefl_subdaily_alt_sigma" and
+        "gnssrefl_subdaily_spline_outlier1_m"/"_2_m" go into the
+        json's subdaily_* keys, which analysis_tools/gnss_record.py
+        puts on subdaily's command line each night; and
+        "gnssrefl_amplitude_min_by_frequency" replaces the one-value
+        reqAmp list with one threshold per frequency
+        (_apply_amplitude_by_frequency()). Try them first with
+        analysis_tools/evaluate_qc_variants.py.
         """
 
         from gnssrefl.gnssir_input import make_gnssir_input
@@ -847,6 +859,66 @@ class GnssIrProcessor:
         if direct_signal_poly_order is not None:
             kwargs["polyV"] = int(direct_signal_poly_order)
 
+        # Arc-level QC in subdaily (gnssrefl's own params:
+        # subdaily_alt_sigma, subdaily_spline_outlier1/2 -- stored in
+        # the json). analysis_tools/gnss_record.py reads them back and
+        # puts them on subdaily's command line: confirmed against the
+        # 4.1.5 source and a run, subdaily never takes alt_sigma from
+        # the json (subdaily() defaults it to False, and the json is
+        # only consulted when it is None), and on the command line a
+        # change refits the frozen years once. Left unset, subdaily's
+        # defaults hold:
+        #   * part 1 drops arcs more than 2.5 sigma from that UTC
+        #     day's mean, sigma a plain standard deviation. alt_sigma
+        #     makes it the median and 1.4826 x the median absolute
+        #     deviation, the robust definition gnssrefl credits to
+        #     Felipe Geremia-Nievinski. A day's spread is mostly tide,
+        #     so this clip rarely fires either way.
+        #   * the two spline clips drop arcs more than 3 standard
+        #     deviations (of their residuals over the WHOLE fit) from a
+        #     spline; spline_outlier1/2 replace that by a fixed limit in
+        #     metres. The first clip tests the RHdot-corrected RH (no
+        #     inter-frequency correction yet) against the first spline,
+        #     which is fitted to the UNCORRECTED RH -- so its residual
+        #     carries that spline's misfit and each signal's bias and is
+        #     wider than the final scatter (a limit sized on the final
+        #     arcs is several times too tight there). The second tests
+        #     the RHdot- and inter-frequency-corrected RH against the
+        #     final spline (gnssrefl's subdaily, Larson 2024; the RHdot
+        #     correction, Larson et al. 2013, 2017). Only the first one
+        #     changes the published spline: the final spline is refitted
+        #     on every arc that survived it.
+        # In a synthetic reproduction of the Sep 2026 storm with
+        # gnssrefl's real subdaily, fixed limits of 0.30/0.25 m with
+        # alt_sigma left a sustained +1.7 m storm bias where it was (the
+        # limits are relative to a spline that follows the bias) and
+        # cost 12% of calm arcs (0.30 m was 1.5 x the scatter the first
+        # clip tested there). That is why these are opt-in and evaluated
+        # on the station's own results first
+        # (analysis_tools/evaluate_qc_variants.py).
+        alt_sigma = station_section.get("gnssrefl_subdaily_alt_sigma")
+        if alt_sigma is not None:
+            kwargs["subdaily_alt_sigma"] = self._as_bool(
+                alt_sigma, "gnssrefl_subdaily_alt_sigma"
+            )
+        for key, param in (
+            ("gnssrefl_subdaily_spline_outlier1_m", "subdaily_spline_outlier1"),
+            ("gnssrefl_subdaily_spline_outlier2_m", "subdaily_spline_outlier2"),
+        ):
+            value = station_section.get(key)
+            if value is None:
+                continue
+            try:
+                limit = float(value)
+            except (TypeError, ValueError):
+                limit = float("nan")
+            if not limit > 0:
+                raise GnssIrProcessorError(
+                    f"station.json {key} must be a positive number of "
+                    f"metres, not {value!r}"
+                )
+            kwargs[param] = limit
+
         try:
             make_gnssir_input(**kwargs)
         except (Exception, SystemExit) as exc:
@@ -854,6 +926,137 @@ class GnssIrProcessor:
                 f"Could not set up gnssrefl analysis strategy for "
                 f"station {self._station_code!r}: {exc}"
             ) from exc
+
+        amplitude_by_frequency = station_section.get(
+            "gnssrefl_amplitude_min_by_frequency"
+        )
+        if amplitude_by_frequency is not None:
+            self._apply_amplitude_by_frequency(amplitude_by_frequency)
+
+    @staticmethod
+    def _as_bool(value, key: str) -> bool:
+        """A station.json switch: true/false (or the strings "true",
+        "false", "yes", "no", "1", "0"). bool("false") is True, so a
+        quoted value is read rather than coerced."""
+
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "yes", "1"):
+            return True
+        if text in ("false", "no", "0"):
+            return False
+        raise GnssIrProcessorError(
+            f"station.json {key} must be true or false, not {value!r}"
+        )
+
+    def _gnssir_json_path(self) -> Path:
+        """The json make_gnssir_input() just wrote (gnssrefl 4.1.5:
+        $REFL_CODE/input/<station>/<station>.json, no extension)."""
+
+        return (
+            self._refl_code
+            / "input"
+            / self._station_code
+            / f"{self._station_code}.json"
+        )
+
+    def _apply_amplitude_by_frequency(self, thresholds) -> None:
+        """
+        One LSP amplitude threshold per frequency in the json gnssir
+        reads, from station.json's "gnssrefl_amplitude_min_by_frequency",
+        e.g. {"1": 6.5, "20": 5.0, "101": 7.0}.
+
+        make_gnssir_input() has no argument for this: it writes
+        reqAmp = [ampl] * len(freqs), one value for every frequency,
+        and gnssir applies reqAmp[i] to freqs[i] (an arc is kept only
+        if its amplitude is ABOVE it). The amplitudes of different
+        signals are not comparable -- transmit power, antenna gain at
+        low elevation and receiver tracking differ by constellation
+        and band; gnssrefl's own documentation calls the threshold
+        "receiver and elevation angle region dependent" -- so this
+        rewrites that list after make_gnssir_input() has written the
+        file: a listed frequency gets its own value, every other one
+        keeps the one gnssrefl wrote. It matters in storms: a rough sea
+        lowers the coherent reflected power (the roughness damping of
+        Strandberg et al.'s inverse SNR model, 2016, 2019; Sepulveda
+        et al. 2023 see errors rise abruptly at high waves), and of a
+        strong signal the damped, doubtful arcs still clear one shared
+        threshold. A listed frequency that is not in the json's freqs
+        is ignored with a warning. Done on every initialize(), like
+        make_gnssir_input() itself.
+
+        It applies to days gnssir processes from now on; results
+        already written keep the threshold they were made with until
+        those days are processed again. analysis_tools/
+        amplitude_thresholds.py derives values from each frequency's
+        own amplitude histogram; analysis_tools/evaluate_qc_variants.py
+        scores them against the Chatham gauge first.
+        """
+
+        key = "gnssrefl_amplitude_min_by_frequency"
+        if not isinstance(thresholds, dict):
+            raise GnssIrProcessorError(
+                f"station.json {key} must map frequency codes to amplitudes, "
+                f'e.g. {{"1": 6.5, "20": 5.0}}, not {thresholds!r}'
+            )
+        wanted = {}
+        for freq, amplitude in thresholds.items():
+            try:
+                code, value = int(freq), float(amplitude)
+            except (TypeError, ValueError):
+                raise GnssIrProcessorError(
+                    f"station.json {key}: {freq!r}: {amplitude!r} is not a "
+                    f"frequency code and an amplitude"
+                ) from None
+            if not value > 0:
+                raise GnssIrProcessorError(
+                    f"station.json {key}: the amplitude for frequency {code} "
+                    f"must be positive, not {amplitude!r}"
+                )
+            wanted[code] = value
+
+        path = self._gnssir_json_path()
+        try:
+            strategy = json.loads(path.read_text())
+            freqs = [int(f) for f in strategy["freqs"]]
+            req_amp = list(strategy["reqAmp"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise GnssIrProcessorError(
+                f"Could not read the gnssir json {path} to set per-frequency "
+                f"amplitudes: {exc}"
+            ) from exc
+
+        unknown = sorted(set(wanted) - set(freqs))
+        if unknown:
+            self._logger.warning(
+                "%s lists frequencies %s that this station's gnssir json does "
+                "not analyse (freqs %s); ignored.",
+                key,
+                unknown,
+                freqs,
+            )
+        default = req_amp[0] if req_amp else None
+        strategy["reqAmp"] = [
+            wanted.get(f, req_amp[i] if i < len(req_amp) else default)
+            for i, f in enumerate(freqs)
+        ]
+
+        # the same layout gnssrefl writes (json.dump, indent=4), in one step
+        tmp = path.with_name(f".{path.name}.tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(strategy, f, indent=4)
+            os.replace(tmp, path)
+        except OSError as exc:
+            raise GnssIrProcessorError(
+                f"Could not write per-frequency amplitudes to {path}: {exc}"
+            ) from exc
+        self._logger.info(
+            "Per-frequency amplitude thresholds (reqAmp) in %s: %s",
+            path,
+            dict(zip(freqs, strategy["reqAmp"])),
+        )
 
     # ==========================================================
     # Private: process()

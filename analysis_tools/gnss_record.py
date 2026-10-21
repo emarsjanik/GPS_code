@@ -48,6 +48,12 @@ HOW
            itself instead -- with the window if that works, else with
            the fallback settings, said so in its header -- and frozen
            at once; tonight's fit starts after it.
+           The arc-QC settings in the gnssir json (station.json's opt-in
+           gnssrefl_subdaily_alt_sigma and _spline_outlier1_m/2_m,
+           written there by gnssrefl_processor.py) are added to
+           --settings: subdaily 4.1.5 ignores the json's alt_sigma, and
+           so they are part of what a frozen year is checked against
+           (json_qc_options). Unset: no change.
 
   frozen   FREEZE_AFTER_DAYS into a new year (counted on the fit's own
            end), the old year's rows of that night's fit are kept as
@@ -193,6 +199,64 @@ def results_days(refl_code: Path | str, sta: str, since: date | None = None) -> 
             if d.year == year and (since is None or d >= since) and _has_data(f):
                 found[d] = f
     return dict(sorted(found.items()))
+
+
+# The gnssir-json keys of station.json's opt-in arc QC (written by
+# gnssrefl_processor.py), with the subdaily option each one is.
+JSON_QC_OPTIONS = (("subdaily_alt_sigma", "-alt_sigma"),
+                   ("subdaily_spline_outlier1", "-spline_outlier1"),
+                   ("subdaily_spline_outlier2", "-spline_outlier2"))
+
+
+def qc_options(cfg: dict) -> str:
+    """A gnssir json's arc-QC settings as subdaily options; "" when none
+    is set, which is the default. alt_sigma false is subdaily's own
+    default, so it adds nothing (and does not refit the frozen years)."""
+    out = []
+    for key, opt in JSON_QC_OPTIONS:
+        v = cfg.get(key) if isinstance(cfg, dict) else None
+        if v is None or v is False:
+            continue
+        if v is True:
+            out += [opt, "True"]
+            continue
+        try:                       # a hand-edited value must not stop the nightly fit
+            out += [opt, f"{float(v):g}"]
+        except (TypeError, ValueError):
+            print(f"  WARNING: {key} = {v!r} in the gnssir json is not a number -- ignored")
+    return " ".join(out)
+
+
+def json_qc_options(refl_code: Path | str, sta: str) -> str:
+    """qc_options() of the station's gnssir json ($REFL_CODE/input/<sta>/
+    <sta>.json, else gnssrefl's older input/<sta>.json).
+
+    They go on subdaily's COMMAND LINE, for two reasons. gnssrefl 4.1.5's
+    subdaily never reads subdaily_alt_sigma from its json: subdaily()
+    defaults alt_sigma to False, and the json is consulted only when it
+    is None (subdaily_cl.py, confirmed against the source and a run) --
+    the spline_outlier keys are read, alt_sigma is silently not. And on
+    the command line they are part of the settings a frozen year is
+    checked against, so switching one on refits the frozen years once
+    instead of leaving them made without it."""
+    for path in (Path(refl_code) / "input" / sta / f"{sta}.json",
+                 Path(refl_code) / "input" / f"{sta}.json"):
+        try:
+            cfg = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        return qc_options(cfg)
+    return ""
+
+
+def with_json_qc(settings: str, refl_code: Path | str, sta: str) -> str:
+    """settings plus the json's arc-QC options that settings does not
+    already give (subdaily's command line wins over its json anyway)."""
+    given = set(shlex.split(settings))
+    extra = shlex.split(json_qc_options(refl_code, sta))
+    add = [x for i in range(0, len(extra), 2) if extra[i] not in given
+           for x in extra[i:i + 2]]
+    return " ".join([settings] + add) if add else settings
 
 
 def azimuth_window(settings: str) -> tuple[float, float] | None:
@@ -528,6 +592,20 @@ def arc_stats(refl_code: Path | str, sta: str, days: int = ARC_STATS_DAYS) -> li
     return out
 
 
+def status_settings(refl_code: Path | str, sta: str) -> str | None:
+    """The subdaily settings of the last update that succeeded without
+    the fallback (record_status.json), or None. Read by the arc-QC
+    evaluation tools, so they fit exactly what the nightly fit does."""
+    try:
+        st = json.loads((Path(refl_code) / "Files" / sta / FIT_SUBDIR / STATUS_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict) or not st.get("ok") or st.get("fallback"):
+        return None
+    s = st.get("settings")
+    return s if isinstance(s, str) and s.strip() else None
+
+
 def write_status(files_dir: Path, **kw) -> None:
     fit_dir = files_dir / FIT_SUBDIR
     fit_dir.mkdir(parents=True, exist_ok=True)
@@ -785,6 +863,11 @@ def cmd_update(refl_code, sta, settings, fallback, allow_shrink, since=None) -> 
     meeting the cron run would otherwise share Files/<sta>/fit/)."""
     files_dir = Path(refl_code) / "Files" / sta
     (files_dir / FIT_SUBDIR).mkdir(parents=True, exist_ok=True)
+    qc = json_qc_options(refl_code, sta)
+    if qc:
+        settings = with_json_qc(settings, refl_code, sta)
+        fallback = with_json_qc(fallback, refl_code, sta) if fallback else fallback
+        print(f"  Arc QC from the gnssir json (station.json gnssrefl_subdaily_*): {qc}")
     with open(files_dir / FIT_SUBDIR / ".lock", "w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

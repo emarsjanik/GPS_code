@@ -28,7 +28,9 @@ WHAT IT DOES (each run)
   3. Copies the production results of the previous two days into that
      folder (for continuity), runs subdaily over the three days with the
      same settings as process_and_plot.sh (-rhdot True -knots 8, azimuth
-     35-125), and keeps today's part of the spline as
+     35-125, and any opt-in arc QC of station.json, which gnssir's json
+     carries and gnss_record.with_json_qc puts on the command line, as
+     each night's fit does), and keeps today's part of the spline as
      products/refl_code_ultra/history/ultra_<run time>.csv.
   4. Compares every earlier run's same-day levels with the production
      spline where production now covers them: n, bias, RMS. That table
@@ -60,7 +62,7 @@ sys.path.insert(0, str(PROJECT / "station"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from station_datum import spline_shift  # noqa: E402
 from gnss_record import (MIN_EDGE_ARCS, arcs_in_window, azimuth_window,  # noqa: E402
-                         results_days, subdaily_range)
+                         results_days, subdaily_range, with_json_qc)
 
 # the same as process_and_plot.sh
 SUBDAILY_SETTINGS = "-rhdot True -knots 8 -azim1 35 -azim2 125"
@@ -247,7 +249,7 @@ def main() -> int:
     spline = refl / "Files" / station / f"{station}_spline_out.txt"
     spline.unlink(missing_ok=True)                # so last run's spline is never read as this one's
     cmd = ["subdaily", station, str(y1), "-doy1", str(d1), "-year_end", str(y2), "-doy2", str(d2)
-           ] + SUBDAILY_SETTINGS.split()
+           ] + with_json_qc(SUBDAILY_SETTINGS, refl, station).split()
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0 or not spline.exists():
         print(f"subdaily wrote no spline (exit status {r.returncode}):\n" + (r.stderr or r.stdout)[-1500:])
