@@ -20,7 +20,12 @@ exactly:
     a real run on a synthetic EOT20-format model, checked against an
     independent M2 calculation;
   * validation: known lags (one 10-minute row, a time-zone error, a
-    harbour delay), the height ratio and the mean offset come back.
+    harbour delay, a fraction of a minute), the height ratio and the
+    mean offset come back; against NOAA only the difference between
+    two spreadsheets' lags is offered as a shift;
+  * history: kept by default, started from the spreadsheet
+    tide_model_file names, and read back by filter_month.py across a
+    month end.
 
 Run with:
     python3 -m unittest discover -s tests -p "test_make_tide_prediction.py" -v
@@ -47,6 +52,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "analysis_tools"))
 sys.path.insert(0, str(ROOT / "diagnostics"))
+sys.path.insert(0, str(ROOT / "maintenance"))
 import make_tide_prediction as mtp  # noqa: E402
 
 try:
@@ -114,10 +120,14 @@ class FakeNoaa:
     """Serves the synthetic tide as CO-OPS predictions: whole UTC days
     begin_date..end_date at the requested interval, 3 decimals, the
     way the real API answers. `refuse` lists intervals answered with an
-    error; `short` drops the last day of every answer; `fail` raises."""
+    error; `short` drops the last day of every answer; `fail` raises;
+    `drop` lists times left out. The gauge's tide is the synthetic one
+    `late_minutes` later and `ratio` times as large."""
 
-    def __init__(self, refuse=(), short: bool = False, fail: bool = False) -> None:
+    def __init__(self, refuse=(), short: bool = False, fail: bool = False, drop=(),
+                 late_minutes: float = 0.0, ratio: float = 1.0) -> None:
         self.refuse, self.short, self.fail = set(refuse), short, fail
+        self.drop, self.late_minutes, self.ratio = set(drop), late_minutes, ratio
         self.urls = []
 
     def __call__(self, url, timeout=None):
@@ -134,10 +144,12 @@ class FakeNoaa:
         step = timedelta(minutes=int(q["interval"]))
         times, t = [], begin
         while t < end:
-            times.append(t)
+            if t not in self.drop:
+                times.append(t)
             t += step
+        values = self.ratio * synth(times, self.late_minutes)
         return _Answer({"predictions": [{"t": t.strftime("%Y-%m-%d %H:%M"), "v": f"{v:.3f}"}
-                                        for t, v in zip(times, synth(times))]})
+                                        for t, v in zip(times, values)]})
 
 
 # ---------------------------------------------------------------------
@@ -242,6 +254,11 @@ class TestNoaa(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 mtp.noaa_prediction(self.times, urlopen=FakeNoaa(short=True))
 
+    def test_one_missing_sample_raises(self) -> None:
+        server = FakeNoaa(drop={datetime(2026, 10, 20, 12, 10)})
+        with self.assertRaisesRegex(RuntimeError, "missing at 1 time"):
+            mtp.noaa_prediction(self.times, urlopen=server)
+
     def test_subordinate_corrections_shift_later_and_scale(self) -> None:
         got = mtp.noaa_prediction(self.times, time_offset_minutes=30, height_ratio=0.9,
                                   urlopen=FakeNoaa())
@@ -290,6 +307,17 @@ class TestPytmdKeywords(unittest.TestCase):
         self.assertEqual([c["extrapolate"] for c in calls], [False, True])
         self.assertEqual(calls[1]["cutoff"], 5.0)
         np.testing.assert_allclose(got, synth(self.times), atol=1e-9)
+
+    def test_land_fill_is_said_and_recorded(self) -> None:
+        with unittest.mock.patch.dict(sys.modules,
+                                      fake_pytmd(3, [], land_until_extrapolated=True)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            _, about = mtp.predict(self.times, opts(source="pytmd"))
+        self.assertIn("station cell is land", out.getvalue())
+        self.assertIn("nearest ocean node within 10 km", about["land_fill"])
+        with unittest.mock.patch.dict(sys.modules, fake_pytmd(3, [])):
+            _, about = mtp.predict(self.times, opts(source="pytmd"))
+        self.assertNotIn("land_fill", about)
 
     def test_no_ocean_within_reach_raises(self) -> None:
         with unittest.mock.patch.dict(sys.modules, fake_pytmd(3, [], all_land=True)):
@@ -363,6 +391,44 @@ class TestValidation(unittest.TestCase):
         self.assertAlmostEqual(res["ratio"], 0.8, delta=0.005)
         self.assertAlmostEqual(res["mean"], 0.05, delta=0.005)
         self.assertIn("not a clock error", mtp.read_lag(res["lag_min"]))
+
+    def test_lag_is_found_to_a_fraction_of_a_minute(self) -> None:
+        for late in (-9.6, 2.7):
+            res = self.compare(synth(self.ref_t, late_minutes=late))
+            self.assertAlmostEqual(res["lag_min"], late, delta=0.05)
+
+    def test_a_different_range_does_not_move_the_lag(self) -> None:
+        # on a whole row, where the prediction needs no interpolation
+        for ratio in (0.8, 1.25):
+            res = self.compare(ratio * synth(self.ref_t, late_minutes=-10))
+            self.assertAlmostEqual(res["lag_min"], -10.0, delta=0.05)
+
+    def test_every_lag_is_scored_on_rows_the_prediction_covers_at_all_lags(self) -> None:
+        # 1.4 days of overlap: enough to compare, but only ~0.9 days
+        # have the prediction on both sides at +/-6 h, too few to scan
+        gen_t = ten_minute(datetime(2026, 7, 20), 1.4)
+        res = mtp.compare_series(gen_t, synth(gen_t), gen_t, synth(gen_t))
+        self.assertIsNotNone(res)
+        self.assertIsNone(res["lag_min"])
+
+    def test_positive_time_zone_lag_is_not_eastern_time_written_as_utc(self) -> None:
+        self.assertIn("written as UTC", mtp.read_lag(-240.0))
+        self.assertIn("4 h late", mtp.read_lag(240.0))
+        self.assertNotIn("written as UTC", mtp.read_lag(300.0))
+
+    def test_against_noaa_no_shift_is_offered_from_one_lag(self) -> None:
+        res = self.compare(0.8 * synth(self.ref_t, late_minutes=-10))
+        text = mtp.format_report("old.xlsx", "EOT20_heightm", "NOAA", res, kind="noaa")
+        self.assertNotIn("--shift-old-minutes", text)
+        self.assertNotIn("add", text)
+        self.assertIn("not a clock error by itself", text)
+        text = mtp.format_report("old.xlsx", "EOT20_heightm", "EOT20", res, kind="pytmd")
+        self.assertIn("--shift-old-minutes +10", text)
+
+    def test_shift_is_offered_only_for_a_clock_error(self) -> None:
+        res = self.compare(synth(self.ref_t, late_minutes=37))
+        text = mtp.format_report("x.xlsx", "EOT20_heightm", "EOT20", res, kind="pytmd")
+        self.assertNotIn("--shift-old-minutes", text)
 
     def test_gap_in_the_prediction_is_not_bridged(self) -> None:
         keep = [not (datetime(2026, 8, 1) <= t < datetime(2026, 8, 2)) for t in self.gen_t]
@@ -478,6 +544,89 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(about["history_from"], "2026-10-10 00:00 UTC")
         self.assertIn("kept 432 earlier row(s)", out)
 
+    def test_history_is_kept_by_default_and_can_be_switched_off(self) -> None:
+        self.run_main("--source", "noaa")
+        self.now = NOW + timedelta(days=3)
+        code, out = self.run_main("--source", "noaa")
+        self.assertEqual(code, 0)
+        self.assertIn("kept 432 earlier row(s)", out)
+        self.assertEqual(mtp.read_prediction(self.out)[0][0], datetime(2026, 10, 10))
+        self.now = NOW + timedelta(days=4)
+        code, out = self.run_main("--source", "noaa", "--no-keep-history")
+        self.assertEqual(code, 0)
+        self.assertEqual(mtp.read_prediction(self.out)[0][0], datetime(2026, 10, 14))
+
+    def test_keep_history_must_be_a_boolean(self) -> None:
+        self.cfg["tide_prediction"] = {"keep_history": "false"}
+        with self.assertRaises(SystemExit):
+            self.run_main("--source", "noaa")
+
+    def test_first_run_starts_from_the_spreadsheet_and_monthly_csvs_keep_their_tide(self) -> None:
+        # The hand-made spreadsheet the plot reads ends on 30 September;
+        # the switch comes in October. Both months must keep every tide
+        # value when filter_month.py makes their CSVs again in November.
+        import filter_month
+        sheet = self.dir / "marconi_tides.xlsx"
+        wb = openpyxl.Workbook()
+        wb.active.append(["time", "EOT20_heightm"])
+        sheet_t = ten_minute(datetime(2026, 9, 1), 30)
+        sheet_v = [round(float(v), 4) for v in synth(sheet_t, late_minutes=-10)]
+        for t, v in zip(sheet_t, sheet_v):
+            wb.active.append([t, v])
+        wb.save(sheet)
+        self.cfg.update(tide_model_file=str(sheet), tide_model_value_column="EOT20_heightm")
+        code, out = self.run_main("--source", "pytmd", modules=fake_pytmd(3, []))
+        self.assertEqual(code, 0)
+        self.assertIn(f"took {len(sheet_t)} earlier row(s) from marconi_tides.xlsx", out)
+        times, values, about, _ = mtp.read_prediction(self.out)
+        self.assertEqual((times[0], times[-1]),
+                         (datetime(2026, 9, 1), datetime(2026, 11, 8, 23, 50)))
+        self.assertTrue(all(b - a == timedelta(minutes=10) for a, b in zip(times, times[1:])))
+        self.assertEqual(list(values[:len(sheet_t)]), sheet_v)        # copied as they were
+        np.testing.assert_allclose(values[len(sheet_t):], synth(times[len(sheet_t):]),
+                                   atol=0.0001)
+        self.assertIn("marconi_tides.xlsx", about["seeded_from"])
+
+        # now the plot reads the generated file; three weeks of nights later
+        self.cfg["tide_model_file"] = str(self.out)
+        self.now = NOW + timedelta(days=25)
+        code, out = self.run_main("--source", "pytmd", modules=fake_pytmd(3, []))
+        self.assertEqual(code, 0)
+        about = mtp.read_prediction(self.out)[2]
+        self.assertIn("marconi_tides.xlsx", about["seeded_from"])
+        tide_t, tide_v = filter_month.load_tide(self.out, "time", "EOT20_heightm")
+        for month in (9, 10):
+            query = [t for t in ten_minute(datetime(2026, month, 1), 31)[::3]
+                     if t.month == month]
+            got = filter_month.interp_tide(tide_t, tide_v, query)
+            self.assertNotIn(None, got)
+        got = filter_month.interp_tide(tide_t, tide_v, sheet_t)
+        self.assertEqual(got, sheet_v)
+
+    def test_spreadsheet_with_another_column_is_not_copied(self) -> None:
+        sheet = self.dir / "noaa_sheet.xlsx"
+        wb = openpyxl.Workbook()
+        wb.active.append(["time", "FES_heightm"])
+        for t in ten_minute(datetime(2026, 9, 1), 2):
+            wb.active.append([t, 0.5])
+        wb.save(sheet)
+        self.cfg.update(tide_model_file=str(sheet), tide_model_value_column="FES_heightm")
+        code, out = self.run_main("--source", "pytmd", modules=fake_pytmd(3, []))
+        self.assertEqual(code, 0)
+        self.assertIn("no rows taken from noaa_sheet.xlsx", out)
+        self.assertEqual(mtp.read_prediction(self.out)[0][0], datetime(2026, 10, 10))
+
+    def test_auto_does_not_rename_the_column_the_plot_reads(self) -> None:
+        # tide_model_file is this file and reads EOT20_heightm: with no
+        # pyTMD, auto fails rather than write a NOAA column
+        self.cfg.update(tide_model_file=str(self.out), tide_model_value_column="EOT20_heightm")
+        server = FakeNoaa()
+        code, out = self.run_main("--source", "auto", server=server)
+        self.assertEqual(code, 1)
+        self.assertIn("auto: using pytmd", out)
+        self.assertEqual(server.urls, [])
+        self.assertFalse(self.out.exists())
+
     def test_history_from_another_source_is_not_kept(self) -> None:
         self.run_main("--source", "noaa")
         self.now = NOW + timedelta(days=3)
@@ -533,16 +682,37 @@ class TestGenerate(unittest.TestCase):
         gen = self.dir / "gen.xlsx"
         times = ten_minute(datetime(2026, 7, 14), 12)
         mtp.write_prediction(gen, times, synth(times), "time", "EOT20_heightm",
-                             {"source": "test"})
+                             {"source": "test", "source_key": "pytmd:EOT20:test"})
         code, out = self.run_main("--validate", "--reference", str(old), str(new),
                                   "--generated", str(gen))
         self.assertEqual(code, 0)
         old_part, new_part = out.split("Spreadsheet   : ")[1:]
+        new_part, between = new_part.split("Between the spreadsheets")
         self.assertIn("Best lag      : -10.0 min", old_part)
         self.assertIn("--shift-old-minutes +10", old_part)
         self.assertIn("Best lag      : +0.0 min", new_part)
         self.assertIn("the two agree in time", new_part)
+        self.assertIn("new.xlsx lag minus old.xlsx lag: +10.0 min", between)
+        self.assertIn("--shift-old-minutes +10", between)
         self.assertFalse(self.out.exists())           # validation writes nothing
+
+    def test_validate_against_noaa_gives_the_shift_between_the_spreadsheets(self) -> None:
+        # No pyTMD, so auto uses NOAA, whose gauge runs 37 min late at
+        # 0.8 x: each lag holds that delay, only their difference does not
+        old = self.write_reference("old.xlsx", late_minutes=-10)
+        new = self.write_reference("new.xlsx", late_minutes=0)
+        code, out = self.run_main("--validate", "--reference", str(old), str(new),
+                                  server=FakeNoaa(late_minutes=37, ratio=0.8))
+        self.assertEqual(code, 0)
+        self.assertIn("using NOAA CO-OPS", out)
+        reports, between = out.split("Between the spreadsheets")
+        self.assertIn("Best lag      : -47.0 min", reports)
+        self.assertIn("Best lag      : -37.0 min", reports)
+        self.assertNotIn("--shift-old-minutes", reports)
+        self.assertNotIn("add +", reports)
+        self.assertIn("lag minus old.xlsx lag: +10.0 min", between)
+        self.assertIn("--old old.xlsx --new new.xlsx --shift-old-minutes +10", between)
+        self.assertIn("one 10-minute row", between)
 
     def test_validate_makes_its_own_prediction(self) -> None:
         ref = self.write_reference("edt.xlsx", late_minutes=-240)

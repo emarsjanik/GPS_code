@@ -54,17 +54,30 @@ SOURCES (--source, or "source" in station.json's "tide_prediction")
           et al., doi:10.5281/zenodo.5555395) at the station's latitude
           and longitude. This is the ocean tide, not the load tide:
           the antenna moves with the loaded crust, as a tide gauge
-          does. It needs pyTMD in the virtual environment (pip install
-          pyTMD) and EOT20's ocean_tides files (doi:10.17882/79489) in
-          <directory>/EOT20/ocean_tides/.
+          does. It needs EOT20's ocean_tides files (doi:10.17882/79489)
+          in <directory>/EOT20/ocean_tides/ and pyTMD in the virtual
+          environment. Tested: pyTMD 3.0.9 (Python 3.9 or later, with
+          dask) and 2.2.9.1. gnssrefl_venv is pinned (requirements.txt)
+          and pyTMD 3 brings in xarray, pandas and scipy, so install it
+          against the current versions, which makes pip refuse rather
+          than upgrade anything:
+              pip freeze > before.txt
+              pip install 'pyTMD==3.0.9' dask -c before.txt
+          Memory: pyTMD 3 loads every constituent's global grid, about
+          2.3-2.5 GB at EOT20's 1/8 degree whether or not it crops;
+          pyTMD 2 about 0.5 GB (both measured on a synthetic grid of
+          that size, not on the NUC).
           The station is on a narrow strip of land between the
           Atlantic and Cape Cod Bay, which have different tides. If
           the model treats the station's grid cell as land, pyTMD
-          fills it from the nearest ocean cell within --extrapolate-km.
-          When that cell is on the bay side, the prediction is the
-          bay's tide, not the open coast's. --validate shows this.
-          The fix is a "point" ([lat, lon]) a little offshore on the
-          Atlantic side.
+          fills it from the nearest ocean cell within --extrapolate-km
+          (the run says so, and the "about" sheet records it). When
+          that cell is on the bay side, the prediction is the bay's
+          tide, not the open coast's. Even with ocean all round, the
+          linear interpolation between grid nodes can mix a bay node
+          with an Atlantic one. --validate's height ratio and RMS show
+          either. The fix is a "point" ([lat, lon]) a little offshore
+          on the Atlantic side.
   noaa    NOAA CO-OPS harmonic predictions (Parker 2007, Tidal Analysis
           and Prediction, NOAA Special Publication NOS CO-OPS 3) for a
           harmonic station: datum MSL, metric, time_zone=gmt. The
@@ -76,15 +89,21 @@ SOURCES (--source, or "source" in station.json's "tide_prediction")
           two corrections NOAA itself uses for its subordinate
           stations: a time shift and a height ratio. Both are off by
           default. NOAA's MSL is the gauge's mean over its tidal datum
-          epoch, not necessarily today's, so the curve may sit a few
-          cm off the EOT20 one; --validate's mean difference says how
-          far.
+          epoch, not today's. That does not move the curve, which has a
+          zero mean like EOT20's, but its seasonal terms and the
+          harbour can put it a few cm off the EOT20 one.
+          tide_model_navd88_offset was measured for the EOT20
+          spreadsheet: before tide_model_file points at a NOAA file,
+          check --validate's mean difference and adjust the offset by
+          it if it is not near zero.
   auto    pytmd if it works on this machine, otherwise noaa. It says
-          which it used and why. Once it has written the file it keeps
-          that file's source on later runs: switching on a night pyTMD
-          fails would rename the height column, and the plot would lose
-          its predicted tide. Delete the file, or give --source, to
-          choose again.
+          which it used and why. Once tide_model_file is this file, it
+          uses the source whose height column tide_model_value_column
+          names, and otherwise, once it has written the file, it keeps
+          that file's source: switching on a night pyTMD fails would
+          rename the height column, and the plot would lose its
+          predicted tide. Delete the file, or give --source, to choose
+          again. An explicit "source" is safer than auto.
 
 VALIDATION (--validate)
 
@@ -96,17 +115,20 @@ overlap and writes nothing. It reports:
     that lag;
   - the height ratio at that lag (spreadsheet range / prediction
     range).
-How to read the lag:
+How to read the lag, against pytmd/EOT20 (the same model, so the lag
+is absolute):
   - within 2.5 min of zero: the two agree in time;
   - about 10 min: one 10-minute row (merge_tide_files.py's ambiguity);
-  - about 4 or 5 h: a time-zone error (Eastern time written as UTC);
+  - about -4 or -5 h: Eastern time written as UTC (+4 or +5 h: the
+    times moved the other way, e.g. converted to UTC twice);
   - anything else: a real difference between the two predictions
     (another model or place), not a clock error.
-Against pytmd/EOT20 the lag is absolute, because it is the same model.
-Give both spreadsheets (--reference OLD NEW): the one at zero is
-aligned, and the other's lag is the shift merge_tide_files.py needs.
-Against noaa the lag includes the harbour's real delay, so compare the
-two spreadsheets' lags with each other rather than with zero.
+Only then does the report say how many minutes to add to a
+spreadsheet. Against noaa the lag includes the harbour's real delay,
+so it is not read as a clock error at all. Give both spreadsheets
+(--reference OLD NEW) and it also prints the difference between their
+lags, which holds for either source: that is the shift
+merge_tide_files.py --shift-old-minutes needs.
 
 SAFETY
 
@@ -115,15 +137,25 @@ SAFETY
   - It never overwrites a spreadsheet it did not make, that is, one
     without its "about" sheet, such as the hand-made file. --force
     overrides this.
-  - --keep-history keeps the earlier rows of its own previous file
-    when that file came from the same source; the new prediction wins
-    where the two overlap. Without it, the file holds only the rolling
-    window. Everything else that reads tide_model_file reads the WHOLE
-    file: Step 6 of process_and_plot.sh, the morning mail's statistics
-    and the tide column of the monthly CSVs (maintenance/
-    s3UploadTimeseries.sh). With a rolling file those cover only the
-    file's span, and a --backfill of an older month has no tide column.
-    Use --keep-history if that matters.
+  - It keeps history by default ("keep_history", --no-keep-history to
+    stop): the earlier rows of its own previous file stay when that
+    file came from the same source, and the new prediction wins where
+    the two overlap. The file grows by about 52,000 rows a year.
+    Everything else that reads tide_model_file reads the WHOLE file:
+    Step 6 of process_and_plot.sh, the morning mail's statistics and
+    the tide column of the monthly CSVs that maintenance/
+    s3UploadTimeseries.sh publishes. That script uploads each month
+    again for 10 days after it ends, and every month of a year again
+    when gnss_record.py freezes the year; a month outside the file
+    gets an empty tide column. So without history, each published
+    month would keep only its last day or so of tide, and the months
+    before the switch none at all.
+  - For the same reason its first run (no file of its own yet) copies,
+    as they are, the rows of the spreadsheet tide_model_file names
+    that come before its window, when that spreadsheet has the same
+    height column, and predicts from where the spreadsheet ends. The
+    "about" sheet records it ("seeded_from"). Months already published
+    then keep their tide values when they are uploaded again.
 
 SWITCHING IT ON (on the NUC)
 
@@ -137,11 +169,15 @@ SWITCHING IT ON (on the NUC)
      and "value_column" (STATION_JSON_REFERENCE.md).
      process_and_plot.sh then refreshes the file just before it draws
      the 7-day plot. Without a "tide_prediction" section nothing runs.
+     Let it run once while tide_model_file is still the spreadsheet,
+     so the file starts with the spreadsheet's rows (SAFETY).
   3. Point the plot at it with "tide_model_file" (the FULL path this
      script prints: the plot looks a relative path up from wherever
      it was started) and "tide_model_value_column" ("EOT20_heightm").
-     Until you do, nothing the public sees changes. To go back, point
-     tide_model_file at the spreadsheet again.
+     Until you do, nothing the public sees changes. From then on the
+     file is also the tide column of the monthly CSVs on S3, so leave
+     keep_history on. To go back, point tide_model_file at the
+     spreadsheet again.
 
 Usage:
     python3 make_tide_prediction.py --source pytmd --pytmd-directory ~/tide_models
@@ -243,9 +279,11 @@ def _interp_no_gaps(xq, x, y, max_gap_s: float) -> np.ndarray:
 
 def pytmd_prediction(times, lat: float, lon: float, directory=None,
                      model: str = DEFAULT_MODEL, extrapolate_km: float = EXTRAPOLATE_KM,
-                     infer_minor: bool = True):
+                     infer_minor: bool = True, info: dict | None = None):
     """Ocean-tide heights (m) at the naive-UTC `times`, from a pyTMD
-    model (EOT20 by default) at one point.
+    model (EOT20 by default) at one point. If `info` is a dict,
+    info["land_fill"] is set True when the point had to be filled from
+    the ocean nearby.
 
     The times go to pyTMD as UTC seconds since 1970 with standard
     "UTC", so pyTMD itself applies the leap seconds. Minor
@@ -260,10 +298,11 @@ def pytmd_prediction(times, lat: float, lon: float, directory=None,
     if that gives no value (a grid cell next to it is land) is it
     filled from the nearest ocean within extrapolate_km. pyTMD 3 needs
     dask for that fill, and for cropping the global grids to 1 degree
-    around the point (which saves memory), and does not install dask
-    itself; without dask, a point whose grid cells are all ocean still
-    works. Raises if pyTMD or the model files are missing, or if no
-    ocean value lies within extrapolate_km of the point."""
+    around the point (which does not measurably lower its peak memory),
+    and does not install dask itself; without dask, a point whose grid
+    cells are all ocean still works. Raises if pyTMD or the model files
+    are missing, or if no ocean value lies within extrapolate_km of the
+    point."""
     import importlib.util
     import inspect
     import pyTMD.compute                       # ImportError: not installed
@@ -308,6 +347,8 @@ def pytmd_prediction(times, lat: float, lon: float, directory=None,
 
     values = heights(extrapolate=False)
     if not np.isfinite(values).all():
+        if info is not None:
+            info["land_fill"] = True
         try:
             values = heights(extrapolate=True)
         except ImportError as exc:
@@ -425,9 +466,13 @@ def resolve_options(args, cfg: dict) -> dict:
     if point is not None and not (isinstance(point, (list, tuple)) and len(point) == 2):
         raise SystemExit(f"tide_prediction \"point\" must be [latitude, longitude], "
                          f"not {point!r}")
+    keep_history = pick(args.keep_history, "keep_history", True)
+    if not isinstance(keep_history, bool):
+        raise SystemExit(f"tide_prediction \"keep_history\" must be true or false, "
+                         f"not {keep_history!r}")
     lat = args.lat if args.lat is not None else (point[0] if point else cfg.get("latitude"))
     lon = args.lon if args.lon is not None else (point[1] if point else cfg.get("longitude"))
-    output = Path(pick(args.output, "file", DEFAULT_OUTPUT))
+    output = Path(pick(args.output, "file", DEFAULT_OUTPUT)).expanduser()
     if not output.is_absolute():
         output = PROJECT_DIR / output
     return {
@@ -442,7 +487,7 @@ def resolve_options(args, cfg: dict) -> dict:
         "noaa_time_offset_minutes": float(pick(args.noaa_time_offset_minutes,
                                                "noaa_time_offset_minutes", 0.0)),
         "noaa_height_ratio": float(pick(args.noaa_height_ratio, "noaa_height_ratio", 1.0)),
-        "keep_history": bool(pick(args.keep_history, "keep_history", False)),
+        "keep_history": keep_history,
         "value_column": pick(args.value_col, "value_column", None),
         "time_column": args.time_col or cfg.get("tide_model_time_column") or "time",
     }
@@ -455,10 +500,11 @@ def predict(times, opts: dict):
     source = opts["source"]
     if source in ("auto", "pytmd"):
         try:
+            info = {}
             values = pytmd_prediction(times, opts["lat"], opts["lon"], opts["pytmd_directory"],
-                                      opts["model"], opts["extrapolate_km"])
+                                      opts["model"], opts["extrapolate_km"], info=info)
             name = f"pyTMD {_pytmd_version()}".strip()
-            return values, {
+            about = {
                 "source": f"{name}, {opts['model']} ocean tide",
                 "point": f"{opts['lat']:.5f}, {opts['lon']:.5f} (latitude, longitude)",
                 "heights": "metres about the model's mean sea level (a zero-mean tide); "
@@ -466,6 +512,13 @@ def predict(times, opts: dict):
                 "source_key": f"pytmd:{opts['model']}:{opts['lat']:.5f},{opts['lon']:.5f}",
                 "value_column": f"{opts['model']}_heightm",
             }
+            if info.get("land_fill"):
+                about["land_fill"] = (f"the point's grid cell is land in {opts['model']}: "
+                                      f"filled from the nearest ocean node within "
+                                      f"{opts['extrapolate_km']:g} km, not interpolated")
+                print(f"  filled from the nearest {opts['model']} ocean node within "
+                      f"{opts['extrapolate_km']:g} km (the station cell is land in the model)")
+            return values, about
         except Exception as exc:
             if source == "pytmd":
                 raise
@@ -477,8 +530,9 @@ def predict(times, opts: dict):
     return values, {
         "source": f"NOAA CO-OPS harmonic predictions, station {station}",
         "point": f"NOAA station {station}",
-        "heights": "metres above the station's mean sea level (datum MSL, a zero-mean tide); "
-                   "add tide_model_navd88_offset for NAVD88",
+        "heights": "metres above the station's mean sea level (datum MSL of NOAA's tidal "
+                   "datum epoch, a zero-mean tide); tide_model_navd88_offset was measured "
+                   "for EOT20: check it against --validate's mean difference",
         "adjustment": (f"{offset:+g} min, x{ratio:g} (subordinate-station correction)"
                        if offset or ratio != 1.0 else "none"),
         "source_key": f"noaa:{station}:{offset:g}:{ratio:g}",
@@ -579,10 +633,13 @@ def compare_series(ref_t, ref_v, gen_t, gen_v, max_lag_minutes: float = MAX_LAG_
       max_abs, corr
       lag_min                     best L, in minutes, in ref(t) ~ gen(t - L):
                                   positive means the reference's times run
-                                  late. Found on a 1-minute scan, refined
-                                  with a parabola through the three best
-                                  points. None if the overlap is too short
-                                  to scan +/-max_lag_minutes.
+                                  late. The lag where a scaled and offset
+                                  prediction fits the reference best, so a
+                                  range difference does not move it. Found
+                                  on a 1-minute scan, refined with a
+                                  parabola through the three best points.
+                                  None if the overlap is too short to scan
+                                  +/-max_lag_minutes.
       rms_at_lag, ratio           at that lag: the mean-removed RMS, and
                                   the reference's range over the prediction's
                                   (regression slope)
@@ -630,9 +687,15 @@ def compare_series(ref_t, ref_v, gen_t, gen_v, max_lag_minutes: float = MAX_LAG_
     lags = np.arange(-int(max_lag_minutes), int(max_lag_minutes) + 1, dtype=float)
 
     def misfit(lag_min):
+        # what is left after the best linear fit, var(a) (1 - r^2): a
+        # plain var(a - b) would trade the lag against the range, since
+        # interpolating between rows slightly flattens the prediction
         g = _interp_no_gaps(rx[use] - lag_min * 60, gx, gv, gap_s)
         k = np.isfinite(g)
-        return float(np.var(rv[use][k] - g[k])) if k.sum() >= MIN_OVERLAP_ROWS else np.inf
+        a, b = rv[use][k], g[k]
+        if k.sum() < MIN_OVERLAP_ROWS or np.std(a) == 0 or np.std(b) == 0:
+            return np.inf
+        return float(np.var(a) * (1 - np.corrcoef(a, b)[0, 1] ** 2))
 
     scores = np.array([misfit(L) for L in lags])
     i = int(np.argmin(scores))
@@ -652,8 +715,24 @@ def compare_series(ref_t, ref_v, gen_t, gen_v, max_lag_minutes: float = MAX_LAG_
     return result
 
 
-def read_lag(lag_min: float) -> str:
-    """What a best-fit lag most likely means (see VALIDATION)."""
+def is_clock_lag(lag_min: float) -> bool:
+    """True for a lag that reads as a clock error: one 10-minute row,
+    or 4-5 h of time zone (see VALIDATION)."""
+    size = abs(lag_min)
+    return size > LAG_SAME_MIN and (
+        abs(size - STEP_MINUTES) <= LAG_SAME_MIN
+        or any(abs(size - 60 * hours) <= TIME_ZONE_TOL_MIN for hours in TIME_ZONE_HOURS))
+
+
+def read_lag(lag_min: float, same_model: bool = True) -> str:
+    """What a best-fit lag most likely means (see VALIDATION). With
+    same_model False (a NOAA prediction, or one of unknown source) the
+    lag also holds a real timing difference, so it is not read as a
+    clock error."""
+    if not same_model:
+        return ("not a clock error by itself: against another model or place (NOAA: the "
+                "gauge's own delay) the lag is partly real; compare two spreadsheets' lags "
+                "with each other")
     size = abs(lag_min)
     if size <= LAG_SAME_MIN:
         return "the two agree in time"
@@ -662,13 +741,26 @@ def read_lag(lag_min: float) -> str:
                 f"describes")
     for hours in TIME_ZONE_HOURS:
         if abs(size - 60 * hours) <= TIME_ZONE_TOL_MIN:
-            return (f"a time-zone error: {hours} h is Eastern time "
-                    f"({'EDT' if hours == 4 else 'EST'}) written as UTC")
+            if lag_min < 0:
+                return (f"a time-zone error: {hours} h is Eastern time "
+                        f"({'EDT' if hours == 4 else 'EST'}) written as UTC")
+            return (f"a time-zone error: the times are {hours} h late, e.g. converted "
+                    f"to UTC twice")
     return ("a timing difference between the two predictions themselves (another model "
             "or place, e.g. a harbour), not a clock error")
 
 
-def format_report(name: str, column: str, label: str, res: dict | None) -> str:
+def source_kind(about: dict) -> str:
+    """"pytmd" or "noaa" for a prediction this script made, else ""."""
+    return str(about.get("source_key") or "").split(":", 1)[0]
+
+
+def format_report(name: str, column: str, label: str, res: dict | None,
+                  kind: str = "pytmd") -> str:
+    """One spreadsheet's comparison. `kind` is the prediction's source
+    (source_kind): only against "pytmd" is the lag absolute, so only
+    then does it say how many minutes to add to the spreadsheet."""
+    same_model = kind == "pytmd"
     lines = [f"Spreadsheet   : {name}, column {column}",
              f"Prediction    : {label}"]
     if res is None:
@@ -688,26 +780,59 @@ def format_report(name: str, column: str, label: str, res: dict | None) -> str:
         lines.append("Best lag      : overlap too short to scan for a time lag")
     else:
         lag = 0.0 if abs(lag) < 0.05 else lag      # no "-0.0"
-        shift = -lag
+        shift = -STEP_MINUTES * int(round(lag / STEP_MINUTES))     # whole rows
         late = "late" if lag > 0 else "early"
         lines += [
             f"Best lag      : {lag:+.1f} min, RMS {res['rms_at_lag']:.3f} m there "
             f"(mean removed)",
         ]
-        if abs(lag) > LAG_SAME_MIN:
+        if same_model and is_clock_lag(lag):
             lines += [
                 f"                the spreadsheet's times run {abs(lag):.1f} min {late}: add "
-                f"{shift:+.0f} min to them to align",
+                f"{shift:+d} min to them to align",
                 f"                (if this is the older of the two files: merge_tide_files.py "
-                f"--shift-old-minutes {shift:+.0f})",
+                f"--shift-old-minutes {shift:+d})",
             ]
+        elif not same_model:
+            lines.append("                (includes the prediction's own timing, e.g. the "
+                         "NOAA gauge's delay: not a shift to apply)")
         lines += [
             f"Height ratio  : {res['ratio']:.3f} (spreadsheet range / prediction range, "
             f"at the best lag)",
-            f"Reading       : {read_lag(lag)}",
+            f"Reading       : {read_lag(lag, same_model)}",
         ]
     lines.append(f"Off-grid rows : {res['off_grid']} (times not on a whole "
                  f"{STEP_MINUTES}-minute mark)")
+    return "\n".join(lines)
+
+
+def format_lag_differences(results) -> str:
+    """The later spreadsheets' lags relative to the first one's, the
+    first --reference taken as the older file. The prediction's own
+    timing (a NOAA gauge's delay) cancels in the difference, so this
+    holds whatever the source: it is the shift merge_tide_files.py
+    --shift-old-minutes needs. `results` is [(name, compare_series
+    result or None), ...]."""
+    old_name, old_res = results[0]
+    lines = [f"Between the spreadsheets ({old_name} taken as the older file):"]
+    if old_res is None or old_res["lag_min"] is None:
+        lines.append(f"  no lag for {old_name}, so nothing to compare")
+        return "\n".join(lines)
+    for name, res in results[1:]:
+        if res is None or res["lag_min"] is None:
+            lines.append(f"  {name}: no lag, so nothing to compare")
+            continue
+        shift = res["lag_min"] - old_res["lag_min"]
+        rows = int(round(shift / STEP_MINUTES))
+        lines.append(f"  {name} lag minus {old_name} lag: {shift:+.1f} min")
+        if abs(shift - rows * STEP_MINUTES) > LAG_SAME_MIN:
+            lines.append(f"  not a whole number of {STEP_MINUTES}-minute rows, so not a "
+                         f"clock offset between the files: do not merge them with a shift "
+                         f"(merge_tide_files.py would find no shared timestamps)")
+            continue
+        lines += [f"  merge_tide_files.py --old {old_name} --new {name} "
+                  f"--shift-old-minutes {rows * STEP_MINUTES:+d}",
+                  f"  Reading     : {old_name} against {name}: {read_lag(-shift)}"]
     return "\n".join(lines)
 
 
@@ -718,6 +843,28 @@ def _resolve(path_text: str) -> Path:
     if not path.is_absolute() and not path.exists():
         path = PROJECT_DIR / path
     return path
+
+
+def history_seed(cfg: dict, column: str):
+    """(times, values, path, column) of the spreadsheet tide_model_file
+    names, sorted by time, when the plot reads the height column
+    `column` from it (tide_model_value_column); otherwise None, saying
+    why."""
+    path = _resolve(cfg["tide_model_file"])
+    if cfg.get("tide_model_value_column") != column:
+        print(f"  no rows taken from {path.name}: tide_model_value_column is "
+              f"{cfg.get('tide_model_value_column')!r}, not {column!r}")
+        return None
+    try:
+        times, values, _, _ = read_prediction(
+            path, cfg.get("tide_model_time_column") or "time", column)
+    except Exception as exc:
+        print(f"  no rows taken from {path.name} ({exc})")
+        return None
+    if not times:
+        return None
+    order = sorted(range(len(times)), key=times.__getitem__)
+    return [times[i] for i in order], values[order], path, column
 
 
 def validate(args, cfg: dict, opts: dict) -> int:
@@ -754,14 +901,20 @@ def validate(args, cfg: dict, opts: dict) -> int:
             return 1
         label = f"{about['source']}, {about['point']}"
 
+    kind = source_kind(about)
     status = 0
+    results = []
     for path, column, times, values in loaded:
         res = compare_series(times, values, gen_t, gen_v, args.max_lag_minutes)
         print()
         print("=" * 72)
-        print(format_report(path.name, column, label, res))
+        print(format_report(path.name, column, label, res, kind))
         if res is None:
             status = 1
+        results.append((path.name, res))
+    if len(results) > 1:
+        print("=" * 72)
+        print(format_lag_differences(results))
     print("=" * 72)
     return status
 
@@ -784,12 +937,24 @@ def generate(args, cfg: dict, opts: dict) -> int:
                   f"sheet), so it is left alone. Choose another --output, or --force.")
             return 2
 
-    # "auto" chooses once. After that it keeps the source of the file it
-    # already wrote: falling back to NOAA on a night pyTMD fails would
-    # rename the height column, and the plot, still reading the old
-    # column, would lose its predicted tide altogether.
+    # "auto" never changes the height column the plot reads: falling
+    # back to NOAA on a night pyTMD fails would rename it, and the plot
+    # would lose its predicted tide altogether. Once tide_model_file is
+    # this file, auto takes the source of tide_model_value_column's
+    # column; otherwise it keeps the source of the file it already wrote.
+    own_columns = {"pytmd": f"{opts['model']}_heightm",
+                   "noaa": f"NOAA{opts['noaa_station']}_heightm"}
+    configured = cfg.get("tide_model_file")
+    plot_reads_out = bool(configured) and _resolve(configured).resolve() == out.resolve()
+    if opts["source"] == "auto" and plot_reads_out and not opts["value_column"]:
+        for kind, column in own_columns.items():
+            if cfg.get("tide_model_value_column") == column:
+                opts = dict(opts, source=kind)
+                print(f"  auto: using {kind}, whose column {column} is "
+                      f"tide_model_value_column")
+                break
     if opts["source"] == "auto" and old is not None and is_generated(old[2]):
-        kept = str(old[2].get("source_key") or "").split(":", 1)[0]
+        kept = source_kind(old[2])
         if kept in ("pytmd", "noaa"):
             opts = dict(opts, source=kept)
             print(f"  auto: keeping {kept}, the source of the existing {out.name} "
@@ -800,6 +965,17 @@ def generate(args, cfg: dict, opts: dict) -> int:
         end = start + timedelta(days=args.days)
     else:
         start, end = rolling_window(utcnow(), args.days_back, args.days)
+    window_start = start
+
+    # First run with history on: start from the spreadsheet the plot
+    # reads now, so the months already published keep their tide (SAFETY).
+    seed = None
+    if opts["keep_history"] and not (old is not None and is_generated(old[2])) \
+            and configured and not plot_reads_out:
+        column = opts["value_column"] or own_columns.get(opts["source"], own_columns["pytmd"])
+        seed = history_seed(cfg, column)
+        if seed is not None and seed[0][-1] < start:
+            start = seed[0][-1] + timedelta(minutes=STEP_MINUTES)
     times = grid_times(start, end)
     try:
         values, about = predict(times, opts)
@@ -810,6 +986,14 @@ def generate(args, cfg: dict, opts: dict) -> int:
 
     value_col = opts["value_column"] or about.pop("value_column")
     about.pop("value_column", None)
+    if seed is not None and seed[3] != value_col:
+        # auto fell back to NOAA: the spreadsheet's column is not this one
+        print(f"  {seed[2].name}'s rows are not kept: its column {seed[3]} is not "
+              f"{value_col}")
+        keep = np.array([t >= window_start for t in times])
+        times = [t for t, k in zip(times, keep) if k]
+        values = values[keep]
+        seed = None
     about.update({
         "time": "UTC. The times on the first sheet are naive; every one is UTC.",
         "interval": f"{STEP_MINUTES} minutes; each height is the instantaneous value at its time",
@@ -829,7 +1013,22 @@ def generate(args, cfg: dict, opts: dict) -> int:
                 values = np.concatenate([[v for _, v in earlier], values])
                 about["history_from"] = (old_about.get("history_from")
                                          or f"{earlier[0][0]:%Y-%m-%d %H:%M} UTC")
+                if old_about.get("seeded_from"):
+                    about["seeded_from"] = old_about["seeded_from"]
                 print(f"  kept {len(earlier)} earlier row(s) from the previous file")
+    elif seed is not None:
+        seed_t, seed_v, seed_path, seed_col = seed
+        earlier = [(t, v) for t, v in zip(seed_t, seed_v) if t < times[0]]
+        if earlier:
+            times = [t for t, _ in earlier] + times
+            values = np.concatenate([[v for _, v in earlier], values])
+            about["history_from"] = f"{earlier[0][0]:%Y-%m-%d %H:%M} UTC"
+            about["seeded_from"] = (f"{seed_path.name}, column {seed_col}: its rows "
+                                    f"{earlier[0][0]:%Y-%m-%d %H:%M} to "
+                                    f"{earlier[-1][0]:%Y-%m-%d %H:%M} copied as they were; "
+                                    f"this prediction from {times[len(earlier)]:%Y-%m-%d %H:%M}")
+            print(f"  took {len(earlier)} earlier row(s) from {seed_path.name} "
+                  f"(tide_model_file), so the months already published keep their tide")
 
     write_prediction(out, times, values, opts["time_column"], value_col, about)
     print(f"Wrote {out}")
@@ -837,8 +1036,7 @@ def generate(args, cfg: dict, opts: dict) -> int:
           f"every {STEP_MINUTES} minutes")
     print(f"  source: {about['source']} ({about['point']})")
     print(f"  columns: {opts['time_column']}, {value_col}")
-    configured = cfg.get("tide_model_file")
-    if not configured or _resolve(configured).resolve() != out.resolve():
+    if not plot_reads_out:
         print(f"  The 7-day plot reads tide_model_file ({configured or 'unset'}); it uses this "
               f"file only once tide_model_file is \"{out.resolve()}\" and "
               f"tide_model_value_column is \"{value_col}\".")
@@ -856,7 +1054,8 @@ def main(argv=None) -> int:
                    help="default: tide_prediction.source in station.json, else auto")
     p.add_argument("--output", default=None,
                    help="default: tide_prediction.file in station.json, else "
-                        "tides/tide_prediction.xlsx in the project")
+                        "tides/tide_prediction.xlsx in the project; a relative path is "
+                        "taken from the project directory, not the current one")
     p.add_argument("--days", type=int, default=DAYS,
                    help=f"length of the prediction (default {DAYS})")
     p.add_argument("--days-back", type=int, default=DAYS_BACK,
@@ -884,7 +1083,10 @@ def main(argv=None) -> int:
     p.add_argument("--value-col", default=None,
                    help="height column name (default EOT20_heightm, or NOAA<station>_heightm)")
     p.add_argument("--keep-history", action="store_true", default=None,
-                   help="keep the earlier rows of this script's previous file")
+                   help="keep the earlier rows of this script's previous file (default: "
+                        "tide_prediction.keep_history, else on)")
+    p.add_argument("--no-keep-history", dest="keep_history", action="store_false",
+                   help="keep only the new window")
     p.add_argument("--force", action="store_true",
                    help="overwrite --output even if this script did not make it")
     v = p.add_argument_group("validation")
