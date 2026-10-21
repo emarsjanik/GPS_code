@@ -180,8 +180,11 @@ def fetch_gage(site: str, start: str, end: str, parameter: str = "auto",
     if parameter in ("auto", NAVD88_ELEVATION):
         series = fetch_series(site, start, end, NAVD88_ELEVATION)
         if series is not None:
+            unused = ("" if gage_datum_navd88_ft is None else
+                      "; --gage-datum-navd88-ft not used")
             return (*series, True,
-                    f"parameter {NAVD88_ELEVATION}, water-surface elevation above NAVD88")
+                    f"parameter {NAVD88_ELEVATION}, water-surface elevation above NAVD88"
+                    f"{unused}")
         if parameter == NAVD88_ELEVATION:
             return [], np.asarray([], float), True, f"no parameter {NAVD88_ELEVATION}"
 
@@ -399,13 +402,13 @@ def main() -> int:
         print("  two records agree in shape, since it no longer contains the")
         print("  amplitude difference.")
         print()
-        print("  CAUTION: the intercept is this station's vertical reference")
-        print("  relative to NAVD88 as realized at Provincetown, PLUS any")
-        print("  real difference in mean water level between two sites 27 km")
-        print("  apart. A single remote gage cannot separate those. Treat it")
-        print("  as narrowing the datum question, not settling it.")
-        print()
         if on_navd88:
+            print("  CAUTION: the intercept is this station's vertical reference")
+            print("  relative to NAVD88 as realized at Provincetown, PLUS any")
+            print("  real difference in mean water level between two sites 27 km")
+            print("  apart. A single remote gage cannot separate those. Treat it")
+            print("  as narrowing the datum question, not settling it.")
+            print()
             print(f"  The gage series is on NAVD88 ({datum_note}).")
             print("  This station's water levels are NAVD88 too, through the")
             print("  OPUS antenna height (GEOID18, +/-0.061 m). The mean above")

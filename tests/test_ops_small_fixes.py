@@ -280,6 +280,12 @@ class TestGageDatum(unittest.TestCase):
         self.assertIn("62620", note)
         self.assertAlmostEqual(v[0], 3.0 * 0.3048)
         self.assertEqual(t[0], datetime(2026, 9, 1, 4, 0))         # EDT -> UTC
+        self.assertNotIn("not used", note)
+        with self.fake_nwis(series, None):
+            _t, v, _navd88, note = self.cg.fetch_gage("x", "2026-09-01", "2026-09-02",
+                                                      gage_datum_navd88_ft=-2.0)
+        self.assertAlmostEqual(v[0], 3.0 * 0.3048)
+        self.assertIn("--gage-datum-navd88-ft not used", note)
 
     def test_gage_height_plus_navd88_gage_datum(self) -> None:
         with self.fake_nwis({"00065": iv_rdb("00065", self.ROWS)}, site_rdb("-2.00", "NAVD88")):
@@ -397,6 +403,11 @@ class TestCompressRinexUtcDays(ShellDatesTestCase):
         # (22 Oct is in the future here: never compressed)
         self.assertEqual(expected, ["station_20261019", "station_20261020", "station_20261021",
                                     "station_20261022"])
+
+    def test_eight_digits_that_are_not_a_date_are_eligible(self) -> None:
+        # As before B22: a name without a date is a one-off recording.
+        (self.proj / "rinex" / "test_99999999.obs").write_text("x\n")
+        self.assertNotIn("test_99999999", self.kept(2, "2026-10-21 23:59 UTC", "UTC"))
 
 
 class TestPruneLocalRinexUtcDays(ShellDatesTestCase):

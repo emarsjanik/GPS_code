@@ -13,8 +13,8 @@
 #
 # What this does, in order:
 #   1. Quick sanity check (venv active, required tools present)
-#   2. Auto-recovers any previously-missed days whose data still
-#      exists in external storage, if configured
+#   2. Auto-recovers any previously-missed days from the raw files
+#      kept in archive/ or in external storage, if configured
 #   3. Converts any new raw data to RINEX and runs GNSS-IR analysis
 #      on it
 #   4. Finds the most recent gap-free stretch of results and
@@ -183,8 +183,8 @@ if [ -f "$PROJECT_DIR/maintenance/recover_missing_days.sh" ]; then
     done
 else
     echo "  recover_missing_days.sh not found -- skipping this step."
-    echo "  (This is only needed if you use external storage for"
-    echo "  automatic daily exports; safe to skip otherwise.)"
+    echo "  (It recovers missed days from the raw files in archive/"
+    echo "  or external storage; the rest of this run does not need it.)"
 fi
 
 # ----------------------------------------------------------------

@@ -185,6 +185,9 @@ for base in "${basenames[@]}"; do
     # eligible (they are one-off recordings, not part of the daily
     # series).
     datestr=$(echo "$base" | grep -oE '[0-9]{8}' | head -1)
+    if [ -n "$datestr" ] && ! date -u -d "${datestr:0:4}-${datestr:4:2}-${datestr:6:2}" >/dev/null 2>&1; then
+        datestr=""   # eight digits, but not a date
+    fi
     if [ -n "$datestr" ] && [ "$KEEP_DAYS" -gt 0 ]; then
         if [ "$((10#$datestr))" -ge "$((10#$cutoff_day))" ]; then
             echo "  [skip] $base -- within the most recent $KEEP_DAYS day(s)"
