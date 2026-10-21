@@ -47,7 +47,9 @@ def load_raw_results(results_dir: Path, year: int, doy1: int, doy2: int, hortho:
     """
     times, values = [], []
     for doy in range(doy1, doy2 + 1):
-        f = results_dir / f"{doy}.txt"
+        # gnssrefl names results files %03d (008.txt): unpadded, days
+        # 1-99 were silently skipped (review B17)
+        f = results_dir / f"{doy:03d}.txt"
         if not f.exists():
             continue
         for line in f.read_text(errors="replace").splitlines():
