@@ -466,14 +466,20 @@ def kept_nothing_days(refl_code: Path | str, sta: str) -> set[date]:
     """Days gnssir ran for and kept no arc at all, so they have no results
     file: gnssrefl 4.1.5 deletes <doy>.txt then ("No good retrievals
     found", retrieve_rh.py) but still writes the rejected arcs to
-    results/<sta>/failQC/<doy>.txt, and recover_missing_days.sh leaves a
-    <doy>.no_data marker for such a day. A day gnssir never got to (no
-    SNR file: the orbit not out yet) has neither."""
+    results/<sta>/failQC/<doy>.txt, on every run that got as far as the
+    arcs. A day gnssir never got to has no failQC file: with no SNR file
+    (the orbit not out yet, rinex2snr exiting 0 without one) gnssir
+    returns before retrieve_rh (gnssir_v2.py). recover_missing_days.sh's
+    <doy>.no_data marker is not read here: it is written whenever there
+    is no results file after both exit 0, so it is also left on a day
+    gnssir never got to, and counted as kept nothing it put a storm WARN
+    in the mail and a 0 into the arc baseline. A day that did get to the
+    arcs has its failQC file beside the marker."""
     found = set()
     for ydir in Path(refl_code).glob("[0-9][0-9][0-9][0-9]"):
         year = int(ydir.name)
         res = ydir / "results" / sta
-        for f in list(res.glob("failQC/[0-9][0-9][0-9].txt")) + list(res.glob("[0-9]*.no_data")):
+        for f in res.glob("failQC/[0-9][0-9][0-9].txt"):
             try:
                 d = date(year, 1, 1) + timedelta(days=int(f.name.split(".")[0]) - 1)
             except ValueError:

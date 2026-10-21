@@ -476,14 +476,19 @@ class TestArcStats(HealthTest):
         self.assertEqual(status, "WARN")
         self.assertIn("2026-10-19: no arcs kept", message)
 
-    def test_a_no_data_marker_is_a_day_with_no_arc_kept(self) -> None:
-        # recover_missing_days.sh's marker (unpadded day of year); inside
-        # the baseline it counts for the arcs, not for the amplitude
+    def no_data(self, day: datetime) -> None:
+        """recover_missing_days.sh's marker (unpadded day of year): no
+        results file after rinex2snr and gnssir both exited 0."""
+        (self.results_dir(day) / f"{day.timetuple().tm_yday}.no_data").write_text(
+            "2026-10-20T03:00:00Z -- no usable retrievals\n")
+
+    def test_a_day_with_no_arc_kept_counts_in_the_arc_baseline(self) -> None:
+        # inside the baseline it counts for the arcs, not for the amplitude
         for k in range(8):
             day = datetime(2026, 10, 12) + timedelta(days=k)
             if k == 4:
-                (self.results_dir(day) / f"{day.timetuple().tm_yday}.no_data").write_text(
-                    "2026-10-20T03:00:00Z -- no usable retrievals\n")
+                self.no_data(day)
+                self.kept_nothing(day)
             else:
                 self.write_results(day, n=400 if k < 7 else 390, amp=12.0 if k < 7 else 11.0)
         gr.write_status(self.files, ok=True)
@@ -493,6 +498,27 @@ class TestArcStats(HealthTest):
         (status, message), = self.findings("arcs")
         self.assertEqual(status, "OK", message)
         self.assertIn("previous 7 days: 400 arcs, Amp 12.0", message)
+
+    def test_a_no_data_marker_alone_is_not_a_day_with_no_arc_kept(self) -> None:
+        # The marker is also left when rinex2snr exited 0 without an SNR
+        # file (no orbit yet): gnssir then returns before retrieve_rh,
+        # with no failQC file. That day is not a storm day.
+        for k in range(8):
+            day = datetime(2026, 10, 12) + timedelta(days=k)
+            if k == 4:
+                self.no_data(day)
+            else:
+                self.write_results(day, n=400 if k < 7 else 390, amp=12.0 if k < 7 else 11.0)
+        self.no_data(datetime(2026, 10, 20))
+        gr.write_status(self.files, ok=True)
+        st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
+        self.assertEqual([d["day"] for d in st["arc_stats"]],
+                         [f"2026-10-{d}" for d in (12, 13, 14, 15, 17, 18, 19)])
+        self.assertNotIn(0, [d["arcs"] for d in st["arc_stats"]])
+        sh.check_arc_stats(STA)
+        (status, message), = self.findings("arcs")
+        self.assertEqual(status, "OK", message)
+        self.assertIn("2026-10-19: 390 arcs", message)
 
     def test_a_day_gnssir_never_ran_for_is_not_counted(self) -> None:
         # no SNR file yet (the orbit not out): nothing in results/ at all
