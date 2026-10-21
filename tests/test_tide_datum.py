@@ -12,6 +12,12 @@ tide offset never reached the plot.
 
   * TideModelInDatumTests -- the helper, and that it gives the NAVD88
     products exactly the numbers they computed before.
+  * NAVD88ProductTests -- the main() of each NAVD88 product that
+    converts the tide (export_timeseries, plot_gnssir_vs_tide,
+    filter_month, compare_to_tide_deviation): the tide it writes, draws
+    or compares is the raw model + tide_model_navd88_offset (or
+    --tide-datum-offset), never the mean-sea-level datum, and
+    filter_month takes it from the station.json it read itself.
   * DepartureDatumTests -- plot_7day.main() on a synthetic week, a
     known surge on a known tide, under several station.json datums:
     each departure is the NAVD88 water level minus the NAVD88 tide --
@@ -25,6 +31,7 @@ Run with:
 from __future__ import annotations
 
 import contextlib
+import csv
 import io
 import json
 import math
@@ -37,7 +44,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "analysis_tools"))
+sys.path.insert(0, str(ROOT / "maintenance"))
 import station_datum as sd  # noqa: E402
+import filter_month  # noqa: E402
 
 try:
     import numpy as np
@@ -46,6 +55,8 @@ try:
     import matplotlib.pyplot as plt
     import plot_7day  # noqa: E402
     import compare_to_tide_deviation as ctd  # noqa: E402
+    import export_timeseries  # noqa: E402
+    import plot_gnssir_vs_tide  # noqa: E402
 except ImportError:  # pragma: no cover
     np = None
 
@@ -121,7 +132,8 @@ class StationFiles(unittest.TestCase):
 
 class TideModelInDatumTests(StationFiles):
 
-    def test_navd88_list_is_what_filter_month_computed(self) -> None:
+    def test_navd88_list_is_the_old_per_height_addition(self) -> None:
+        # filter_month's old arithmetic; NAVD88ProductTests runs filter_month itself
         cfg = {"tide_model_navd88_offset": 0.07}
         raw = [0.5, -1.25, 0.1, 1.234]
         heights, shift = sd.tide_model_in_datum(raw, "NAVD88", cfg)
@@ -174,6 +186,115 @@ class TideModelInDatumTests(StationFiles):
     def test_unknown_datum_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             sd.tide_model_in_datum([0.0], "CGVD2013", {})
+
+
+@unittest.skipIf(np is None, "numpy and matplotlib not installed")
+class NAVD88ProductTests(StationFiles):
+    """Each NAVD88 product's main() on the synthetic week, its tide
+    loader patched to hand it the raw model. The station.json tide
+    offset (0.07 m) is not the 0.09 m default and mean sea level is
+    set (0.10 m), so a product that fell back to the default, ignored
+    --tide-datum-offset or asked for "MSL" would write, draw or
+    compare a different tide."""
+
+    TIDE_OFFSET = 0.07
+    MSL = 0.10
+    SURGE = 0.30
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_station(vertical_datum="NAVD88 (GEOID18)", gnssrefl_orthometric_height=19.014,
+                           water_level_msl_offset=self.MSL,
+                           tide_model_navd88_offset=self.TIDE_OFFSET)
+        self.tide_file = self.proj / "marconi_tides.xlsx"
+        self.tide_file.write_bytes(b"")      # exists; its rows come from the patched loader
+        self.products = self.proj / "products"
+        self.products.mkdir()
+        self.spline = self.products / "usgs_spline_out.txt"
+        self.spline.write_text(spline_text(
+            [model_tide(t) + TRUE_MODEL_ZERO + self.SURGE for t in week()], sd.NAVD88_HORTHO_M))
+        self.raw = [model_tide(t) for t in week()]
+        self.addCleanup(plt.close, "all")
+
+    def run_main(self, module, loader: str, rows, argv) -> str:
+        """module.main() with argv, its tide loader returning the week's
+        times and rows; what it printed."""
+        out = io.StringIO()
+        with unittest.mock.patch.object(sys, "argv", [module.__name__ + ".py", *argv]), \
+                unittest.mock.patch.object(module, loader, return_value=(week(), rows)), \
+                contextlib.redirect_stdout(out):
+            module.main()
+        return out.getvalue()
+
+    def tide_args(self, override) -> list:
+        args = ["--spline-file", str(self.spline), "--tide-file", str(self.tide_file),
+                "--tide-value-col", "EOT20_heightm"]
+        return args + (["--tide-datum-offset", str(override)] if override is not None else [])
+
+    def assert_tide_column(self, csv_path: Path, shift: float) -> None:
+        """The CSV's tide column is the raw model + shift, row for row,
+        in the 4 decimals the products write."""
+        with open(csv_path, newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0][2], "tide_model_EOT20_heightm_navd88_m")
+        self.assertEqual([r[2] for r in rows[1:]],
+                         [f"{v:.4f}" for v in np.asarray(self.raw, float) + shift])
+
+    def test_export_timeseries(self) -> None:
+        for override, shift in ((None, self.TIDE_OFFSET), (0.2, 0.2)):
+            with self.subTest(tide_datum_offset=override):
+                dest = self.proj / "timeseries_export.csv"
+                printed = self.run_main(export_timeseries, "load_tide_reference",
+                                        np.asarray(self.raw, float),
+                                        self.tide_args(override) + ["--output", str(dest)])
+                self.assertIn(f"moved {shift:+.3f} m onto NAVD88", printed)
+                self.assert_tide_column(dest, shift)
+
+    def test_plot_gnssir_vs_tide(self) -> None:
+        for override, shift in ((None, self.TIDE_OFFSET), (0.2, 0.2)):
+            with self.subTest(tide_datum_offset=override):
+                printed = self.run_main(plot_gnssir_vs_tide, "load_tide_reference",
+                                        np.asarray(self.raw, float),
+                                        self.tide_args(override)
+                                        + ["--output", str(self.proj / "gnssir_vs_tide.png")])
+                self.assertIn(f"moved {shift:+.3f} m onto NAVD88", printed)
+                ax = plt.gcf().axes[0]
+                orange, = [ln for ln in ax.get_lines() if ln.get_color() == "tab:orange"]
+                self.assertTrue(np.array_equal(np.asarray(orange.get_ydata(), float),
+                                               np.asarray(self.raw, float) + shift))
+                # the measured offset it removes is level minus that same tide
+                label = ax.get_legend().get_texts()[0].get_text()
+                self.assertEqual(label, "GNSS-IR water level (shifted "
+                                 f"{-(TRUE_MODEL_ZERO + self.SURGE - shift):+.3f} m)")
+                plt.close("all")
+
+    def test_compare_to_tide_deviation(self) -> None:
+        for override, shift in ((None, self.TIDE_OFFSET), (0.2, 0.2)):
+            with self.subTest(tide_datum_offset=override):
+                printed = self.run_main(ctd, "load_tide_reference", np.asarray(self.raw, float),
+                                        self.tide_args(override))
+                self.assertIn(f"moved {shift:+.3f} m onto NAVD88", printed)
+                self.assertIn("Mean offset (GNSS - tide): "
+                              f"{TRUE_MODEL_ZERO + self.SURGE - shift:+.3f} m", printed)
+
+    def month_csv(self, outdir: Path) -> Path:
+        self.run_main(filter_month, "load_tide", list(self.raw),
+                      ["--year", "2026", "--month", "10", "--products-dir", str(self.products),
+                       "--output-dir", str(outdir), "--tide-file", str(self.tide_file),
+                       "--tide-value-col", "EOT20_heightm"])
+        return outdir / "usgs_timeseries_october2026.csv"
+
+    def test_filter_month(self) -> None:
+        self.assert_tide_column(self.month_csv(self.proj / "month"), self.TIDE_OFFSET)
+
+    def test_filter_month_uses_the_station_json_it_read(self) -> None:
+        # filter_month reads station.json once and takes the antenna
+        # height and the tide offset from that one read. Served a
+        # different read than the file on disk, the tide follows it.
+        cfg = dict(sd.load_station(), tide_model_navd88_offset=0.05)
+        with unittest.mock.patch.object(filter_month, "load_station", return_value=cfg):
+            dest = self.month_csv(self.proj / "month")
+        self.assert_tide_column(dest, 0.05)
 
 
 @unittest.skipIf(np is None, "numpy and matplotlib not installed")
