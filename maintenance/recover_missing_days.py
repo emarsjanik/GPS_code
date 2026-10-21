@@ -34,9 +34,13 @@ WHERE A DAY IS RECOVERED FROM, in this order
 
 The raw file is the full record of the day, so it comes first. It is
 converted again with station/rinex_processor.py (the same convbin flags
-as the pipeline), into a scratch folder that is removed afterwards, so
-nothing is added to rinex/ (which compress_rinex.sh, the S3 sync and
+as the pipeline), into a scratch folder, so nothing is added to rinex/ (which compress_rinex.sh, the S3 sync and
 prune_local_rinex.sh manage). The raw file itself is only read.
+The scratch folder is also the working directory, where gnssrefl's
+rinex2snr copies the day's RINEX (350-400 MB) and leaves it. It is
+emptied after every day and removed at the end; a scratch folder
+more than a day old (left by a run that was killed) is removed at
+the start of the next run.
 
 rinex/ is not a source. A conversion there may be of the first hours
 of a day only (pipeline.py explains how a day still being recorded
@@ -56,7 +60,8 @@ own results folder.
 WHAT CAN HAPPEN TO A DAY
 
   recovered   gnssir wrote a results file with data rows.
-  no data     rinex2snr wrote a fresh SNR file, but gnssir kept no arc.
+  no data     rinex2snr wrote a fresh SNR file, and gnssir ran to the
+              end but kept no arc.
               A <doy>.no_data marker is written next to the results, so
               the automatic search does not try the day every night.
               Delete it to try again, e.g. after changing the elevation
@@ -64,8 +69,10 @@ WHAT CAN HAPPEN TO A DAY
   not yet     rinex2snr wrote no SNR file. Most often the orbit is not
               published yet (it routinely takes 1-2 days), so the day is
               tried again on the next run. No marker.
-  failed      convbin failed on the raw file, or gnssir did not replace
-              an existing results file. Tried again on the next run.
+  failed      convbin failed on the raw file, rinex2snr or gnssir raised
+              (a gnssrefl error is not a lack of data), or gnssir did
+              not replace an existing results file. Tried again on the
+              next run.
 
 The shell version wrote the marker whenever gnssir left no results
 file, whatever the reason, so a day whose orbit was not out yet could
@@ -134,6 +141,16 @@ LEGACY_RINEX = r"^{code9}_R_(\d{{4}})(\d{{3}})0000_01D_\d\dS_MO\.RNX$"
 # Slack on "written during this attempt", for file systems that keep
 # modification times to the second only.
 FRESH_SLACK_S = 2.0
+
+# gnssrefl_processor.py's messages when rinex2snr or gnssir raised
+# (_process_staged()): gnssir did not run to the end.
+STAGE_FAILED = ("rinex2snr failed:", "gnssir failed:")
+
+# tempfile.mkdtemp() prefix of the scratch folder in the project root.
+SCRATCH_PREFIX = ".recover_missing_days_"
+
+# A scratch folder older than this was left by a run that was killed.
+STALE_SCRATCH_S = 24 * 3600
 
 ARCHIVE = "archive/"
 EXTERNAL_RAW = "external Raw/"
@@ -293,6 +310,28 @@ def days_in_raw_dir(cfg) -> set[date]:
     }
 
 
+def _empty(folder: Path) -> None:
+    """Remove everything in `folder`, keeping the folder."""
+    for entry in folder.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError:
+            pass
+
+
+def _remove_stale_scratch(root: Path, now: float) -> None:
+    """Scratch folders of earlier runs that were killed (SIGKILL, power loss)."""
+    for folder in root.glob(SCRATCH_PREFIX + "*"):
+        try:
+            if folder.is_dir() and now - folder.stat().st_mtime > STALE_SCRATCH_S:
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def _fresh(path: Path, since: float) -> bool:
     try:
         return path.stat().st_mtime >= since - FRESH_SLACK_S
@@ -369,6 +408,9 @@ class Recovery:
                     path.unlink()
                 except OSError:
                     pass
+            # Whatever else the day left in the scratch folder (the
+            # working directory): rinex2snr's copy of the RINEX.
+            _empty(self.scratch)
 
         if has_results(results) and _fresh(results, started):
             marker = self.station.no_data_marker(day)
@@ -377,6 +419,8 @@ class Recovery:
             return "recovered", result.message
 
         if any(_fresh(p, started) for p in self.station.snr_files(day)):
+            if str(result.message).startswith(STAGE_FAILED):
+                return "failed", result.message
             if results.exists() and not _fresh(results, started):
                 return "failed", ("gnssir did not replace the existing "
                                   f"results file: {result.message}")
@@ -516,8 +560,9 @@ def main(argv=None, cfg=None, now: datetime | None = None,
         print("  DRY RUN -- nothing was processed.")
         return 0
 
-    scratch = Path(tempfile.mkdtemp(prefix=".recover_missing_days_",
-                                    dir=str(getattr(cfg, "project_root", PROJECT_DIR))))
+    project_root = Path(getattr(cfg, "project_root", PROJECT_DIR))
+    _remove_stale_scratch(project_root, time.time())
+    scratch = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=str(project_root)))
     outcomes: dict[str, list[int]] = {}
     previous_handlers = {}
     previous_cwd = os.getcwd()
@@ -525,7 +570,8 @@ def main(argv=None, cfg=None, now: datetime | None = None,
         for signum in (signal.SIGTERM, signal.SIGHUP):
             previous_handlers[signum] = signal.signal(signum, _interrupt)
         # gnssrefl drops working copies into the current directory
-        # (and leaves them when rinex2snr fails): keep them in scratch.
+        # and leaves them: keep them in scratch, which recover()
+        # empties after every day.
         os.chdir(str(scratch))
 
         recovery = Recovery(cfg, station, scratch, rinex_factory, gnssir_factory)

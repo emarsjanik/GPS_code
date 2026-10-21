@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -63,7 +64,8 @@ class FakeGnssir:
     """
     Writes what rinex2snr + gnssir write, per day: "ok" an SNR file and
     a results file with arcs, "nodata" only the SNR file (gnssir kept
-    no arc), "noorbit" nothing (rinex2snr had no orbit).
+    no arc), "noorbit" nothing (rinex2snr had no orbit), "crash" the
+    SNR file and then gnssir raised (gnssrefl_processor's message).
     """
 
     def __init__(self, station, behaviour=None, default="ok"):
@@ -76,7 +78,7 @@ class FakeGnssir:
         observation_file = Path(observation_file)
         self.calls.append((day, observation_file, observation_file.exists(), os.getcwd()))
         what = self.behaviour.get(day, self.default)
-        if what in ("ok", "nodata"):
+        if what in ("ok", "nodata", "crash"):
             snr = (self.station.refl_code / str(day.year) / "snr" / self.station.code4
                    / f"{self.station.code4}{doy_of(day):03d}0.{day:%y}.snr66")
             snr.parent.mkdir(parents=True, exist_ok=True)
@@ -85,8 +87,11 @@ class FakeGnssir:
             if what == "ok":
                 results.parent.mkdir(parents=True, exist_ok=True)
                 results.write_text(f"% year doy RH\n{day.year} {doy_of(day)} 19.1\n")
-            elif results.exists():
+            elif what == "nodata" and results.exists():
                 results.unlink()    # gnssrefl 4.1.5 removes it when no arc is kept
+        if what == "crash":
+            return SimpleNamespace(success=False, message=(
+                "gnssir failed: [Errno 2] No such file: gpt_1wA.pickle"))
         return SimpleNamespace(success=what == "ok", message=f"fake {what}")
 
 
@@ -266,6 +271,66 @@ class TestAutomaticMode(RecoverTestCase):
         self.gnssir.behaviour = {}
         self.run_main()
         self.assertEqual(self.processed_days(), [noorbit])
+
+    def test_gnssir_crash_after_the_snr_file_is_failed_not_no_data(self) -> None:
+        # The SNR file is fresh, but gnssir raised: no marker, so the
+        # day is tried again (the shell version checked gnssir's exit
+        # code for this).
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.gnssir.behaviour = {day: "crash"}
+
+        code, out = self.run_main()
+
+        self.assertEqual(code, 0)
+        self.assertFalse(self.station.no_data_marker(day).exists())
+        self.assertIn("failed: gnssir failed: [Errno 2]", out)
+        self.assertIn(f"Failed, tried again next run: {doy_of(day)}", out)
+
+        self.gnssir.calls.clear()
+        self.gnssir.behaviour = {}
+        self.run_main()
+        self.assertEqual(self.processed_days(), [day])
+
+    def test_scratch_folder_is_emptied_after_every_day(self) -> None:
+        # rinex2snr copies the day's RINEX into the working directory
+        # and leaves it there (350-400 MB a day).
+        days = [date(2026, 7, 1), date(2026, 7, 2), date(2026, 7, 3)]
+        for day in days:
+            self.raw(self.external / "Raw", day)
+        seen = []
+
+        class LeavesCopies(FakeGnssir):
+            def process(self, observation_file, day):
+                cwd = Path(os.getcwd())
+                seen.append(sorted(p.name for p in cwd.iterdir()
+                                   if p.suffix == ".rnx" or p.is_dir()))
+                (cwd / f"ABCD00USA_R_{day:%Y%j}0000_01D_01S_MO.rnx").write_bytes(b"x" * 1000)
+                (cwd / "logs").mkdir(exist_ok=True)
+                return super().process(observation_file, day)
+
+        self.gnssir = LeavesCopies(self.station)
+        code, _out = self.run_main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.processed_days(), days)
+        self.assertEqual(seen, [[], [], []])
+        self.assertEqual(self.scratch_dirs(), [])
+
+    def test_stale_scratch_folders_are_removed(self) -> None:
+        old = self.project / ".recover_missing_days_old"
+        new = self.project / ".recover_missing_days_running"
+        for folder in (old, new):
+            folder.mkdir()
+            (folder / "copy.rnx").write_text("x")
+        two_days_ago = time.time() - 2 * 86400
+        os.utime(old, (two_days_ago, two_days_ago))
+        self.raw(self.external / "Raw", date(2026, 7, 1))
+
+        self.run_main()
+
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
 
     def test_convbin_failure_is_failed_and_tried_again(self) -> None:
         day = date(2026, 7, 1)

@@ -15,6 +15,9 @@ products/
 logs/
 archive/
 
+# Scratch folders of maintenance/recover_missing_days.py
+.recover_missing_days_*/
+
 # Database
 database/
 
