@@ -507,9 +507,13 @@ class TestGenerate(unittest.TestCase):
         import station_health as sh
         self.run_main("--source", "noaa")
         want = (datetime(2026, 10, 10), datetime(2026, 11, 8, 23, 50))
-        self.assertEqual(sh._xlsx_column_range(self.out, "time"), want)
-        got = sh._xlsx_column_range_stdlib(self.out, "time")
-        self.assertTrue(all(abs((g - w).total_seconds()) < 1 for g, w in zip(got, want)))
+        column = "NOAA8447435_heightm"
+        times = sh._tide_times(self.out, "time", column)
+        self.assertEqual((len(times), times[0], times[-1]), (30 * 144,) + want)
+        got = sh._tide_times_stdlib(self.out, "time", column)
+        self.assertEqual(len(got), len(times))
+        self.assertTrue(all(abs((g - w).total_seconds()) < 1
+                            for g, w in zip((got[0], got[-1]), want)))
 
     def test_hand_made_spreadsheet_is_never_overwritten(self) -> None:
         self.hand_made(self.out)
