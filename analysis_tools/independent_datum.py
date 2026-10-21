@@ -65,15 +65,29 @@ mean (CO-OPS monthly_mean product). Twelve consecutive whole months,
 so the seasonal cycle cancels. Offline, it is a linear sea-level
 trend times the years since the middle of the epoch (OFFLINE_TRENDS),
 with the spread of the trends of the long-term stations nearby as its
-uncertainty. MHW and MLW are moved by the same amount: the range of
-the tide has not changed measurably over that time.
+uncertainty. That trend is a lower bound rather than a centre: the
+rise has been faster since the 1990s than over the long records, and a
+single year can sit a few cm off any trend. MHW and MLW are moved by
+the same amount: the range of the tide has not changed measurably over
+that time. The epochs of the chosen source, the monthly means and the
+spread are compared; a source on another epoch is left out of the
+spread and named.
 
 BEST ESTIMATE. VDatum at the reflection zone (or offshore) when it
-answers: it is a model, but of the open coast at Marconi. Otherwise
-Chatham, the nearest NAVD88-tied gauge. Chatham sits in a back-barrier
-harbour whose damped low waters raise its mean level by a few cm
-against the open coast (cam compare_gnssr_to_gauge.py). The spread of
-the sources around Marconi is reported as the transfer uncertainty.
+answers: it is a model, but of the open coast at Marconi, and its MHW
+and MLW are Marconi's. Its budget is VDatum's own skill here -- VDatum
+asked at the local CO-OPS stations, against their published MSL --
+and the spread over the VDatum points at the site. Otherwise Chatham,
+the nearest NAVD88-tied gauge, for mean sea level only. Chatham sits
+in a back-barrier harbour whose inlet damps the tide, low waters most
+(cam compare_gnssr_to_gauge.py): its mean level is a few cm above the
+open coast's and its MHW and MLW are not Marconi's at all, so they are
+printed as the harbour's own, with no uncertainty. Its budget is the
+published datum error and, as the transfer to Marconi, half the
+spread of MSL - NAVD88 over the local stations; none of them is on
+the open Atlantic coast (Chatham's harbour, Provincetown on Cape Cod
+Bay, Saquatucket on Nantucket Sound), and much of that spread is in
+their NAVD88 ties rather than in the tide, so it stands in for both.
 
 WHAT IT PRINTS. The datums from each source and where they came from,
 the epoch correction, the best present-day estimate with its
@@ -81,7 +95,8 @@ uncertainty budget, each configured offset minus that estimate (the
 bias it implies), and how long a co-located gauge would have to run
 to measure the GNSS-IR bias to a given uncertainty (calibration_plan;
 protocol in docs/INDEPENDENT_DATUM.md, after Larson et al. 2013,
-2017; Lofgren et al. 2014; Purnell et al. 2020).
+2017; Lofgren et al. 2014; Purnell et al. 2020). --daily-sigma sets
+the daily scatter that table assumes.
 
 Usage (on the station; the machine this was written on could not
 reach NOAA):
@@ -89,13 +104,15 @@ reach NOAA):
     python3 analysis_tools/independent_datum.py \\
         --cache products/refl_code/Files/usgs/independent_datum_cache.json \\
         --json products/refl_code/Files/usgs/independent_datum.json
-    python3 analysis_tools/independent_datum.py --window 2026-08-01 2026-09-16
+    python3 analysis_tools/independent_datum.py --window START END
+        (YYYY-MM-DD; the real overlap's dates are not recorded)
     python3 analysis_tools/independent_datum.py --offline
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import re
@@ -125,9 +142,11 @@ COOPS_DATUM_STATIONS_API = ("https://api.tidesandcurrents.noaa.gov/mdapi/prod/we
 COOPS_MONTHLY_API = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=monthly_mean"
                      "&station={station}&begin_date={begin}&end_date={end}&datum=MSL&units=metric"
                      "&time_zone=gmt&format=json&application=gnssir_station_datum")
-# 0 m on a tidal datum -> its height on NAVD88. Parameter names as in
-# NOAA's own client (noaa-ocs-hydrography/vyperdatum, vdatum_rest_utils.py);
-# a point outside the tidal grids answers t_z = -999999.
+# 0 m on a tidal datum -> its height on NAVD88. Request layout after
+# NOAA's own client (noaa-ocs-hydrography/vyperdatum, vdatum_rest_utils.py),
+# which spells the geoid parameters s_v_goid/t_v_goid; the geoid does not
+# enter a tidal-datum-to-NAVD88 conversion. A point outside the tidal
+# grids answers t_z = -999999.
 VDATUM_API = ("https://vdatum.noaa.gov/vdatumweb/api/convert?s_x={lon:.7f}&s_y={lat:.7f}&s_z=0"
               "&region=contiguous&s_h_frame=NAD83_2011&s_coor=geo&s_v_frame={frame}&s_v_unit=m"
               "&s_v_elevation=height&s_v_geoid=geoid18&t_h_frame=NAD83_2011&t_coor=geo"
@@ -152,7 +171,10 @@ OFFSHORE_M = 1000.0
 # station pages (2026-10-20). "local": within ~30 km of Marconi, so its
 # MSL - NAVD88 counts in the transfer spread; the others are long-term
 # stations shown for the regional picture (and Nantucket is the control
-# station Chatham's datums were reduced with).
+# station Chatham's datums were reduced with). None of the local three
+# is on the open Atlantic coast: Chatham is a back-barrier harbour,
+# Provincetown is on Cape Cod Bay and Saquatucket (Harwich Port) on
+# Nantucket Sound.
 NEARBY_STATIONS = (
     ("8447435", "Chatham, Lydia Cove, MA", True),
     ("8446121", "Provincetown, MA", True),
@@ -237,18 +259,42 @@ MONTHLY_LOOKBACK = 24
 # (Larson et al. 2013, Kachemak Bay), ~2 cm (Larson et al. 2017, Friday
 # Harbor, 10 years), 2.7-2.8 cm (Holden & Larson 2021); the spectral
 # and inverse methods agree for daily means (Purnell et al. 2020).
+# These are sheltered sites. At an exposed one the retrievals scatter
+# far more (Sepulveda et al. 2023, Scripps Pier: 9-18 cm RMS), and
+# Marconi's reflection zone (about 70-220 m out at 5-15 deg) lies
+# around the surf zone, where wave setup moves the mean level with the
+# wave height, storm after storm. --daily-sigma sets a larger value;
+# the days needed grow as its square.
 DAILY_SIGMA_M = 0.025
+DAILY_SIGMA_SOURCE = "sheltered-site literature value"
 # NOAA computes datums for a short-term station by simultaneous
 # comparison with a control station from at least a month of data
 # (Computational Techniques for Tidal Datums Handbook, NOAA Special
 # Publication NOS CO-OPS 2, 2003); a month also spans two spring-neap
 # cycles, over which tide-range-dependent GNSS-IR errors average out.
 MIN_DEPLOYMENT_DAYS = 29
-# How well the reference sensor itself is put on NAVD88 (1 sigma).
+# The pressure logger's own level error over a deployment (1 sigma):
+# the barometric correction (0.5-1 hPa, 5-10 mm), the seawater density
+# that turns pressure into depth (0.1-0.3 % of a few metres, 3-10 mm)
+# and sensor drift; 1-2 cm all told. 0.01 m is the better end: a
+# barometer beside it, the density measured, drift checked before and
+# after.
+GAUGE_SIGMA_M = 0.01
+# How the logger's zero is put on NAVD88 (1 sigma). A logger moored
+# outside the surf zone is never dry, so it cannot be levelled or
+# occupied: its zero comes from the water surface beside it, read
+# against NAVD88 at slack water in calm weather (a staff levelled from
+# an NGS mark, or an RTK pole) while it records, about 2.5 cm a session,
+# averaged over the sessions. An intertidal logger in a pipe can be
+# levelled from a mark at spring low water, but reads only when covered
+# and is inside the surf at times: calm days only.
+TIE_SESSION_M = 0.025
+TIE_SESSIONS = 8
 TIE_OPTIONS = (
-    ("levelled to an NGS bench mark", 0.005),
-    ("static GNSS on its mark (OPUS; NGS 58/59)", 0.02),
-    ("RTK, repeated occupations", 0.03),
+    ("pipe mount levelled from an NGS mark", 0.005),
+    (f"{TIE_SESSIONS} calm slack-water staff/RTK sessions",
+     round(TIE_SESSION_M / math.sqrt(TIE_SESSIONS), 4)),
+    ("1 calm slack-water staff/RTK session", TIE_SESSION_M),
 )
 TARGETS_M = (0.01, 0.02, 0.03)
 
@@ -292,6 +338,8 @@ class Net:
         except (urllib.error.URLError, OSError) as exc:
             self.down[host] = f"{host} unreachable ({getattr(exc, 'reason', exc)})"
             raise Unavailable(self.down[host])
+        except http.client.HTTPException as exc:      # e.g. a body cut short by a proxy
+            raise Unavailable(f"{host} answer broken off ({exc!r})")
         except ValueError as exc:
             raise Unavailable(f"{host} did not return JSON ({exc})")
 
@@ -460,7 +508,10 @@ def query_points(cfg: dict):
     NAVD88 height (water near 0 m), e as the middle of the elevation
     mask and the azimuth as the mean of the azimuth regions -- the
     documented Marconi regions when station.json's point nowhere in
-    particular (MARCONI_AZIMUTH_REGIONS)."""
+    particular (MARCONI_AZIMUTH_REGIONS). The published water level
+    uses only arcs in process_and_plot.sh's 35-125 deg subdaily window
+    (mean about 80 deg); at ~110 m from the antenna the two centres
+    are a few tens of metres apart, well inside one VDatum grid cell."""
     lat = cfg.get("latitude")
     lon = cfg.get("longitude")
     if lat is None or lon is None:
@@ -594,6 +645,7 @@ def coops_record(net: Net, station: str, name: str, local: bool, cache: dict,
         if meta.get("name"):
             rec["label"] = f"CO-OPS {station} {meta['name']}"
         if "lat" in meta:
+            rec["lat"], rec["lon"] = meta["lat"], meta["lon"]
             rec["distance_km"] = round(distance_km(home[0], home[1], meta["lat"], meta["lon"]), 1)
         cache[key] = dict(rec)
         rec["provenance"] = f"live, {rec['retrieved']}"
@@ -636,11 +688,14 @@ def nearby_unlisted(net: Net, home, listed, radius_km: float = LOCAL_RADIUS_KM,
     return found[:limit], how
 
 
-def vdatum_record(net: Net, label: str, lat: float, lon: float, cache: dict, now: datetime) -> tuple:
-    """(record or None, what happened) for one VDatum point."""
+def vdatum_record(net: Net, label: str, lat: float, lon: float, cache: dict, now: datetime,
+                  names=tuple(VDATUM_FRAMES)) -> tuple:
+    """(record or None, what happened) for one VDatum point, asking for
+    the datums in `names` (MSL first)."""
     key = f"vdatum:{lat:.5f},{lon:.5f}"
     datums, why = {}, ""
-    for name, frame in VDATUM_FRAMES.items():
+    for name in names:
+        frame = VDATUM_FRAMES[name]
         try:
             z, bad = parse_vdatum(net.get(VDATUM_API.format(lat=lat, lon=lon, frame=frame)))
         except Unavailable as exc:
@@ -668,6 +723,34 @@ def vdatum_record(net: Net, label: str, lat: float, lon: float, cache: dict, now
         rec["provenance"] = f"cache, retrieved {rec.get('retrieved', '?')}"
         return rec, f"failed ({why}); cache used"
     return None, f"failed ({why})"
+
+
+def vdatum_check(net: Net, sources, cache: dict, now: datetime) -> tuple:
+    """([{"station", "label", "vdatum", "published", "residual"}],
+    [(what, how)]): VDatum's MSL - NAVD88 at each local CO-OPS station
+    whose position is known, minus the station's published value.
+
+    VDatum's own skill on this coast, measured directly: its tidal and
+    NAVD88 surfaces are built from these same stations, so a residual
+    here is the model's error near the site (and the station's own
+    datum error with it). Its RMS is the model term of the budget when
+    VDatum is the estimate."""
+    out, tried = [], []
+    for s in sources:
+        if (s["kind"] != "coops" or not s.get("local") or s.get("superseded")
+                or s.get("discovered") or "lat" not in s):
+            continue
+        rec, how = vdatum_record(net, f"at CO-OPS {s['station']}", s["lat"], s["lon"], cache, now,
+                                 names=("MSL",))
+        if rec and rec["epoch"] != s["epoch"]:
+            how += f"; not compared: the station is on the {s['epoch']} epoch, VDatum {rec['epoch']}"
+            rec = None
+        tried.append((f"VDatum at CO-OPS {s['station']}", how))
+        if rec:
+            out.append({"station": s["station"], "label": s["label"],
+                        "vdatum": rec["datums"]["MSL"], "published": s["datums"]["MSL"],
+                        "residual": round(rec["datums"]["MSL"] - s["datums"]["MSL"], 4)})
+    return out, tried
 
 
 def monthly_rows(net: Net, station: str, begin: date, end: date, cache: dict) -> tuple:
@@ -706,7 +789,7 @@ def sea_level_since_epoch(net: Net, station: str, epoch: str, now: datetime, cac
     found = annual_anomaly(rows, now)
     if found is not None:
         anomaly, (y1, m1), (y2, m2) = found
-        return {"value": round(anomaly, 4), "sigma": None, "how": how,
+        return {"value": round(anomaly, 4), "sigma": None, "how": how, "epoch": epoch,
                 "method": f"observed: mean of {station}'s monthly mean sea level, "
                           f"{y1}-{m1:02d} to {y2}-{m2:02d}, against the {epoch} mean"}
     mid = epoch_midpoint(epoch) or epoch_midpoint(NTDE)
@@ -716,23 +799,28 @@ def sea_level_since_epoch(net: Net, station: str, epoch: str, now: datetime, cac
     return {"value": round(rate / 1000.0 * years, 4),
             "sigma": round((max(rates) - min(rates)) / 2000.0 * years, 4),
             "low": round(min(rates) / 1000.0 * years, 4),
-            "high": round(max(rates) / 1000.0 * years, 4),
+            "high": round(max(rates) / 1000.0 * years, 4), "epoch": epoch,
             "how": how + "; linear trend used" if how != "live" else
                    f"live, but no 12 whole months in the last {MONTHLY_LOOKBACK}; linear trend used",
             "method": (f"trend: {rate:.2f} mm/yr ({OFFLINE_TRENDS[trend_station][2]}, NOAA) x "
                        f"{years:.1f} yr since {mid:.1f}; "
                        + ", ".join(f"{n} {r:.2f}" for r, _, n in OFFLINE_TRENDS.values())
-                       + " mm/yr give the range")}
+                       + " mm/yr give the range; a linear trend is a lower bound, the rise "
+                         "having been faster since the 1990s, and one year can sit a few cm off it")}
 
 
 # ---------------------------------------------------------------------
 # ESTIMATE, COMPARISON, CALIBRATION
 # ---------------------------------------------------------------------
 
-def best_estimate(sources, adjustment: dict) -> dict | None:
+def _half_range(vals):
+    return (max(vals) - min(vals)) / 2.0 if len(vals) >= 2 else None
+
+
+def best_estimate(sources, adjustment: dict, check=None) -> dict | None:
     """The present-day datums at Marconi from the best source, with an
-    uncertainty budget (m, 1 sigma; a component that is not known is
-    left out and named).
+    uncertainty budget for MSL (m, 1 sigma; a component that is not
+    known is left out and named).
 
     Choice: VDatum at the reflection zone, then offshore, then at the
     antenna (it models the open coast at the site), then Chatham, then
@@ -740,10 +828,22 @@ def best_estimate(sources, adjustment: dict) -> dict | None:
     determinations, and stations found by nearby_unlisted, are never
     chosen.
 
-    Budget: the chosen datum's published error; the epoch correction's
-    uncertainty; and the transfer from source to site, taken as half
-    the spread of MSL - NAVD88 over the local sources (VDatum points
-    and the stations within ~30 km)."""
+    Budget for a VDatum pick: VDatum's own error, the RMS of `check`
+    (vdatum_check: VDatum minus the published MSL at the local
+    stations); the epoch correction's uncertainty; and half the spread
+    of MSL - NAVD88 over the VDatum points at the site. Its MHW and MLW
+    are Marconi's.
+
+    Budget for a station pick: the published datum error; the epoch
+    correction's uncertainty; and the transfer from the station to the
+    site, half the spread of MSL - NAVD88 over the local stations. Only
+    MSL is carried to Marconi ("present"): a harbour's MHW and MLW are
+    its own tide, not the open coast's, and are given apart
+    ("station_tide") with no uncertainty.
+
+    Sources on another tidal epoch than the pick are left out of the
+    spread, and a pick on another epoch than the sea-level correction
+    is warned of ("warnings")."""
     usable = [s for s in sources if s and not s.get("superseded") and not s.get("discovered")
               and "MSL" in s["datums"]]
     if not usable:
@@ -755,17 +855,38 @@ def best_estimate(sources, adjustment: dict) -> dict | None:
     local = [s for s in usable if s["kind"] == "coops" and s.get("local")]
     pick = (vd_order + primary + local + usable)[0]
     adj = adjustment["value"]
-    present = {k: round(v + adj, 4) for k, v in pick["datums"].items()}
-    spread = [s["datums"]["MSL"] for s in usable if s.get("local")]
-    transfer = (max(spread) - min(spread)) / 2.0 if len(spread) >= 2 else None
-    parts = {"published datum": pick.get("datum_error"),
-             "epoch correction": adjustment.get("sigma"),
-             "transfer to Marconi": transfer}
+    warnings = []
+    if adjustment.get("epoch") and pick.get("epoch") and pick["epoch"] != adjustment["epoch"]:
+        warnings.append(f"{pick['label']} is on the {pick['epoch']} epoch, the sea-level correction "
+                        f"on {adjustment['epoch']}: present MSL is off by the change between them")
+    same = [s for s in usable if s.get("local") and s.get("epoch") == pick.get("epoch")]
+    other = [s["label"] for s in usable if s.get("local") and s.get("epoch") != pick.get("epoch")]
+    if other:
+        warnings.append(f"left out of the spread, not on the {pick.get('epoch')} epoch: "
+                        + ", ".join(other))
+    station_tide = None
+    if pick["kind"] == "vdatum":
+        spread = [s["datums"]["MSL"] for s in same if s["kind"] == "vdatum"]
+        res = [c["residual"] for c in check or []]
+        present = {k: round(v + adj, 4) for k, v in pick["datums"].items()}
+        parts = {"VDatum model": (math.sqrt(sum(r * r for r in res) / len(res)) if res else None),
+                 "epoch correction": adjustment.get("sigma"),
+                 "spread over the VDatum points": _half_range(spread)}
+    else:
+        spread = [s["datums"]["MSL"] for s in same]
+        present = {"MSL": round(pick["datums"]["MSL"] + adj, 4)}
+        station_tide = {k: round(pick["datums"][k] + adj, 4) for k in ("MHW", "MLW")
+                        if k in pick["datums"]} or None
+        parts = {"published datum": pick.get("datum_error"),
+                 "epoch correction": adjustment.get("sigma"),
+                 "transfer to Marconi": _half_range(spread)}
     known = [v for v in parts.values() if v is not None]
-    return {"source": pick["label"], "epoch_msl": pick["datums"]["MSL"], "present": present,
+    return {"source": pick["label"], "kind": pick["kind"], "epoch_msl": pick["datums"]["MSL"],
+            "present": present, "station_tide": station_tide,
             "uncertainty": round(math.sqrt(sum(v * v for v in known)), 4) if known else None,
             "parts": {k: (round(v, 4) if v is not None else None) for k, v in parts.items()},
-            "spread_n": len(spread)}
+            "spread_n": len(spread), "check_n": len(check or []) if pick["kind"] == "vdatum" else None,
+            "warnings": warnings}
 
 
 def compare_configured(cfg: dict, msl_now: float, msl_window: float | None = None,
@@ -779,7 +900,9 @@ def compare_configured(cfg: dict, msl_now: float, msl_window: float | None = Non
     tide_model_navd88_offset is the mean water level over the overlap
     it was measured in (tide-model heights are zero-mean), so it is set
     against mean sea level over --window when that is known, which
-    takes the season out of the comparison."""
+    takes the season out of the comparison. That holds only for a model
+    run without the seasonal SA/SSA constituents; with them, --window
+    would count the season twice and present MSL is the reference."""
     out = []
     v = cfg.get("water_level_msl_offset")
     if v is None:
@@ -804,18 +927,21 @@ def compare_configured(cfg: dict, msl_now: float, msl_window: float | None = Non
 
 
 def calibration_plan(target: float, sigma_tie: float, sigma_daily: float = DAILY_SIGMA_M,
-                     min_days: int = MIN_DEPLOYMENT_DAYS) -> dict:
+                     min_days: int = MIN_DEPLOYMENT_DAYS,
+                     sigma_gauge: float = GAUGE_SIGMA_M) -> dict:
     """Days of a co-located gauge needed to measure the GNSS-IR bias to
     `target` (m, 1 sigma).
 
     The bias is the mean of daily-mean differences, GNSS-IR minus
     gauge, so its error is sigma_daily / sqrt(n) on top of the gauge's
-    own tie to NAVD88: n = sigma_daily^2 / (target^2 - sigma_tie^2).
-    A tie as uncertain as the target can never get there. Never less
+    tie to NAVD88 and its own level error (GAUGE_SIGMA_M), neither of
+    which averages down: n = sigma_daily^2 / (target^2 - sigma_tie^2 -
+    sigma_gauge^2). A gauge whose tie and own error alone reach the
+    target can never get there. Never less
     than min_days (a month: NOAA's short-term datum practice, and two
     spring-neap cycles). Daily errors that persist with the weather
     make the real need larger, so the month is a floor, not a promise."""
-    budget = target ** 2 - sigma_tie ** 2
+    budget = target ** 2 - sigma_tie ** 2 - sigma_gauge ** 2
     if budget <= 0:
         return {"feasible": False, "days": None, "statistical_days": None}
     n = max(1, math.ceil(sigma_daily ** 2 / budget - 1e-9))
@@ -828,7 +954,7 @@ def calibration_plan(target: float, sigma_tie: float, sigma_daily: float = DAILY
 
 def build_report(cfg: dict, net: Net, cache: dict, now: datetime,
                  stations=NEARBY_STATIONS, window=None, vdatum: bool = True,
-                 discover: bool = True) -> dict:
+                 discover: bool = True, daily_sigma: float | None = None) -> dict:
     """Everything the tool prints, as a dict (also what --json writes)."""
     points = query_points(cfg)
     home = (points[0][1], points[0][2])
@@ -847,12 +973,16 @@ def build_report(cfg: dict, net: Net, cache: dict, now: datetime,
             if rec:
                 rec["discovered"] = True
                 sources.append(rec)
+    check = []
     if vdatum:
         for label, lat, lon in points:
             rec, how = vdatum_record(net, label, lat, lon, cache, now)
             tried.append((f"VDatum {label}", how))
             if rec:
                 sources.append(rec)
+        if any(s["kind"] == "vdatum" for s in sources):
+            check, how = vdatum_check(net, sources, cache, now)
+            tried += how
     for key in OFFLINE_DATUMS:
         if OFFLINE_DATUMS[key].get("superseded"):
             sources.append(offline_record(key))
@@ -860,7 +990,7 @@ def build_report(cfg: dict, net: Net, cache: dict, now: datetime,
                   and not s.get("superseded")), NTDE)
     adjustment = sea_level_since_epoch(net, PRIMARY_STATION, epoch, now, cache)
     tried.append((f"CO-OPS monthly means {PRIMARY_STATION}", adjustment["how"]))
-    best = best_estimate(sources, adjustment)
+    best = best_estimate(sources, adjustment, check)
     msl_window = None
     if window and best:
         begin = date(window[0].year, window[0].month, 1)
@@ -873,13 +1003,16 @@ def build_report(cfg: dict, net: Net, cache: dict, now: datetime,
             msl_window = round(best["epoch_msl"] + anomaly, 4)
     comparisons = (compare_configured(cfg, best["present"]["MSL"], msl_window, bool(window))
                    if best else [])
+    sigma = daily_sigma if daily_sigma is not None else DAILY_SIGMA_M
     plans = [{"tie": label, "sigma_tie": tie,
-              "targets": {f"{t:.2f}": calibration_plan(t, tie) for t in TARGETS_M}}
+              "targets": {f"{t:.2f}": calibration_plan(t, tie, sigma) for t in TARGETS_M}}
              for label, tie in TIE_OPTIONS]
     return {"generated": _stamp(now), "points": points, "sources": sources, "tried": tried,
             "adjustment": adjustment, "best": best, "msl_window": msl_window,
             "window": [str(window[0]), str(window[1])] if window else None,
-            "comparisons": comparisons, "calibration": plans,
+            "comparisons": comparisons, "vdatum_check": check, "calibration": plans,
+            "daily_sigma": {"value": sigma, "source": DAILY_SIGMA_SOURCE if daily_sigma is None
+                            else "--daily-sigma"},
             "hortho_navd88": navd88_hortho(cfg)}
 
 
@@ -924,16 +1057,27 @@ def format_report(rep: dict) -> str:
         L += ["", "No source gave a mean sea level: nothing to compare with."]
         return "\n".join(L)
     p = b["present"]
-    L += ["", f"Present-day datums at Marconi, from {b['source']}:",
+    L += ["", f"Present-day {'datums' if b['kind'] == 'vdatum' else 'mean sea level'} at Marconi, "
+              f"from {b['source']}:",
           f"  MSL {p['MSL']:+.3f} m NAVD88"
           + (f"   MHW {p['MHW']:+.3f}" if "MHW" in p else "")
           + (f"   MLW {p['MLW']:+.3f}" if "MLW" in p else "")]
+    t = b.get("station_tide")
+    if t:
+        L += _wrap("(the station's own " + "   ".join(f"{k} {v:+.3f}" for k, v in t.items())
+                   + ", corrected the same way, are its harbour's tide: its range does not "
+                   "transfer to the open coast at Marconi, and no uncertainty is given for them)", 2)
     parts = ", ".join(f"{k} {v:.3f}" if v is not None else f"{k} unknown" for k, v in b["parts"].items())
-    L += _wrap("uncertainty " + (f"+/-{b['uncertainty']:.3f} m" if b["uncertainty"] is not None
-                                 else "unknown") + f" (1 sigma: {parts})", 2)
-    if b["parts"]["transfer to Marconi"] is None:
+    L += _wrap("uncertainty of MSL " + (f"+/-{b['uncertainty']:.3f} m" if b["uncertainty"] is not None
+                                        else "unknown") + f" (1 sigma: {parts})", 2)
+    if b["kind"] == "vdatum":
+        L += _wrap(f"(VDatum model: RMS of VDatum minus the published MSL at {b['check_n']} local "
+                   "CO-OPS station(s); spread: over the VDatum points at the site)", 2)
+    if b["parts"].get("transfer to Marconi", 0) is None:
         L.append("  (one local source only: the transfer from it to the open coast at Marconi "
                  "is not measured -- a few cm for Chatham's harbour)")
+    for w in b.get("warnings") or []:
+        L += _wrap(f"WARNING: {w}", 2)
     if rep["msl_window"] is not None:
         L.append(f"  MSL over --window {rep['window'][0]}..{rep['window'][1]}: "
                  f"{rep['msl_window']:+.3f} m NAVD88")
@@ -950,25 +1094,34 @@ def format_report(rep: dict) -> str:
                    else f"{'above' if d > 0 else 'below'} it by more than its uncertainty"
                    if u is not None else f"{'above' if d > 0 else 'below'} it")
         L.append(f"  {c['field']}: {verdict}.")
+    missing = [k for k, v in b["parts"].items() if v is None]
+    if u is not None and missing:
+        L += _wrap(f"(that uncertainty leaves out what is not known: {', '.join(missing)})", 2)
     if u is not None and biases and all(abs(c["bias"]) <= u for c in biases):
         L += _wrap(f"So no GNSS-IR absolute bias shows at the +/-{u:.3f} m this estimate "
-                   f"allows; a co-located gauge (below) or VDatum at the site is what "
-                   f"narrows it.", 2)
+                   f"allows; a co-located gauge (below)"
+                   + (" is what narrows it." if b["kind"] == "vdatum" else
+                      " or VDatum at the site is what narrows it."), 2)
     L += ["  Both offsets were measured against the GNSS-IR record (B11), so each difference",
           "  also reads as the GNSS-IR absolute bias when that offset was set: levels read that",
           "  much high (+) or low (-) against NOAA's tidal datums. The NAVD88 water level",
           "  itself (Hortho - RH) does not use either offset.",
-          "", "To measure the GNSS-IR bias directly (co-located gauge; docs/INDEPENDENT_DATUM.md):",
-          f"  days of daily means needed (daily scatter {DAILY_SIGMA_M:.3f} m; never under "
-          f"{MIN_DEPLOYMENT_DAYS}):",
-          f"  {'gauge tied to NAVD88 by (1 sigma, m)':50s}"
+          "", "To measure the GNSS-IR bias directly (co-located gauge; docs/INDEPENDENT_DATUM.md):"]
+    L += _wrap(f"days of daily means needed (daily scatter {rep['daily_sigma']['value']:.3f} m, "
+               f"{rep['daily_sigma']['source']}; gauge's own level {GAUGE_SIGMA_M:.3f} m; never "
+               f"under {MIN_DEPLOYMENT_DAYS}):", 2)
+    L += [f"  {'gauge zero tied to NAVD88 by (1 sigma, m)':50s}"
           + "".join(f"{'+/-' + k + ' m':>11s}" for k in rep["calibration"][0]["targets"])]
     for plan in rep["calibration"]:
         cells = "".join(f"{(str(v['days']) + ' d') if v['feasible'] else 'never':>11s}"
                         for v in plan["targets"].values())
         tie = f"{plan['tie']} ({plan['sigma_tie']:.3f})"
         L.append(f"  {tie:50s}{cells}")
-    L.append("  'never': the tie alone is as uncertain as the target.")
+    L.append("  'never': the tie and the gauge's own error alone reach the target.")
+    if rep["daily_sigma"]["source"] != "--daily-sigma":
+        L += _wrap("The daily scatter is that of sheltered sites; on this exposed beach it is "
+                   "likely larger (Sepulveda et al. 2023), and the days grow as its square: "
+                   "--daily-sigma sets it.", 2)
     return "\n".join(L)
 
 
@@ -1003,9 +1156,15 @@ def main(argv=None) -> int:
     p.add_argument("--json", default=None, help="also write the report as JSON to this file")
     p.add_argument("--window", nargs=2, metavar=("START", "END"), default=None,
                    help="YYYY-MM-DD YYYY-MM-DD: the overlap tide_model_navd88_offset was measured "
-                        "in, so it is compared with mean sea level over the same days")
+                        "in, so it is compared with mean sea level over the same days (for a "
+                        "tide model run without the seasonal SA/SSA terms)")
     p.add_argument("--no-vdatum", action="store_true", help="skip the VDatum requests")
+    p.add_argument("--daily-sigma", type=float, default=None, metavar="M",
+                   help=f"daily-mean GNSS-IR minus gauge scatter (m) for the calibration table "
+                        f"(default {DAILY_SIGMA_M}, a sheltered-site literature value)")
     args = p.parse_args(argv)
+    if args.daily_sigma is not None and not args.daily_sigma > 0:
+        p.error("--daily-sigma must be above 0")
 
     window = None
     if args.window:
@@ -1021,7 +1180,7 @@ def main(argv=None) -> int:
         print("  (no station.json read: the documented Marconi position and heights are used)")
     cache = load_cache(args.cache)
     rep = build_report(cfg, Net(online=not args.offline), cache, datetime.now(timezone.utc),
-                       window=window, vdatum=not args.no_vdatum)
+                       window=window, vdatum=not args.no_vdatum, daily_sigma=args.daily_sigma)
     print(format_report(rep))
     if args.cache and not args.offline:
         save_cache(Path(args.cache), cache)

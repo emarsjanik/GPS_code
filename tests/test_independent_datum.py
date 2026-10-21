@@ -13,6 +13,7 @@ host is unreachable.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
 import sys
@@ -90,12 +91,21 @@ def monthly(year_months, msl_of=lambda y, m: 0.12):
 LAST_12 = [(2025, m) for m in range(10, 13)] + [(2026, m) for m in range(1, 10)]
 
 
-class Router:
-    """A fake fetch_json: answers by URL and records every request."""
+OFFSHORE_S_Y = f"s_y={idt.query_points(MARCONI)[2][1]:.7f}&"
+CHATHAM_S_Y = "s_y=41.6885080&"
 
-    def __init__(self, vdatum_zone=0.061, down=(), http_404=(), monthly_answer=None):
+
+class Router:
+    """A fake fetch_json: answers by URL and records every request.
+    VDatum gives vdatum_zone at the site (vdatum_offshore 1 km out, when
+    set) and vdatum_chatham at Chatham's position."""
+
+    def __init__(self, vdatum_zone=0.061, down=(), http_404=(), monthly_answer=None,
+                 vdatum_offshore=None, vdatum_chatham=0.025):
         self.calls = []
         self.vdatum_zone = vdatum_zone
+        self.vdatum_offshore = vdatum_offshore
+        self.vdatum_chatham = vdatum_chatham
         self.down = set(down)
         self.http_404 = set(http_404)
         self.monthly_answer = monthly_answer if monthly_answer is not None else monthly(LAST_12)
@@ -109,7 +119,10 @@ class Router:
             if "s_y=41.8928243&" in url:            # the antenna, on the bluff
                 return {"t_z": "-999999", "message": "outside tidal grid"}
             frame = url.split("s_v_frame=")[1].split("&")[0]
-            return {"t_z": str(self.vdatum_zone + {"LMSL": 0.0, "MHW": 0.70, "MLW": -0.75}[frame])}
+            z = (self.vdatum_chatham if CHATHAM_S_Y in url else
+                 self.vdatum_offshore if self.vdatum_offshore is not None and OFFSHORE_S_Y in url
+                 else self.vdatum_zone)
+            return {"t_z": str(z + {"LMSL": 0.0, "MHW": 0.70, "MLW": -0.75}[frame])}
         if "monthly_mean" in url:
             return self.monthly_answer
         if "stations.json?type=datums" in url:
@@ -285,13 +298,41 @@ class TestLiveReport(unittest.TestCase):
         self.assertAlmostEqual(by["tide_model_navd88_offset"]["bias"], 0.09 - 0.181)
         self.assertIn("--window does that", by["tide_model_navd88_offset"]["note"])
 
-    def test_transfer_spread_is_over_the_local_sources(self) -> None:
-        rep, _ = report()
-        # local: VDatum zone and offshore 0.061, Chatham 0.018, Provincetown
-        # 0.030, Saquatucket -0.106 (the far stations, -0.08, do not count)
-        self.assertAlmostEqual(rep["best"]["parts"]["transfer to Marconi"], (0.061 + 0.106) / 2)
-        self.assertEqual(rep["best"]["spread_n"], 5)     # no VDatum value at the antenna
-        self.assertIsNone(rep["best"]["parts"]["published datum"])     # VDatum: not known
+    def test_vdatum_budget_is_its_own_skill_and_site_spread(self) -> None:
+        rep, router = report(Router(vdatum_offshore=0.051))
+        b = rep["best"]
+        # VDatum at Chatham 0.025 against the published 0.018; zone 0.061
+        # and offshore 0.051 (no value at the antenna); the harbours'
+        # spread (Saquatucket -0.106) does not enter
+        self.assertEqual(rep["vdatum_check"], [{"station": "8447435",
+                                                "label": "CO-OPS 8447435 Chatham, Lydia Cove",
+                                                "vdatum": 0.025, "published": 0.018,
+                                                "residual": 0.007}])
+        self.assertEqual(b["parts"], {"VDatum model": 0.007, "epoch correction": None,
+                                      "spread over the VDatum points": 0.005})
+        self.assertEqual((b["spread_n"], b["check_n"]), (2, 1))
+        self.assertAlmostEqual(b["uncertainty"], (0.007 ** 2 + 0.005 ** 2) ** 0.5, places=4)
+        # only Chatham's position is known (the others' metadata is empty);
+        # it is asked for LMSL alone
+        at_chatham = [u for u in router.calls if CHATHAM_S_Y in u]
+        self.assertEqual(len(at_chatham), 1)
+        self.assertIn("s_v_frame=LMSL&", at_chatham[0])
+        self.assertIn("VDatum model: RMS of VDatum minus the published MSL at 1 local",
+                      idt.format_report(rep).replace("\n    ", " "))
+
+    def test_vdatum_far_from_the_harbours_does_not_widen_the_budget(self) -> None:
+        near = report(Router(vdatum_zone=0.018, vdatum_chatham=0.020))[0]["best"]
+        far = report(Router(vdatum_zone=0.100, vdatum_chatham=0.020))[0]["best"]
+        self.assertEqual(near["uncertainty"], far["uncertainty"])
+        self.assertAlmostEqual(far["uncertainty"], 0.002)
+
+    def test_vdatum_without_a_check_names_what_is_left_out(self) -> None:
+        rep, _ = report(Router(vdatum_chatham=-999999))       # no tidal grid at Chatham
+        self.assertIsNone(rep["best"]["parts"]["VDatum model"])
+        self.assertEqual(rep["vdatum_check"], [])
+        text = " ".join(idt.format_report(rep).split())
+        self.assertIn("VDatum model unknown", text)
+        self.assertIn("leaves out what is not known: VDatum model", text)
 
     def test_requests_carry_the_right_parameters(self) -> None:
         _, router = report()
@@ -304,6 +345,8 @@ class TestLiveReport(unittest.TestCase):
         self.assertEqual({u.split("s_v_frame=")[1].split("&")[0] for u in vd}, {"LMSL", "MHW", "MLW"})
         # the antenna answers -999999 for LMSL, so its MHW/MLW are not asked
         self.assertEqual(sum("s_y=41.8928243&" in u for u in vd), 1)
+        # VDatum is also asked at Chatham, for LMSL alone (vdatum_check)
+        self.assertEqual(sum(CHATHAM_S_Y in u for u in vd), 1)
         mm = [u for u in router.calls if "monthly_mean" in u]
         self.assertEqual(len(mm), 1)
         for part in ("datum=MSL", "units=metric", "time_zone=gmt", "station=8447435",
@@ -386,6 +429,55 @@ class TestFallbacks(unittest.TestCase):
         self.assertIn("not tried", tried["CO-OPS datums 8443970"])
         self.assertIn("no offline values", tried["CO-OPS datums 8443970"])
 
+    def test_offline_budget_and_harbour_tide(self) -> None:
+        rep, _ = report(Router(down={"api.tidesandcurrents.noaa.gov", "vdatum.noaa.gov"}))
+        b = rep["best"]
+        self.assertEqual(b["parts"]["published datum"], 0.012)
+        self.assertAlmostEqual(b["uncertainty"], 0.066, places=3)
+        # Chatham's MHW and MLW are its harbour's, not Marconi's: kept apart
+        self.assertEqual(set(b["present"]), {"MSL"})
+        self.assertAlmostEqual(b["station_tide"]["MHW"], 0.704 + rep["adjustment"]["value"])
+        self.assertAlmostEqual(b["station_tide"]["MLW"], -0.710 + rep["adjustment"]["value"])
+        text = " ".join(idt.format_report(rep).split())
+        self.assertIn("Present-day mean sea level at Marconi, from CO-OPS 8447435", text)
+        self.assertIn("does not transfer to the open coast at Marconi", text)
+        self.assertIn("uncertainty of MSL +/-0.066 m", text)
+        self.assertIn("or VDatum at the site is what narrows it", text)
+
+    def test_verdict_lines(self) -> None:
+        rep, _ = report()
+        rep["best"]["uncertainty"] = 0.05
+        rep["comparisons"][0]["bias"] = 0.02
+        rep["comparisons"][1]["bias"] = -0.08
+        text = idt.format_report(rep)
+        self.assertIn("water_level_msl_offset: within the independent height's own uncertainty.",
+                      text)
+        self.assertIn("tide_model_navd88_offset: below it by more than its uncertainty.", text)
+        self.assertNotIn("So no GNSS-IR absolute bias shows", text)
+        rep["comparisons"][1]["bias"] = -0.04
+        self.assertIn("a co-located gauge (below) is what narrows it",
+                      " ".join(idt.format_report(rep).split()))
+
+    def test_epochs_are_compared(self) -> None:
+        new = {"key": "coops:x", "kind": "coops", "station": "8447435", "label": "new epoch",
+               "datums": {"MSL": 0.08}, "epoch": "2002-2020", "local": True}
+        old = {"key": "coops:y", "kind": "coops", "station": "8446121", "label": "old epoch",
+               "datums": {"MSL": -0.10}, "epoch": "1983-2001", "local": True}
+        b = idt.best_estimate([new, old], {"value": 0.05, "sigma": 0.01, "epoch": "1983-2001"})
+        self.assertEqual(b["spread_n"], 1)                # the old-epoch station left out
+        self.assertIsNone(b["parts"]["transfer to Marconi"])
+        self.assertEqual(len(b["warnings"]), 2)
+        self.assertIn("sea-level correction on 1983-2001", b["warnings"][0])
+        self.assertIn("old epoch", b["warnings"][1])
+
+    def test_broken_off_answer_falls_back(self) -> None:
+        def fetch(url):
+            raise http.client.IncompleteRead(b"{\"dat")
+        net = idt.Net(fetch)
+        with self.assertRaisesRegex(idt.Unavailable, "broken off"):
+            net.get("https://vdatum.noaa.gov/x")
+        self.assertEqual(net.down, {})
+
     def test_http_error_does_not_mark_the_host_down(self) -> None:
         rep, router = report(Router(http_404={"8446121"}))
         tried = dict(rep["tried"])
@@ -448,16 +540,27 @@ class TestCalibrationPlan(unittest.TestCase):
 
     def test_days_needed(self) -> None:
         # (0.025^2) / (0.01^2 - 0.005^2) = 8.3 -> 9 days, floored at a month
-        plan = idt.calibration_plan(0.01, 0.005)
+        plan = idt.calibration_plan(0.01, 0.005, sigma_gauge=0.0)
         self.assertEqual(plan["statistical_days"], 9)
         self.assertEqual(plan["days"], idt.MIN_DEPLOYMENT_DAYS)
-        self.assertEqual(idt.calibration_plan(0.01, 0.005, min_days=1)["days"], 9)
-        self.assertEqual(idt.calibration_plan(0.005, 0.0, sigma_daily=0.05, min_days=1)["days"], 100)
+        self.assertEqual(idt.calibration_plan(0.01, 0.005, min_days=1, sigma_gauge=0.0)["days"], 9)
+        self.assertEqual(idt.calibration_plan(0.005, 0.0, sigma_daily=0.05, min_days=1,
+                                              sigma_gauge=0.0)["days"], 100)
+        # the gauge's own 0.01 m: 0.025^2 / (0.02^2 - 0.005^2 - 0.01^2) = 2.3 -> 3
+        self.assertEqual(idt.calibration_plan(0.02, 0.005)["statistical_days"], 3)
 
     def test_a_tie_as_uncertain_as_the_target_never_gets_there(self) -> None:
         self.assertFalse(idt.calibration_plan(0.02, 0.02)["feasible"])
         self.assertFalse(idt.calibration_plan(0.01, 0.03)["feasible"])
         self.assertTrue(idt.calibration_plan(0.03, 0.02)["feasible"])
+        # nor a perfect tie when the gauge alone is as uncertain as the target
+        self.assertFalse(idt.calibration_plan(0.01, 0.0)["feasible"])
+
+    def test_ties_are_ones_a_moored_logger_can_have(self) -> None:
+        sigmas = dict((label, tie) for label, tie in idt.TIE_OPTIONS)
+        self.assertAlmostEqual(sigmas[f"{idt.TIE_SESSIONS} calm slack-water staff/RTK sessions"],
+                               idt.TIE_SESSION_M / idt.TIE_SESSIONS ** 0.5, places=4)
+        self.assertFalse(any("static GNSS" in label for label in sigmas))
 
 
 class TestCommandLine(unittest.TestCase):
@@ -482,6 +585,25 @@ class TestCommandLine(unittest.TestCase):
         self.assertIn("never", text)
         self.assertEqual(rep["best"]["epoch_msl"], 0.018)
         self.assertEqual(len(rep["calibration"]), len(idt.TIE_OPTIONS))
+        self.assertEqual(rep["daily_sigma"], {"value": idt.DAILY_SIGMA_M,
+                                              "source": idt.DAILY_SIGMA_SOURCE})
+        self.assertIn("--daily-sigma sets it", " ".join(text.split()))
+
+    def test_daily_sigma_option(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            out_json = Path(td) / "report.json"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                idt.main(["--offline", "--no-vdatum", "--daily-sigma", "0.06",
+                          "--station-json", str(Path(td) / "none.json"), "--json", str(out_json)])
+            rep = json.loads(out_json.read_text())
+        self.assertEqual(rep["daily_sigma"], {"value": 0.06, "source": "--daily-sigma"})
+        # 0.06^2 / (0.02^2 - 0.005^2 - 0.01^2) = 13.1 -> 14 days (levelled pipe mount)
+        self.assertEqual(rep["calibration"][0]["targets"]["0.02"]["statistical_days"], 14)
+        self.assertIn("daily scatter 0.060 m, --daily-sigma", " ".join(buf.getvalue().split()))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                idt.main(["--offline", "--daily-sigma", "0"])
 
     def test_bad_window_is_refused(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):

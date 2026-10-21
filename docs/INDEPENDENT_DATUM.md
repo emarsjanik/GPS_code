@@ -42,7 +42,15 @@ python3 analysis_tools/independent_datum.py \
   `tide_model_navd88_offset` was measured in. That offset is a mean
   over a few weeks, and sea level has a seasonal cycle of a few cm.
   With the window, the offset is compared with mean sea level over the
-  same days, from Chatham's monthly means.
+  same days, from Chatham's monthly means. The dates are not recorded
+  anywhere; the older tide file named in `merge_tide_files.py`
+  (`…_20260715-20260831.xlsx`) is a hint, not a record. Use the window
+  only if the tide model was run without the seasonal SA and SSA
+  constituents (EOT20 has them): a model that carries the season
+  would have it counted twice.
+- `--daily-sigma M` sets the daily GNSS-IR minus gauge scatter that
+  the calibration table assumes (default 0.025 m, from sheltered
+  sites; see "How long").
 - `--offline` uses no network at all.
 
 It takes a minute or two: twenty to thirty small requests, each with a
@@ -63,8 +71,8 @@ mark sheets:
 | ID | Station | Used for |
 |---|---|---|
 | 8447435 | Chatham, Lydia Cove | the estimate when VDatum does not answer; the monthly means |
-| 8446121 | Provincetown | spread around Marconi |
-| 8447495 | Saquatucket Harbor (historical) | spread around Marconi |
+| 8446121 | Provincetown (Cape Cod Bay) | spread around Marconi |
+| 8447495 | Saquatucket Harbor, Harwich Port (Nantucket Sound; historical) | spread around Marconi |
 | 8449130 | Nantucket Island | regional picture; Chatham's control station |
 | 8447930 | Woods Hole | regional picture |
 | 8443970 | Boston | regional picture |
@@ -84,7 +92,12 @@ out at 61°), and 1 km offshore. VDatum's tidal grids stop at the
 shoreline, so the antenna on its bluff will probably get no answer.
 The two seaward points are the ones that count. VDatum models the open
 coast at Marconi itself, so its answer is used as the estimate
-whenever it gives one.
+whenever it gives one, MHW and MLW included. Its uncertainty is then
+measured, not borrowed from the harbours: the tool also asks VDatum
+for MSL at each local CO-OPS station whose position NOAA returns, and
+the RMS of VDatum minus the published value is the "VDatum model"
+term. Half the spread over the VDatum points at the site is the other
+term, with the epoch correction.
 
 **The epoch.** Tidal datums are means over the National Tidal Datum
 Epoch, 1983–2001 (Gill & Schultz 2001). Sea level has risen since.
@@ -98,8 +111,16 @@ months back. The tool looks back up to 24 months for one, and prints
 which months it used.
 
 When the monthly means cannot be read, a linear trend stands in. The
-default is Nantucket's 4.01 mm/yr. The range shown runs to Boston's
-2.94 mm/yr.
+default is Nantucket's 4.01 mm/yr (Chatham's control station). The
+range shown runs to Boston's 2.94 mm/yr. A linear trend over a long
+record is a lower bound for the rise since 1992: the rise has been
+faster since the 1990s, and any one year can sit a few cm off the
+trend. The ±σ (half the range) is a size, not an interval centred on
+the truth.
+
+The tool compares the epochs of the chosen source, of the monthly
+means and of the spread. A source on another epoch (NOAA is moving to
+2002–2020) is left out of the spread and named in a warning.
 
 **Offline values.** These are used when NOAA cannot be reached. They
 are stored in the script with their source and the date they were
@@ -139,6 +160,13 @@ The first run on the station is therefore the first live test. The
 tests (`tests/test_independent_datum.py`) feed the tool answers shaped
 like the real ones, with no network.
 
+MHW and MLW below are each harbour's own tide. Chatham's inlet damps
+the tide, low waters most, so they are not Marconi's (whose lows were
+about −1.0 m against Chatham's −0.5 m in Sep 2026, camera
+`compare_gnssr_to_gauge.py`). The tool prints them apart from the
+Marconi estimate, with no uncertainty; only VDatum gives MHW and MLW
+at Marconi.
+
 | Offline value (heights above MLLW, m) | MSL | NAVD88 | MSL − NAVD88 | MHW − NAVD88 | MLW − NAVD88 | Source |
 |---|---|---|---|---|---|---|
 | 8447435 Chatham, Sep 2015–Aug 2017 | 0.778 | 0.760 | **+0.018** | +0.704 | −0.710 | bench mark sheet, published 2020-05-20; datum error 0.012 m |
@@ -146,9 +174,16 @@ like the real ones, with no network.
 | 8447495 Saquatucket Harbor, May–Sep 1993 | 0.682 | 0.788 | −0.106 | +0.432 | −0.703 | bench mark sheet, published 2003-04-21 |
 
 The two Chatham determinations differ by 6 cm, and Saquatucket is 12 cm
-from Chatham. MSL − NAVD88 is not one number around the outer Cape.
-That is why the tool reports the spread of the local sources as a
-"transfer" uncertainty, and why VDatum at the site is worth having.
+from Chatham. None of the local stations is on the open Atlantic
+coast: Chatham is a back-barrier harbour, Provincetown is on Cape Cod
+Bay and Saquatucket (Harwich Port) on Nantucket Sound, a different
+water body and tidal regime. Almost all of the 6 cm between the
+Chatham sheets is in the NAVD88 tie (0.816 → 0.760 m above MLLW),
+while MSL moved 0.771 → 0.778 m. So the spread is as much the
+uncertainty of the stations' NAVD88 ties as of the tide. The tool
+reports half of it as the "transfer" term when a station is the
+estimate, and it stands in for both. It is not used when VDatum is the
+estimate, which is why VDatum at the site is worth having.
 
 ### What the offline numbers say
 
@@ -156,6 +191,8 @@ That is why the tool reports the spread of the local sources as a
 Present MSL at Marconi (from Chatham): +0.156 m NAVD88   (+/-0.066 m, 1 sigma)
     epoch +0.018, plus +0.138 m of sea-level rise since 1992.5
     (+0.101 m at Boston's trend)
+    budget: published datum 0.012, epoch correction 0.018, transfer 0.062
+    (no MHW or MLW at Marconi: Chatham's are its harbour's)
 water_level_msl_offset     +0.100  ->  -0.056 m against it
 tide_model_navd88_offset   +0.090  ->  -0.066 m against it
 ```
@@ -184,8 +221,10 @@ A datum transferred from a harbour 23 km away can only be good to a
 few cm. The published GNSS-IR validations reach about 2 cm because
 they compare against a gauge at the site:
 
-- Larson et al. 2013a (Onsala, Friday Harbor) and 2013b (Kachemak
-  Bay): daily mean sea level within 2.3 cm.
+- Larson et al. 2013a (Onsala, Friday Harbor): single retrievals
+  within 4.8 cm RMS at Onsala and about 10 cm at Friday Harbor.
+- Larson et al. 2013b (Kachemak Bay): daily mean sea level within
+  2.3 cm.
 - Larson et al. 2017: ten years against the co-located NOAA gauge at
   Friday Harbor, with daily means at about 2 cm and monthly at 1.3 cm.
 - Löfgren et al. 2014: five sites with co-located gauges.
@@ -206,45 +245,75 @@ Dec 2024 to Mar 2025 is the right kind of instrument. Its level was
 only relative to its own mean, though: that is the part a datum tie
 supplies.
 
+The logger's own level is good to about 1–2 cm over a deployment: the
+barometric correction (0.5–1 hPa, 5–10 mm), the seawater density that
+turns pressure into depth (0.1–0.3 % of a few metres, 3–10 mm) and
+sensor drift. The tool takes 1 cm (`GAUGE_SIGMA_M`), the better end:
+a barometer beside it, the density measured (CTD cast or the logger's
+own temperature and a salinity), drift checked before and after. This
+term does not average down with more days.
+
 **A staff or stilling pipe read by RTK** works only in calm weather on
-this beach. Treat it as a spot check.
+this beach. Treat it as a spot check, or as the tie below.
 
 ### 2. The tie to NAVD88
 
-The tie is the whole point. The tool's last table shows what each kind
-of tie can reach.
+The tie is the whole point. A moored logger is never dry, so nothing
+on it can be levelled or occupied with GNSS. Its zero has to come from
+the water surface beside it, at times when that surface is flat:
 
-| Tie | 1σ | Notes |
+| Tie (`TIE_OPTIONS`) | 1σ | How |
 |---|---|---|
-| Levelled to an NGS bench mark | ~5 mm | The only tie that also checks the GEOID18 part of the antenna height (OPUS ±0.061 m, mostly geoid). |
-| Static GNSS on the sensor's mark (OPUS; NGS 58/59 guidelines) | ~2 cm | Shares GEOID18 with the antenna height. It measures the GNSS-IR's own bias (reflector height, phase centre, refraction, sea state) but not the geoid. |
-| RTK, repeated occupations | ~3 cm | Good for a first look, not for a ±2 cm answer. |
+| Calm slack-water sessions, 8 of them | ~9 mm | At high or low slack water in calm weather (Hs under about 0.5 m, buoy 44008), read the still-water level at the water's edge against NAVD88 for 10–15 min: a staff levelled from an NGS bench mark, or an RTK pole. Each session gives the logger's zero to about 2.5 cm; 8 sessions average to about 9 mm. Log the times to the second; the logger's level is taken over the same minutes. |
+| One such session | ~2.5 cm | A first look, not a ±2 cm answer. |
+| Pipe mount levelled from an NGS mark | ~5 mm | A logger in a pipe on the low-tide terrace, its mount levelled from a bench mark at spring low water. It reads only when covered, and it is inside the surf at times: use calm days only. |
+
+A GNSS buoy (PPK) moored beside the logger in calm spells is another
+way to read the surface; its per-session error should be measured
+before it is put in the table. Levelling from a bench mark is the only
+tie that also checks the GEOID18 part of the antenna height (OPUS
+±0.061 m, mostly geoid); an RTK tie shares GEOID18 with the antenna
+and so measures the GNSS-IR's own bias (reflector height, phase
+centre, refraction, sea state) but not the geoid.
 
 ### 3. How long
 
 At least **29 days**. That is a lunar month and two spring–neap cycles,
 and it is NOAA's practice for datums at a short-term station (NOAA
-2003). The statistics alone need far less: with a daily scatter of
-2.5 cm and a levelled tie, a ±1 cm answer takes 9 days. The month is there because
-GNSS-IR errors depend on tide range (the height-rate correction) and on
-sea state, and those need to average out.
+2003). The month is there because GNSS-IR errors depend on tide range
+(the height-rate correction) and on sea state, and those need to
+average out.
 
-| Gauge tied by | ±0.01 m | ±0.02 m | ±0.03 m |
+The statistics need n = σ_daily² / (target² − σ_tie² − σ_gauge²)
+days. The default σ_daily, 2.5 cm, comes from sheltered sites (Kachemak
+Bay, Friday Harbor, Lake Taupō). Marconi is exposed: its reflection
+zone (about 70–220 m out at 5–15°) lies around the surf zone, where
+wave setup moves the mean level with Hs, and errors persist through a
+storm. At an exposed site the retrievals scatter far more (Sepúlveda
+et al. 2023, Scripps Pier: 9–18 cm RMS). Run the tool with
+`--daily-sigma` at a value from this station's own record, for example
+the RMS of de-meaned daily GNSS-IR minus Chatham daily means; the days
+grow as its square.
+
+| Gauge zero tied by (σ_gauge 0.01 m) | ±0.01 m | ±0.02 m | ±0.03 m |
 |---|---|---|---|
-| levelling (0.005) | 29 d | 29 d | 29 d |
-| static GNSS (0.02) | never | never | 29 d |
-| RTK (0.03) | never | never | never |
+| pipe mount, levelled (0.005) | never | 29 d (3 at σ_daily 0.025; 10 at 0.05) | 29 d |
+| 8 slack-water sessions (0.009) | never | 29 d (3; 12 at 0.05) | 29 d |
+| 1 slack-water session (0.025) | never | never | 29 d (4; 15 at 0.05) |
 
-"Never" means the tie alone is as uncertain as the target.
+"Never" means the tie and the gauge's own error alone reach the
+target. A ±1 cm answer needs a gauge better than 1 cm, which a
+pressure logger on this beach is not.
 
 ### 4. The analysis
 
 1. Take daily means of complete days, from both the gauge and the
    GNSS-IR spline. Leave out days with QC failures or runup readings
    (`water_level_qc.py`).
-2. The bias is the median daily difference (GNSS-IR minus gauge). Its
+2. The bias is the mean daily difference (GNSS-IR minus gauge). Its
    error is the scatter over the square root of the number of days,
-   combined with the tie error.
+   combined with the tie error and the gauge's own. (A median resists
+   outliers better, but its error is about 1.25 times larger.)
 3. Break the bias down by significant wave height (buoy 44008) and by
    spring versus neap tides. A bias that grows with Hs is a sea-state
    effect (Purnell et al. 2020; Sepúlveda et al. 2023), not a datum
@@ -272,15 +341,27 @@ MSL at Marconi with an uncertainty you accept:
 - **`water_level_msl_offset`** would become that MSL. On the public
   7-day plot, the blue level curve and every departure value would move
   by (old − new). The format would not change.
-- **`tide_model_navd88_offset`** would become MSL over the tide model's
-  overlap, or simply present MSL. The model's heights are zero-mean.
+- **`tide_model_navd88_offset`** would become present annual MSL. Not
+  MSL over one window: for a model without the seasonal SA and SSA
+  constituents, that would put one window's seasonal anomaly into
+  every other month's comparison, the monthly CSV's tide column
+  included; and a model run with them (EOT20 has them) already
+  carries the season. Check which it was before using `--window`.
   This moves:
   - the internal `usgs_vs_tide.png` tide curve;
   - the "Mean offset" and "RAW RMS" lines of
     `compare_to_tide_deviation.py`;
   - the tide column of the monthly CSV.
-- **Nothing else moves:** not the NAVD88 spline, the monthly water
-  levels, the TWL export or the camera DEM.
+- **Nothing else in this repository moves:** not the NAVD88 spline,
+  the monthly water levels, the TWL export or the GNSS-IR-driven
+  camera DEM.
+- **The camera repository has its own copies of the same +0.09 m:**
+  `process_historical.py` (`DEFAULT_DATUM_OFFSET`, passed to
+  `extract_elevation_contours.py` as `--vertical-datum-offset`),
+  `historical_forcing.py` (`MSL_TO_NAVD88`) and `adcp_to_navd88.py`
+  (`MSL_TO_NAVD88`, the `--offset` fallback). The historical,
+  tide-model-driven DEMs move by (new − 0.09) only if those copies are
+  changed too.
 - Record the source and date in `station.json` (a `_comment`) and in
   `station_datum.py`.
 - Do not re-derive either offset from the GNSS-IR again.
