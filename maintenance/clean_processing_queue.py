@@ -30,11 +30,15 @@ If the file is missing but results are absent, the entry is KEPT and
 reported: that combination means data was genuinely lost, which is
 worth investigating rather than quietly tidying away.
 
-Note on the day mapping: this station records a UTC day per file but
-names files by local date, so station_20260722.um980 contains the
-UTC day that begins during 2026-07-22 local. Both candidate
-day-of-year values are checked rather than assuming which convention
-applies.
+Note on the day mapping: station_manager.py records one UTC day per
+file and names it for that UTC day (station_20260722.um980 holds
+2026-07-22 00:00-24:00 UTC; _raw_file_for_day()), so the results of
+the file's own day are the ones checked. This used to say files were
+named by local date and also accepted the NEXT day's results (review
+B22). That could remove the entry of a day that really was lost
+whenever the following day had results -- the one case this script
+must keep and report. The results file name is zero-padded, as
+gnssrefl writes it (008.txt); unpadded, days 1-99 never matched.
 
 DRY RUN by default.
 
@@ -76,7 +80,7 @@ def station_code() -> str:
 
 def results_exist(doy: int, year: int, code: str) -> bool:
     base = PROJECT_DIR / "products" / "refl_code" / str(year) / "results" / code
-    if (base / f"{doy}.txt").exists():
+    if (base / f"{doy:03d}.txt").exists():   # gnssrefl zero-pads (008.txt)
         return True
     # A day with no usable retrievals is legitimately empty, not
     # missing -- recover_missing_days.sh records this explicitly.
@@ -124,17 +128,20 @@ def main() -> int:
             keep_no_results.append(f"{filename} (no date in filename)")
             continue
 
-        d = datetime.strptime(m.group(1), "%Y%m%d")
+        try:
+            d = datetime.strptime(m.group(1), "%Y%m%d")
+        except ValueError:
+            keep_no_results.append(f"{filename} (no valid date in filename)")
+            continue
         doy = int(d.strftime("%j"))
         year = d.year
 
-        # Check the file's own day and the next, since a file named
-        # for a local date holds the UTC day that starts within it.
-        if results_exist(doy, year, code) or results_exist(doy + 1, year, code):
+        # The file's own UTC day only (see "Note on the day mapping").
+        if results_exist(doy, year, code):
             removable.append((entry_id, filename, retries or 0))
         else:
             keep_no_results.append(
-                f"{filename} (file gone AND no results for doy {doy}/{doy+1})")
+                f"{filename} (file gone AND no results for {d:%Y-%m-%d}, doy {doy})")
 
     print("=" * 66)
     print("  processing_queue cleanup")

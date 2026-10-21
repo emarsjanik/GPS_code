@@ -13,8 +13,8 @@
 #
 # What this does, in order:
 #   1. Quick sanity check (venv active, required tools present)
-#   2. Auto-recovers any previously-missed days whose data still
-#      exists in external storage, if configured
+#   2. Auto-recovers any previously-missed days from the raw files
+#      kept in archive/ or in external storage, if configured
 #   3. Converts any new raw data to RINEX and runs GNSS-IR analysis
 #      on it
 #   4. Finds the most recent gap-free stretch of results and
@@ -254,8 +254,8 @@ if [ -f "$PROJECT_DIR/maintenance/recover_missing_days.sh" ]; then
     # Last year too, so a late-December day is still recoverable in
     # January -- but only once the record has a last year (its results
     # folder exists), and never before gnss_record_first_day: those days
-    # are not part of the record, and each recovered day is a ~400 MB
-    # copy plus rinex2snr and gnssir.
+    # are not part of the record, and each recovered day is a convbin
+    # run plus rinex2snr and gnssir.
     this_year=$(date -u +%Y)
     first_year=0
     [[ "$RECORD_FIRST_DAY" =~ ^[0-9]{4}- ]] && first_year=$((10#${RECORD_FIRST_DAY:0:4}))
@@ -279,8 +279,8 @@ if [ -f "$PROJECT_DIR/maintenance/recover_missing_days.sh" ]; then
     step_end "$recover_rc" "recover_missing_days.sh failed for$recover_failed -- see the log"
 else
     echo "  recover_missing_days.sh not found -- skipping this step."
-    echo "  (This is only needed if you use external storage for"
-    echo "  automatic daily exports; safe to skip otherwise.)"
+    echo "  (It recovers missed days from the raw files in archive/"
+    echo "  or external storage; the rest of this run does not need it.)"
     step_skip "maintenance/recover_missing_days.sh not found"
 fi
 

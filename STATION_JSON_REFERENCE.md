@@ -183,6 +183,9 @@ project's own station the result was stark:
 | 120-150 deg | 0.719 m |
 | 150-175 deg | 1.253 m |
 
+(Made with each arc's raw RH, before review B18; `--raw-rh`
+reproduces that comparison.)
+
 Trimming the mask from `[353, 360, 0, 173]` to `[353, 360, 0, 130]`
 discarded 9% of arcs and improved agreement against an independent
 tide model by 18%:
@@ -625,6 +628,7 @@ So let it run once before you point `tide_model_file` at it.
 | `manager_retry_delay_seconds` | number | How long to wait before retrying after a failed recording chunk, during continuous operation. Default `60.0`. |
 | `health_check_interval_seconds` | number | How often to record a system health snapshot (disk space, CPU, memory) during continuous operation. Default `3600.0` (1 hour). |
 | `export_retry_window_days` | integer | How many days to keep retrying a day's export to external storage before giving up (this exists because a day's orbit product routinely isn't published for 1-2 days after the fact, so an immediate export would predictably fail). Default `3`. |
+| `manager_pipeline_in_background` | boolean | At each UTC midnight, run the processing pipeline (then the health snapshot, then the export) in a background thread while the next day records. Default `true`. `false` restores the old order, in which nothing was recorded while the pipeline ran (a gap of several minutes after 00:00 UTC every day); it is there only as a way back if the background run ever causes trouble. |
 
 ---
 
