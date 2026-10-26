@@ -20,9 +20,11 @@ Run with:
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -682,14 +684,216 @@ class TestExternalStorageExport(StationManagerTestCase):
         )
         self.assertTrue(exported.exists())
         self.assertEqual(exported.read_text(), "real data")
-        self.assertFalse(self.cfg.products_dir.exists())  # moved, not copied
+        # Copied, not moved: products/ is the whole water-level record.
+        self.assertEqual(
+            (self.cfg.products_dir / "refl_code" / "marker.txt").read_text(),
+            "real data",
+        )
 
-    def test_flattening_removes_year_and_station_nesting(self) -> None:
+    def test_export_never_moves_or_deletes_the_record(self) -> None:
+        # products/ used to be moved file by file and then rmtree'd:
+        # the next night gnss_record found one day of results, refused
+        # to shrink the record, and the frozen years were gone.
+        refl = self.cfg.products_dir / "refl_code"
+        record_inputs = [
+            refl / "2025" / "results" / "usgs" / "300.txt",
+            refl / "2026" / "results" / "usgs" / "190.txt",
+            refl / "Files" / "usgs" / "usgs_spline_out.txt",
+            refl / "Files" / "usgs" / "usgs_2025_spline_frozen.txt",
+            refl / "Files" / "usgs" / "fit" / "record_status.json",
+            refl / "input" / "usgs.json",
+            refl / "2026" / "snr" / "usgs" / "usgs1900.26.snr66",
+        ]
+        for path in record_inputs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(path.name)
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        for path in record_inputs:
+            with self.subTest(path=path.relative_to(refl)):
+                self.assertEqual(path.read_text(), path.name)
+        exported = self.external_root / "Products" / "20260709"
+        self.assertEqual(
+            (exported / "Files" / "usgs" / "usgs_spline_out.txt").read_text(),
+            "usgs_spline_out.txt",
+        )
+        self.assertEqual(
+            (exported / "results" / "2026" / "usgs" / "190.txt").read_text(),
+            "190.txt",
+        )
+
+    def _by_mtime(self):
+        # File times are set by hand in these tests, and a ctime cannot
+        # be: judge "changed" by mtime alone (the ctime half is tested
+        # in test_file_put_in_place_with_an_old_mtime_is_exported).
+        return unittest.mock.patch.object(
+            station_manager.StationManager, "_changed_time",
+            staticmethod(lambda st: st.st_mtime))
+
+    def _marker_time(self) -> float:
+        marker = self.external_root / "Products" / self.manager._EXPORT_MARKER
+        return float(marker.read_text())
+
+    def test_next_export_copies_only_what_changed(self) -> None:
+        # products/ now stays, so a daily export copies only the files
+        # changed since the last one, not the whole record again.
+        results = self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        old_day = results / "189.txt"
+        old_day.write_text("day 189")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        # The marker on the external storage holds when that export
+        # started: a file last changed well before it is not copied
+        # again, one changed after it is.
+        started = self._marker_time()
+        os.utime(old_day, (started - 3600, started - 3600))
+        new_day = results / "190.txt"
+        new_day.write_text("day 190")
+        os.utime(new_day, (started + 1, started + 1))
+
+        with self._by_mtime():
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        second = self.external_root / "Products" / "20260709" / "results" / "2026" / "usgs"
+        self.assertTrue((second / "190.txt").exists())
+        self.assertFalse((second / "189.txt").exists())
+        self.assertTrue(
+            (self.external_root / "Products" / "20260708" / "results"
+             / "2026" / "usgs" / "189.txt").exists()
+        )
+        self.assertFalse(
+            (self.external_root / "Products" / "20260709" / "other").exists()
+        )
+
+    def test_change_just_before_the_last_export_is_copied_again(self) -> None:
+        # File times lag time.time() (the kernel's coarse clock), some
+        # filesystems keep whole seconds, and the clock can be stepped
+        # back: a file changed just after an export started can carry a
+        # time just before it. It must be copied again, not missed.
+        results = self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        day = results / "190.txt"
+        day.write_text("first version")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        day.write_text("rewritten during the export")
+        just_before = self._marker_time() - 0.005
+        os.utime(day, (just_before, just_before))
+
+        with self._by_mtime():
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (self.external_root / "Products" / "20260709" / "results" / "2026"
+             / "usgs" / "190.txt").read_text(),
+            "rewritten during the export",
+        )
+
+    def test_marker_ahead_of_the_clock_copies_everything(self) -> None:
+        # The clock was an hour ahead when the last export ran (a wrong
+        # clock at boot, before NTP) and has been set back since: by
+        # that marker every file changed in the hour since is skipped,
+        # and nothing would copy them again.
+        results = self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        day = results / "190.txt"
+        day.write_text("day 190")
+        marker = self.external_root / "Products" / self.manager._EXPORT_MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{time.time() + 3600:.3f}\n")
+
+        with self._by_mtime(), self.assertLogs("station.manager", level="WARNING") as logs:
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (self.external_root / "Products" / "20260709" / "results" / "2026"
+             / "usgs" / "190.txt").read_text(),
+            "day 190",
+        )
+        self.assertIn("after the clock now", "\n".join(logs.output))
+        self.assertLessEqual(self._marker_time(), time.time())
+
+    def test_file_put_in_place_with_an_old_mtime_is_exported(self) -> None:
+        # A file moved in (a rename keeps its mtime), restored with
+        # cp -p / rsync -a, or copied with shutil.copy2 (as the RINEX
+        # staging does) has an mtime from before the last export, but
+        # it has never been exported. Its ctime is fresh.
+        results = self.cfg.products_dir / "refl_code" / "2025" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        (results / "001.txt").write_text("day 1")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        restored = results / "300.txt"
+        restored.write_text("restored from a backup")
+        long_ago = self._marker_time() - 300 * 86400
+        os.utime(restored, (long_ago, long_ago))
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (self.external_root / "Products" / "20260709" / "results" / "2025"
+             / "usgs" / "300.txt").read_text(),
+            "restored from a backup",
+        )
+
+    def test_new_external_disk_gets_the_whole_record(self) -> None:
+        # What was last exported is kept on the external storage, not
+        # in products/: an empty (new, swapped, wiped) disk is given
+        # the whole record, not only what changed since the old disk
+        # was last written.
+        spline = self.cfg.products_dir / "refl_code" / "Files" / "usgs" / "usgs_spline_out.txt"
+        spline.parent.mkdir(parents=True, exist_ok=True)
+        spline.write_text("the whole record")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 8))
+
+        new_disk = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, new_disk, True)
+        self.manager._external_storage_path = new_disk
+        with self._by_mtime():
+            self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        self.assertEqual(
+            (new_disk / "Products" / "20260709" / "Files" / "usgs"
+             / "usgs_spline_out.txt").read_text(),
+            "the whole record",
+        )
+
+    def test_file_vanishing_during_the_export_is_skipped(self) -> None:
+        # A file listed by os.walk and gone before it is copied (a
+        # temporary file, a staged RINEX file being cleaned up; here a
+        # dangling symlink) used to abort the whole export, so the
+        # files after it were not copied and the marker not written.
+        refl = self.cfg.products_dir / "refl_code"
+        (refl / "2026" / "rinex" / "usgs").mkdir(parents=True, exist_ok=True)
+        os.symlink(str(self.root / "gone.rnx"),
+                   str(refl / "2026" / "rinex" / "usgs" / "staged.rnx"))
+        results = refl / "2026" / "results" / "usgs"
+        results.mkdir(parents=True, exist_ok=True)
+        (results / "190.txt").write_text("day 190")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Products" / "20260709"
+        self.assertEqual(
+            (exported / "results" / "2026" / "usgs" / "190.txt").read_text(), "day 190"
+        )
+        self.assertFalse((exported / "rinex" / "2026" / "usgs" / "staged.rnx").exists())
+        self.assertTrue(
+            (self.external_root / "Products" / self.manager._EXPORT_MARKER).exists()
+        )
+
+    def test_flattening_keeps_the_year_and_drops_refl_code(self) -> None:
         # Confirmed against a real, live products/ directory: results
-        # normally nest as <year>/results/<station>/<file> --
-        # flattening should collapse the year layer while keeping the
-        # station code, so files from different station codes never
-        # collide under the same filename.
+        # normally nest as <year>/results/<station>/<file>. The
+        # refl_code/ level goes; the year stays (a results file's name
+        # carries no year), and so does the station code, so files from
+        # different years or station codes never collide.
         results_dir = (
             self.cfg.products_dir / "refl_code" / "2026" / "results" / "usgs"
         )
@@ -700,10 +904,54 @@ class TestExternalStorageExport(StationManagerTestCase):
 
         exported = (
             self.external_root / "Products" / "20260709"
-            / "results" / "usgs" / "190.txt"
+            / "results" / "2026" / "usgs" / "190.txt"
         )
         self.assertTrue(exported.exists())
         self.assertEqual(exported.read_text(), "day 190 results")
+
+    def test_same_day_of_year_in_two_years_both_exported(self) -> None:
+        # Collapsing the year let 2025's 292.txt and 2026's 292.txt
+        # land on the same results/usgs/292.txt: with products/ now
+        # copied whole, the first export kept one year of every day of
+        # year the record has twice.
+        refl = self.cfg.products_dir / "refl_code"
+        for year in ("2025", "2026"):
+            path = refl / year / "results" / "usgs" / "292.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{year} day 292")
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Products" / "20260709" / "results"
+        for year in ("2025", "2026"):
+            with self.subTest(year=year):
+                self.assertEqual(
+                    (exported / year / "usgs" / "292.txt").read_text(),
+                    f"{year} day 292",
+                )
+
+    def test_same_day_check_spline_does_not_replace_the_record(self) -> None:
+        # analysis_tools/ultra_rapid_check.py keeps its own REFL_CODE
+        # beside refl_code/, with its own few-day
+        # Files/usgs/usgs_spline_out.txt. Flattened to the same
+        # Files/usgs/ it overwrote the whole-record spline in the
+        # export (whichever os.walk reached last won).
+        for tree, text in (("refl_code", "the whole record"),
+                           ("refl_code_ultra", "four days, ultra-rapid")):
+            path = self.cfg.products_dir / tree / "Files" / "usgs" / "usgs_spline_out.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        self.manager._export_day_to_external_storage(date(2026, 7, 9))
+
+        exported = self.external_root / "Products" / "20260709" / "Files"
+        self.assertEqual(
+            (exported / "usgs" / "usgs_spline_out.txt").read_text(), "the whole record"
+        )
+        self.assertEqual(
+            (exported / "refl_code_ultra" / "usgs" / "usgs_spline_out.txt").read_text(),
+            "four days, ultra-rapid",
+        )
 
     def test_multiple_station_codes_kept_separate_not_collided(self) -> None:
         # Confirmed real scenario: if a station's own code was ever
@@ -718,7 +966,7 @@ class TestExternalStorageExport(StationManagerTestCase):
 
         self.manager._export_day_to_external_storage(date(2026, 7, 9))
 
-        exported_root = self.external_root / "Products" / "20260709" / "results"
+        exported_root = self.external_root / "Products" / "20260709" / "results" / "2026"
         self.assertEqual(
             (exported_root / "usgs" / "197.txt").read_text(), "usgs results"
         )
@@ -738,7 +986,7 @@ class TestExternalStorageExport(StationManagerTestCase):
 
         exported = (
             self.external_root / "Products" / "20260709"
-            / "results" / "usgs" / "failQC" / "bad_arc.txt"
+            / "results" / "2026" / "usgs" / "failQC" / "bad_arc.txt"
         )
         self.assertTrue(exported.exists())
 
@@ -822,10 +1070,21 @@ class TestExternalStorageExport(StationManagerTestCase):
         # Confirms the real ordering in run()'s daily cycle: pipeline
         # runs, then health check, then export -- not export first,
         # which could move data pipeline.py still needed. Recording
-        # itself is irrelevant to this test, so it's replaced with a
-        # no-op to reach the ordering-relevant calls immediately.
+        # itself is irrelevant to this test: the first day ends at
+        # once, to reach the ordering-relevant calls immediately, and
+        # the next one records until stopped, as the real recorder
+        # does while the pipeline runs in the background.
         self.manager._today = lambda: date(2026, 7, 9)
-        self.manager._record_day = lambda day: None
+        days_recorded = []
+
+        def record_day(day):
+            if days_recorded:
+                deadline = time.monotonic() + 5.0
+                while not self.manager._stop_requested and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            days_recorded.append(day)
+
+        self.manager._record_day = record_day
 
         raw_file = self.cfg.raw_dir / "station_20260709.um980"
         raw_file.write_bytes(b"fake raw data")
@@ -907,7 +1166,10 @@ class TestLifecycle(StationManagerTestCase):
         self.manager.run()
 
         self.assertEqual(pipeline_runs["count"], 2)
-        self.assertEqual(len(FakeReceiver.record_calls), 2)
+        # day3 keeps recording while day2's pipeline runs in the
+        # background, until that run asks for the stop: at least the
+        # two chunks of day1 and day2, usually more.
+        self.assertGreaterEqual(len(FakeReceiver.record_calls), 2)
         self.assertFalse(self.manager._running)
         self.assertTrue(self.manager._stop_requested)
 
@@ -932,6 +1194,371 @@ class TestLifecycle(StationManagerTestCase):
 
         self.assertTrue(self.fake_pipeline.shutdown_called)
         self.assertFalse(self.manager._initialized)
+
+
+# ------------------------------------------------------------
+# Recording continues while the pipeline runs (review B8)
+# ------------------------------------------------------------
+
+class BlockingPipeline(FakePipeline):
+    """
+    A FakePipeline whose run() holds until `release` is set (or a
+    timeout), counting the chunks of `watch_day` that the recorder
+    wrote meanwhile. Tracks how many runs overlap.
+    """
+
+    def __init__(self, watch_day: date, hold_s: float = 5.0):
+        super().__init__()
+        self.watch = f"{watch_day:%Y%m%d}"
+        self.hold_s = hold_s
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.chunks_at_start = None
+        self.chunks_during_run = None
+        self.active = 0
+        self.max_active = 0
+        self._count_lock = threading.Lock()
+
+    def watched_chunks(self) -> int:
+        return sum(
+            self.watch in call["filename"].name
+            for call in list(FakeReceiver.record_calls)
+        )
+
+    def run(self) -> PipelineSummary:
+        with self._count_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if self.run_calls == 0:
+                self.chunks_at_start = self.watched_chunks()
+                self.started.set()
+                self.release.wait(self.hold_s)
+                self.chunks_during_run = (
+                    self.watched_chunks() - self.chunks_at_start
+                )
+            return super().run()
+        finally:
+            with self._count_lock:
+                self.active -= 1
+            self.finished.set()
+
+
+class TestPipelineInBackground(StationManagerTestCase):
+
+    day1 = date(2026, 7, 9)
+    day2 = date(2026, 7, 10)
+    day3 = date(2026, 7, 11)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.manager._seconds_until_next_utc_midnight = lambda: 9999.0
+
+    def _use(self, pipeline, station=None) -> None:
+        self.cfg.station = dict(station or {})
+        self.manager = station_manager.StationManager(
+            cfg=self.cfg, db=self.db, pipeline=pipeline
+        )
+        self.manager._make_receiver = lambda: FakeReceiver(cfg=self.cfg)
+        self.manager.initialize()
+        self.manager._seconds_until_next_utc_midnight = lambda: 9999.0
+        self.manager._chunk_seconds = 0.0
+        self.manager._retry_delay_seconds = 0.0
+
+    def _days_by_chunk_count(self, *days_and_chunks) -> None:
+        """
+        _today() follows the chunks recorded: the first n1 chunks are
+        day 1, the next n2 day 2, ...; the last day never ends.
+        """
+
+        def fake_today():
+            done = len(FakeReceiver.record_calls)
+            for day, chunks in days_and_chunks[:-1]:
+                if done < chunks:
+                    return day
+                done -= chunks
+            return days_and_chunks[-1][0]
+
+        self.manager._today = fake_today
+
+    def _stop_when(self, predicate, timeout_s: float = 10.0) -> None:
+        """Stop between chunks once `predicate()` holds (or on timeout)."""
+
+        original = self.manager._record_one_chunk
+        deadline = time.monotonic() + timeout_s
+
+        def record(raw_file, duration):
+            original(raw_file, duration)
+            if predicate() or time.monotonic() > deadline:
+                self.manager.stop()
+            else:
+                time.sleep(0.001)
+
+        self.manager._record_one_chunk = record
+
+    def test_defaults_to_background(self) -> None:
+        self._use(FakePipeline())
+        self.assertTrue(self.manager._pipeline_in_background)
+
+    def test_station_json_can_restore_inline_order(self) -> None:
+        self._use(FakePipeline(), {"manager_pipeline_in_background": False})
+        self.assertFalse(self.manager._pipeline_in_background)
+
+    def test_next_day_records_while_pipeline_runs(self) -> None:
+        # The fix itself: the pipeline started at day1's rollover
+        # holds until the recorder has written a chunk of day2. With
+        # the old inline run nothing records until run() returns, so
+        # the pipeline would hold for its full timeout and count none.
+        pipeline = BlockingPipeline(watch_day=self.day2)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+
+        def released_and_done():
+            if (
+                pipeline.started.is_set()
+                and pipeline.watched_chunks() > pipeline.chunks_at_start
+            ):
+                pipeline.release.set()
+            return pipeline.finished.is_set()
+
+        self._stop_when(released_and_done)
+
+        self.manager.run()
+
+        self.assertEqual(pipeline.run_calls, 1)
+        self.assertGreaterEqual(pipeline.chunks_during_run, 1)
+        day2_files = {
+            c["filename"].name for c in FakeReceiver.record_calls
+            if "20260710" in c["filename"].name
+        }
+        self.assertEqual(day2_files, {"station_20260710.um980"})
+
+    def test_inline_mode_records_nothing_while_pipeline_runs(self) -> None:
+        # The way back ("manager_pipeline_in_background": false) is
+        # the old order: no chunk of day2 while day1's pipeline runs.
+        pipeline = BlockingPipeline(watch_day=self.day2, hold_s=0.2)
+        self._use(pipeline, {"manager_pipeline_in_background": False})
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+        self._stop_when(lambda: pipeline.finished.is_set())
+
+        self.manager.run()
+
+        self.assertEqual(pipeline.chunks_during_run, 0)
+        self.assertEqual(len(FakeReceiver.record_calls), 2)
+
+    def test_health_and_export_follow_the_pipeline_in_the_thread(self) -> None:
+        pipeline = BlockingPipeline(watch_day=self.day2)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+
+        order = []
+        original_health = self.manager._health_check
+        original_export = self.manager._export_day_to_external_storage
+
+        def health():
+            order.append(("health", pipeline.finished.is_set()))
+            original_health()
+
+        def export(day):
+            order.append(("export", day))
+            original_export(day)
+
+        self.manager._health_check = health
+        self.manager._export_day_to_external_storage = export
+
+        def released_and_done():
+            if pipeline.started.is_set():
+                pipeline.release.set()
+            return len(order) >= 2
+
+        self._stop_when(released_and_done)
+
+        self.manager.run()
+
+        self.assertEqual(order, [("health", True), ("export", self.day1)])
+
+    def test_stop_waits_for_the_pipeline_in_progress(self) -> None:
+        # A stop asked for while the background run is busy must not
+        # let run() return (and shutdown() close the database) under it.
+        pipeline = BlockingPipeline(watch_day=self.day2)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1))
+
+        def stop_then_release_late():
+            if not pipeline.started.is_set():
+                return False
+            # Released only after run() has seen the stop.
+            threading.Timer(0.3, pipeline.release.set).start()
+            return True
+
+        self._stop_when(stop_then_release_late)
+
+        self.manager.run()
+
+        self.assertTrue(pipeline.finished.is_set())
+        self.assertIsNone(self.manager._rollover_thread)
+        self.manager.shutdown()
+        self.assertTrue(pipeline.shutdown_called)
+
+    def test_a_busy_pipeline_delays_the_next_day_never_overlaps(self) -> None:
+        # day1's run holds past day2's rollover; day2's run waits for
+        # it, so the two never run at once, and both days are exported
+        # in order.
+        pipeline = BlockingPipeline(watch_day=self.day3)
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1), (self.day3, 1))
+
+        exported = []
+        self.manager._export_day_to_external_storage = exported.append
+
+        def release_on_day3_then_done():
+            if pipeline.watched_chunks() >= 1:
+                pipeline.release.set()
+            return len(exported) >= 2
+
+        self._stop_when(release_on_day3_then_done)
+
+        self.manager.run()
+
+        self.assertEqual(pipeline.run_calls, 2)
+        self.assertEqual(pipeline.max_active, 1)
+        self.assertEqual(exported, [self.day1, self.day2])
+
+    def test_system_exit_in_the_pipeline_is_logged_recording_goes_on(self) -> None:
+        # gnssrefl calls sys.exit() on some error paths. In the thread
+        # that must not end the day's work silently, nor reach the
+        # recorder; the next day's work still runs.
+        class ExitingPipeline(FakePipeline):
+            def run(self):
+                if self.run_calls == 0:
+                    self.run_calls += 1
+                    raise SystemExit("gnssrefl gave up")
+                return super().run()
+
+        pipeline = ExitingPipeline()
+        self._use(pipeline)
+        self._days_by_chunk_count((self.day1, 1), (self.day2, 1), (self.day3, 1))
+        self._stop_when(lambda: pipeline.run_calls >= 2 and len(FakeReceiver.record_calls) >= 3)
+
+        with self.assertLogs("station.manager", level="ERROR") as logs:
+            self.manager.run()
+
+        self.assertEqual(pipeline.run_calls, 2)
+        self.assertTrue(any("gnssrefl gave up" in line for line in logs.output))
+        self.assertFalse(self.manager._running)
+
+
+class _WritingReceiver(FakeReceiver):
+    """A FakeReceiver that really appends bytes, as record_raw() does."""
+
+    def record_raw(self, filename, duration, append=False, enable_logging=False, **kwargs):
+        result = super().record_raw(filename, duration, append, enable_logging)
+        with open(filename, "ab" if append else "wb") as handle:
+            handle.write(b"\xaa" * 1000)
+        return result
+
+
+class TestRealPipelineInBackground(StationManagerTestCase):
+    """
+    The real Pipeline and a real SQLite Database, shared with the
+    manager, run in the background thread (only convbin and gnssrefl
+    are faked), while the recorder appends to today's raw file.
+    """
+
+    def test_real_pipeline_processes_the_closed_day_while_today_records(self) -> None:
+        from pipeline import Pipeline
+
+        closed_day = date(2020, 1, 1)
+        today = datetime.now(timezone.utc).date()
+        closed_file = self.cfg.raw_dir / f"station_{closed_day:%Y%m%d}.um980"
+        today_file = self.cfg.raw_dir / f"station_{today:%Y%m%d}.um980"
+
+        def today_chunks() -> int:
+            return sum(
+                c["filename"] == today_file for c in list(FakeReceiver.record_calls)
+            )
+
+        seen = {"today_chunks_during_convert": None, "converted": []}
+        converted = threading.Event()
+        root = self.root
+
+        class FakeRinex:
+            def convert(self, raw_path):
+                seen["converted"].append(raw_path.name)
+                before = today_chunks()
+                deadline = time.monotonic() + 5.0
+                while today_chunks() <= before and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                seen["today_chunks_during_convert"] = today_chunks() - before
+                converted.set()
+                return SimpleNamespace(
+                    observation_file=root / "rinex" / f"{raw_path.stem}.obs",
+                    navigation_file="", sbas_file="", success=True,
+                    convbin_version="fake", message="ok",
+                )
+
+            def verify(self, result):
+                return True
+
+        class FakeGnssir:
+            def process(self, observation_file, day):
+                return SimpleNamespace(
+                    reflector_height=19.0, soil_moisture=None, snow_depth=None,
+                    quality_score=1.0, output_directory=str(root / "products"),
+                    success=True, runtime_seconds=0.0, message="ok",
+                )
+
+            def verify(self, result):
+                return True
+
+        class TestPipeline(Pipeline):
+            def _initialize_processors(self):
+                self._rinex = FakeRinex()
+                self._gnssir = FakeGnssir()
+
+        pipeline = TestPipeline(cfg=self.cfg, db=self.db)
+        manager = station_manager.StationManager(
+            cfg=self.cfg, db=self.db, pipeline=pipeline
+        )
+        manager._make_receiver = lambda: _WritingReceiver(cfg=self.cfg)
+        manager.initialize()
+        manager._seconds_until_next_utc_midnight = lambda: 9999.0
+        manager._chunk_seconds = 0.0
+        manager._today = lambda: closed_day if not FakeReceiver.record_calls else today
+
+        original = manager._record_one_chunk
+        deadline = time.monotonic() + 10.0
+
+        def record(raw_file, duration):
+            original(raw_file, duration)
+            if raw_file == closed_file:
+                # Closed long ago, so the pipeline's "written in the
+                # last 15 min" rule (for files without today's date)
+                # does not hold it back in this test.
+                old = time.time() - 3600
+                os.utime(closed_file, (old, old))
+            if (converted.is_set() and manager._last_summary is not None
+                    and today_chunks() >= 2) or time.monotonic() > deadline:
+                manager.stop()
+            else:
+                time.sleep(0.001)
+
+        manager._record_one_chunk = record
+
+        manager.run()
+
+        # The closed day went through the real pipeline and was archived ...
+        self.assertEqual(seen["converted"], [closed_file.name])
+        self.assertTrue((self.cfg.archive_dir / closed_file.name).exists())
+        self.assertFalse(closed_file.exists())
+        self.assertEqual(manager._last_summary.files_processed, 1)
+        # ... while today's file kept growing in raw/, never touched.
+        self.assertGreaterEqual(seen["today_chunks_during_convert"], 1)
+        self.assertTrue(today_file.exists())
+        self.assertEqual(today_file.stat().st_size, 1000 * today_chunks())
+        # The health snapshot ran in the thread on the shared database.
+        self.assertIsNotNone(manager._last_health_check)
 
 
 # ------------------------------------------------------------

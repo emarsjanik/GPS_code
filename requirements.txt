@@ -14,8 +14,11 @@
 #     The version in Ubuntu's apt repositories is a DIFFERENT fork
 #     without the Unicore/UM980 support this project needs.
 
-# The GNSS-IR analysis engine this whole project wraps.
-gnssrefl
+# The GNSS-IR analysis engine this whole project wraps. Pinned: the
+# code relies on 4.1.5's argument and output file names, and a newer
+# release changes the water levels. Upgrade deliberately (and change
+# GNSSREFL_VERSION in install.sh with it).
+gnssrefl==4.1.5
 
 # Serial communication with the receiver.
 pyserial

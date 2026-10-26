@@ -51,6 +51,12 @@ VENV_DIR="$PROJECT_DIR/gnssrefl_venv"
 RTKLIB_SRC_DIR="$PROJECT_DIR/.rtklib_src"
 LOCAL_BIN_DIR="$HOME/.local/bin"
 
+# The gnssrefl this project was checked against (gnssrefl_processor.py,
+# gnss_record.py rely on its argument names and output file names).
+# Keep in step with requirements.txt; upgrade deliberately, comparing
+# a few days processed by both with gnssir/subdaily -extension first.
+GNSSREFL_VERSION="4.1.5"
+
 # ----------------------------------------------------------------
 # Small, reusable UI helpers -- kept dependency-free (no external
 # progress-bar libraries) so this script works on a totally bare
@@ -296,13 +302,20 @@ source "$VENV_DIR/bin/activate"
 
 if python3 -c "import gnssrefl" >/dev/null 2>&1; then
     installed_version=$(python3 -c "import importlib.metadata; print(importlib.metadata.version('gnssrefl'))" 2>/dev/null)
-    ok "gnssrefl already installed (version ${installed_version:-unknown})"
+    if [ "${installed_version:-}" = "$GNSSREFL_VERSION" ]; then
+        ok "gnssrefl already installed (version $installed_version)"
+    else
+        # Left as it is: changing the gnssrefl under a running station
+        # changes its water levels. Install $GNSSREFL_VERSION by hand
+        # (pip install gnssrefl==$GNSSREFL_VERSION) if that is wanted.
+        warn "gnssrefl ${installed_version:-unknown} is installed; this project was checked against $GNSSREFL_VERSION"
+    fi
 else
     run_with_spinner "Upgrading pip" \
         pip install --upgrade pip --quiet
 
     if run_with_spinner "Installing gnssrefl (this can take a few minutes)" \
-        pip install gnssrefl --quiet; then
+        pip install "gnssrefl==$GNSSREFL_VERSION" --quiet; then
         ok "gnssrefl installed"
     else
         fail "gnssrefl installation failed -- see the output above."

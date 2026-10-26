@@ -52,6 +52,7 @@ _here = Path(__file__).resolve().parent
 PROJECT_DIR = _here.parent if _here.name == "diagnostics" else _here
 sys.path.insert(0, str(PROJECT_DIR / "analysis_tools"))
 import gnss_record  # noqa: E402
+import run_status  # noqa: E402
 from gnss_record import results_days  # noqa: E402
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
@@ -308,6 +309,9 @@ def check_processing_currency(station_code: str, since=None) -> None:
 #     camera frame the record does not cover, so a truncated or stale
 #     record must show up here, not only days later on the camera side.)
 # ------------------------------------------------------------------
+STATUS_STALE_HOURS = 36  # gnss_record.py update writes record_status.json nightly
+
+
 def check_water_level_record(station_code: str, since=None) -> None:
     base = PROJECT_DIR / "products" / "refl_code"
     days = list(results_days(base, station_code, since))
@@ -339,6 +343,17 @@ def check_water_level_record(station_code: str, since=None) -> None:
         st = json.loads((files / gnss_record.FIT_SUBDIR / gnss_record.STATUS_NAME).read_text())
     except (OSError, ValueError):
         st = {}
+    # The status is only as new as the last update that wrote it: an
+    # update that never ran, or stopped before writing it (another one
+    # holding the lock), leaves the night before's ok=True and arc
+    # statistics in place.
+    written = parse_ts(str(st.get("time") or ""))
+    age_h = (utcnow() - written).total_seconds() / 3600 if written else None
+    if age_h is not None and age_h > STATUS_STALE_HOURS:
+        record(WARN, "record", f"{gnss_record.STATUS_NAME} was last written "
+                              f"{written:%Y-%m-%d %H:%M}Z, {age_h / 24:.1f} days ago: the "
+                              f"nightly update has not run since, so what it says (and the "
+                              f"arc statistics) is that night's")
     if st and not st.get("ok", True):
         record(FAIL, "record", f"last update ({st.get('time')}) failed: {st.get('message')}")
     elif st.get("fallback"):
@@ -360,6 +375,440 @@ def check_water_level_record(station_code: str, since=None) -> None:
         pass
     if not any(f[1] == "record" and f[0] != OK for f in findings):
         record(OK, "record", f"water level {first} to {last} ({len(days)} results days)")
+
+
+# ------------------------------------------------------------------
+# 2b'. Are arcs dropping out? A rough sea lowers the reflected power, so
+#     in a storm arcs fall below gnssir's amplitude / peak2noise limits
+#     and the survivors are the doubtful ones. gnss_record.py keeps per
+#     UTC day arc count, median Amp and median PkNoise (arc_stats in
+#     record_status.json); a sharp drop on the newest day against the
+#     days before it is a WARN, and so is a newest day gnssir kept no arc
+#     of at all (it has no results file, so no other check sees it as a
+#     storm). It is equally what a receiver or antenna problem looks
+#     like, which is worth a look too.
+# ------------------------------------------------------------------
+ARC_BASELINE_DAYS = 7    # days before the newest one it is compared with
+ARC_MIN_BASELINE = 3
+ARC_COUNT_DROP = 0.5     # newest day's arcs below half the baseline median
+ARC_AMP_DROP = 0.7       # newest day's median Amp below 70 % of the baseline
+
+
+def check_arc_stats(station_code: str) -> None:
+    status = (PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+              / gnss_record.FIT_SUBDIR / gnss_record.STATUS_NAME)
+    try:
+        stats = json.loads(status.read_text()).get("arc_stats") or []
+    except (OSError, ValueError, AttributeError):
+        return
+    if len(stats) < ARC_MIN_BASELINE + 1:
+        return
+    newest, before = stats[-1], stats[-1 - ARC_BASELINE_DAYS:-1]
+    try:
+        # A day that kept no arc (gnss_record.kept_nothing_days) has 0
+        # arcs and no medians: it counts in the arc baseline, not in the
+        # amplitude one.
+        kept = [d for d in before if d["arcs"]]
+        base_arcs = gnss_record._median([d["arcs"] for d in before])
+        base_amp = gnss_record._median([d["median_amp"] for d in kept])
+        base_pkn = gnss_record._median([d["median_pknoise"] for d in kept])
+        newest["arcs"], newest["median_amp"], newest["median_pknoise"]
+    except (KeyError, TypeError):
+        return
+    today = (f"{newest['arcs']} arcs, median Amp {newest['median_amp']}, "
+             f"PkNoise {newest['median_pknoise']}" if newest["arcs"] else "no arcs kept")
+    previous = f"{base_arcs:.0f} arcs" + (f", Amp {base_amp:.1f}, PkNoise {base_pkn:.1f}"
+                                          if base_amp is not None else "")
+    summary = f"{newest['day']}: {today} (previous {len(before)} days: {previous})"
+    dropped = []
+    if newest["arcs"] < ARC_COUNT_DROP * base_arcs:
+        dropped.append("arcs")
+    if (newest["arcs"] and base_amp is not None
+            and newest["median_amp"] < ARC_AMP_DROP * base_amp):
+        dropped.append("amplitude")
+    if not newest["arcs"]:
+        what = "gnssir kept no arcs at all"
+    elif dropped:
+        what = f"sharp drop in {' and '.join(dropped)}"
+    else:
+        record(OK, "arcs", summary)
+        return
+    record(WARN, "arcs", f"{what} -- {summary}. Rough seas damp the reflection (the "
+                         f"water levels kept may be the biased ones); so does a receiver "
+                         f"or antenna problem")
+
+
+# ------------------------------------------------------------------
+# 2b''. Are the newest levels measured, or spline across a gap?
+#     gnssrefl's subdaily writes a level every 30 minutes wherever the
+#     arcs it kept are no more than 6 h apart, and fills spacings over
+#     5 h with straight-line fake data before fitting. Arcs drop out in
+#     rough seas (the 13 Oct 2026 gap), so a storm high tide can reach
+#     the public plot and the DEM as spline across a hole, or as that
+#     chord, with nothing to say so. gnss_record.py writes
+#     <sta>_spline_support.txt (per level: the hours to the nearest kept
+#     arc) and, for the newest 7 days, gap_support in
+#     record_status.json. WARN when more than GAP_SUPPORT_WARN_FRACTION
+#     of that week is over 2 h from any kept arc (with knots every 3 h,
+#     a gap the spline bridges rather than follows), or when any level
+#     of it lies in a kept-arc gap over 5 h (where the straight-line
+#     fill acts: synthetic tests of gnssrefl 4.1.5 put a high or low
+#     tide there 0.5-1.1 m off).
+# ------------------------------------------------------------------
+GAP_SUPPORT_WARN_FRACTION = 0.05   # of the week's ~336 levels: ~17, over 8 h
+
+
+def check_gap_support(station_code: str) -> None:
+    status = (PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+              / gnss_record.FIT_SUBDIR / gnss_record.STATUS_NAME)
+    try:
+        g = json.loads(status.read_text()).get("gap_support")
+    except (OSError, ValueError, AttributeError):
+        return
+    if not isinstance(g, dict) or not g.get("rows"):
+        return                              # no support file yet
+    name = g.get("file") or f"{station_code}_spline_support.txt"
+    try:
+        if g["unknown_rows"] >= g["rows"]:
+            record(WARN, "support", f"the newest {g['days']} days' water levels have no known "
+                                    f"support: subdaily left no {station_code}_<years>"
+                                    f"{gnss_record.KEPT_SUFFIX} in fit/ (a renamed gnssrefl "
+                                    f"output?), so {name} says nan")
+            return
+        summary = gnss_record.support_report(g)
+        many = g["unsupported_fraction"] > GAP_SUPPORT_WARN_FRACTION
+        fake = g["rows_in_gaps_over_5h"] > 0
+        gap_min_val = float(g.get("gap_min_val_hours") or gnss_record.GAP_MIN_VAL_H)
+    except (KeyError, TypeError, ValueError):
+        return
+    if not (many or fake):
+        record(OK, "support", summary)
+        return
+    fill = f"{gnss_record.FAKE_FILL_H:g}"
+    why = []
+    if many:
+        why.append(f"over {100 * GAP_SUPPORT_WARN_FRACTION:g} % of the week is spline across "
+                   f"gaps in the arcs, not measurement")
+    if fake:
+        why.append(f"gnssrefl fills gaps over {fill} h with straight-line fake data before "
+                   f"fitting, and a high or low tide there can be ~1 m off ("
+                   + (f"subdaily_gap_min_val {fill} in station.json leaves them out)"
+                      if gap_min_val > gnss_record.FAKE_FILL_H
+                      else "next to the newest arc, which gnssrefl's gap test never checks)"))
+    record(WARN, "support", f"{summary}: {'; '.join(why)}. Usually arcs lost in rough seas; "
+                            f"{name} lists the levels")
+
+
+# ------------------------------------------------------------------
+# 2c. Is the public plot being redrawn, and does the tide prediction
+#     cover it? process_and_plot.sh reports success when the 7-day plot
+#     fails, so a stale 7_day_plot.png is still uploaded and attached;
+#     and when the tide spreadsheet (tide_model_file) runs out, the
+#     predicted tide and every departure marker vanish from the plot
+#     without a word (plot_7day.load_tide).
+# ------------------------------------------------------------------
+PLOT_STALE_HOURS = 36    # the plot is redrawn nightly
+TIDE_AHEAD_DAYS = 2      # warn this long before the tide prediction runs out
+PLOT_DAYS = 7            # plot_7day.py's default window
+TIDE_GAP_HOURS = 3       # a longer hole in the prediction can hide a high or low tide
+
+
+def _newest_spline_time(station_code: str) -> datetime | None:
+    """Newest water-level time (naive UTC, as plot_7day uses it)."""
+    rec = (PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+           / f"{station_code}_spline_out.txt")
+    try:
+        _, rows = gnss_record.read_spline(rec)
+    except OSError:
+        return None
+    if not rows:
+        return None
+    return datetime(1858, 11, 17) + timedelta(days=rows[-1][0])
+
+
+def check_public_plot(station_code: str) -> None:
+    files = PROJECT_DIR / "products" / "refl_code" / "Files" / station_code
+    plot = files / "7_day_plot.png"
+    try:
+        mtime = plot.stat().st_mtime
+    except OSError:
+        record(WARN, "plot", f"{plot.name} not found")
+        return
+    when = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    age_h = (utcnow() - when).total_seconds() / 3600
+    if age_h > PLOT_STALE_HOURS:
+        record(WARN, "plot", f"{plot.name} last drawn {when:%Y-%m-%d %H:%M}Z, "
+                             f"{age_h / 24:.1f} days ago: the public plot is not updating "
+                             f"(see logs/daily_gnss.log, Step 5)")
+        return
+    try:
+        rec_mtime = (files / f"{station_code}_spline_out.txt").stat().st_mtime
+    except OSError:
+        rec_mtime = None
+    # The plot is drawn right after the record is written each night.
+    if rec_mtime is not None and rec_mtime - mtime > 3600:
+        record(WARN, "plot", f"{plot.name} ({when:%Y-%m-%d %H:%M}Z) is older than the "
+                             f"water-level record it is drawn from: last night's plot failed")
+        return
+    record(OK, "plot", f"{plot.name} drawn {when:%Y-%m-%d %H:%M}Z")
+
+
+def _tide_times(path: Path, time_col: str, value_col: str) -> list:
+    """The times plot_7day.load_tide draws a predicted tide at, sorted:
+    rows of the first sheet, below a header in row 1, whose time is a
+    date-time and whose value is a number. Checking only the time
+    column said "covered" for times with no tide value (a sheet filled
+    out ahead of its values), which the plot leaves blank. Uses openpyxl
+    exactly as load_tide does when this python has it -- not its
+    read_only mode, which reads only as far as the sheet's stated
+    <dimension>, and some writers state A1:B2 for a whole sheet -- else
+    reads the xlsx directly: cron runs this script under the system
+    python, which may not have openpyxl."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return _tide_times_stdlib(path, time_col, value_col)
+    wb = load_workbook(path, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        header = [c.value for c in ws[1]]
+        ti, vi = _tide_columns(header, time_col, value_col)
+        times = [row[ti] for row in ws.iter_rows(min_row=2, values_only=True)
+                 if isinstance(row[ti], datetime) and isinstance(row[vi], (int, float))]
+    finally:
+        wb.close()
+    return sorted(times)
+
+
+def _tide_columns(header: list, time_col: str, value_col: str) -> tuple:
+    for name in (time_col, value_col):
+        if name not in header:
+            raise ValueError(f"no '{name}' column in the first row")
+    return header.index(time_col), header.index(value_col)
+
+
+# Excel's built-in number formats that are dates or times (the rest of
+# 0-49 are numbers, text or currency). openpyxl reads a cell as a date
+# from its style's number format, built-in or custom, never from the
+# value: the same serial number is a date in one cell and a plain
+# number in the next.
+_XLSX_BUILTIN_DATE_FORMATS = {
+    14: "mm-dd-yy", 15: "d-mmm-yy", 16: "d-mmm", 17: "mmm-yy", 18: "h:mm AM/PM",
+    19: "h:mm:ss AM/PM", 20: "h:mm", 21: "h:mm:ss", 22: "m/d/yy h:mm",
+    45: "mm:ss", 46: "[h]:mm:ss", 47: "mmss.0",
+}
+
+
+def _xlsx_is_date_format(fmt: str | None) -> bool:
+    """openpyxl's is_date_format: a d, m, h, y or s outside quoted text
+    and [locale] brackets in the first section of the format."""
+    if fmt is None:
+        return False
+    fmt = re.sub(r'".*?"|\[(?!hh?\]|mm?\]|ss?\])[^\]]*\]', "", fmt.split(";")[0])
+    return re.search(r"(?<![_\\])[dmhysDMHYS]", fmt) is not None
+
+
+def _xlsx_is_timedelta_format(fmt: str | None) -> bool:
+    """openpyxl's is_timedelta_format ([h]:mm:ss and kin), read as a
+    duration, not a date-time."""
+    return fmt is not None and re.search(
+        r"\[hh?\](:mm(:ss(\.0*)?)?)?|\[mm?\](:ss(\.0*)?)?|\[ss?\](\.0*)?",
+        fmt.split(";")[0], re.I) is not None
+
+
+def _tide_times_stdlib(path: Path, time_col: str, value_col: str) -> list:
+    """_tide_times without openpyxl, reading the xlsx (a zip of XML) the
+    way openpyxl does, so both pythons give the same answer:
+
+    - parts found through the package's relationships, not fixed names;
+    - shared and inline strings: plain text plus rich-text runs, without
+      phonetic (rPh) runs;
+    - a number is a date only if its style's number format is a date
+      format (built-in or custom, as openpyxl's is_date_format), counted
+      from 1899-12-30, or from 1904-01-01 when the workbook says
+      date1904 (older Mac Excel); a duration format is not a date-time;
+    - ISO 8601 date-time cells (t="d");
+    - cells and rows without an r attribute take the next position;
+    - the header is row 1 only, as load_tide's ws[1]."""
+    import posixpath
+    import zipfile
+    import xml.etree.ElementTree as ET
+    m = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    r_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    pkg = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+    def rels_of(z, part):
+        folder, name = posixpath.split(part)
+        try:
+            tree = ET.fromstring(z.read(posixpath.join(folder, "_rels", name + ".rels")))
+        except KeyError:
+            return {}
+        out = {}
+        for rel in tree.iter(f"{pkg}Relationship"):
+            target = rel.get("Target", "")
+            target = (target.lstrip("/") if target.startswith("/")
+                      else posixpath.normpath(posixpath.join(folder, target)))
+            out[rel.get("Id")] = (rel.get("Type", ""), target)
+        return out
+
+    def text_of(element):
+        # <t> directly under <si>/<is>, and under its rich-text runs <r>
+        return "".join(t.text or "" for t in element.findall(f"{m}t")) + "".join(
+            t.text or "" for r in element.findall(f"{m}r") for t in r.findall(f"{m}t"))
+
+    with zipfile.ZipFile(path) as z:
+        book = next((t for kind, t in rels_of(z, "").values()
+                     if kind.endswith("/officeDocument")), "xl/workbook.xml")
+        workbook = ET.fromstring(z.read(book))
+        book_rels = rels_of(z, book)
+        pr = workbook.find(f"{m}workbookPr")
+        flag = pr.get("date1904") if pr is not None else None
+        epoch = (datetime(1904, 1, 1) if flag and flag not in ("false", "f", "0")
+                 else datetime(1899, 12, 30))
+        shared, date_styles, duration_styles = [], set(), set()
+        for kind, target in book_rels.values():
+            if kind.endswith("/sharedStrings"):
+                shared = [text_of(si) for si in
+                          ET.fromstring(z.read(target)).findall(f"{m}si")]
+            elif kind.endswith("/styles"):
+                styles = ET.fromstring(z.read(target))
+                custom = {int(f.get("numFmtId")): f.get("formatCode")
+                          for f in styles.iter(f"{m}numFmt")}
+                xfs = styles.find(f"{m}cellXfs")
+                for index, xf in enumerate(xfs.findall(f"{m}xf") if xfs is not None else []):
+                    fmt_id = int(xf.get("numFmtId", 0))
+                    fmt = custom.get(fmt_id, _XLSX_BUILTIN_DATE_FORMATS.get(fmt_id))
+                    if _xlsx_is_date_format(fmt):
+                        date_styles.add(index)
+                    if _xlsx_is_timedelta_format(fmt):
+                        duration_styles.add(index)
+        first = next(workbook.iter(f"{m}sheet"))
+        sheet = ET.fromstring(z.read(book_rels[first.get(f"{r_ns}id")][1]))
+
+    def value_of(c):
+        kind = c.get("t", "n")
+        if kind == "inlineStr":
+            inline = c.find(f"{m}is")
+            return text_of(inline) if inline is not None else None
+        v = c.findtext(f"{m}v") or None
+        if v is None:
+            return None
+        if kind == "n":
+            number = float(v) if any(ch in v for ch in ".Ee") else int(v)
+            style = int(c.get("s", 0))
+            if style not in date_styles or style in duration_styles:
+                return number
+            day, fraction = divmod(number, 1)      # openpyxl's from_excel
+            if 0 <= number < 1:
+                return None                         # a time of day, not a date-time
+            if 0 < number < 60 and epoch.year == 1899:
+                day += 1                            # Excel's 29 Feb 1900
+            try:
+                return epoch + timedelta(days=day, milliseconds=round(fraction * 86400000))
+            except OverflowError:
+                return None                         # openpyxl makes it an error cell
+        if kind == "s":
+            return shared[int(v)]
+        if kind == "b":
+            return bool(int(v))
+        if kind == "d":
+            # openpyxl's from_ISO8601: date and time, any offset ignored;
+            # a date alone is not a date-time
+            iso = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,3})?)?", v)
+            if not iso:
+                return None
+            parts = [int(g) for g in iso.groups()[:6] if g is not None]
+            micro = int(float(iso.group(7)) * 1000000) if iso.group(7) else 0
+            try:
+                return datetime(*parts, microsecond=micro)
+            except ValueError:
+                return None
+        return v                                    # str (a formula's text), e (an error)
+
+    cells = {}                                      # {(row, column): value}
+    row_number = 0
+    for row in sheet.iter(f"{m}row"):
+        row_number = int(row.get("r", row_number + 1))
+        column = 0
+        for c in row.findall(f"{m}c"):
+            ref = re.match(r"\$?([A-Za-z]+)\$?(\d+)", c.get("r") or "")
+            if ref:
+                column = 0
+                for letter in ref.group(1).upper():
+                    column = column * 26 + ord(letter) - 64
+                row_number = int(ref.group(2))
+            else:
+                column += 1
+            cells[(row_number, column)] = value_of(c)
+
+    width = max([col for _, col in cells] or [0])
+    header = [cells.get((1, col)) for col in range(1, width + 1)]
+    ti, vi = _tide_columns(header, time_col, value_col)
+    times = []
+    for (row_number, column), t in cells.items():
+        if row_number > 1 and column == ti + 1 and isinstance(t, datetime):
+            value = cells.get((row_number, vi + 1))
+            if isinstance(value, (int, float)):
+                times.append(t)
+    return sorted(times)
+
+
+def check_tide_coverage(station_code: str, cfg: dict) -> None:
+    tide_file = cfg.get("tide_model_file")
+    if not tide_file:
+        record(OK, "tide", "no tide_model_file set: the 7-day plot has no predicted tide")
+        return
+    value_col = cfg.get("tide_model_value_column")
+    if not value_col:
+        # plot_7day draws the tide only with both set
+        record(WARN, "tide", "tide_model_file is set but tide_model_value_column is not: "
+                             "the 7-day plot has no predicted tide or departure markers")
+        return
+    path = Path(tide_file)
+    if not path.is_absolute() and not path.exists():
+        path = PROJECT_DIR / path
+    if not path.exists():
+        record(WARN, "tide", f"tide model file {tide_file} not found: the 7-day plot "
+                             f"has no predicted tide or departure markers")
+        return
+    column = cfg.get("tide_model_time_column") or "time"
+    try:
+        times = _tide_times(path, column, value_col)
+    except Exception as exc:
+        record(WARN, "tide", f"could not read {path.name}: {exc}")
+        return
+    if not times:
+        record(WARN, "tide", f"{path.name} has no rows with a time in '{column}' and a "
+                             f"number in '{value_col}'")
+        return
+    start, end = times[0], times[-1]
+    newest = _newest_spline_time(station_code) or utcnow().replace(tzinfo=None)
+    need_from = newest - timedelta(days=PLOT_DAYS)
+    need_to = newest + timedelta(days=TIDE_AHEAD_DAYS)
+    # holes inside the window: a file joined from two predictions
+    # (merge_tide_files.py) can span the window and still miss part of it
+    inside = [need_from] + [t for t in times if need_from < t < need_to] + [need_to]
+    holes = [(a, b) for a, b in zip(inside, inside[1:])
+             if b - a > timedelta(hours=TIDE_GAP_HOURS)]
+    if end < need_to:
+        state = ("are already missing from" if end < newest
+                 else f"disappear from it within {TIDE_AHEAD_DAYS} days of")
+        record(WARN, "tide", f"{path.name} ends {end:%Y-%m-%d %H:%M}, the 7-day plot needs it "
+                             f"to {need_to:%Y-%m-%d} (newest water level + {TIDE_AHEAD_DAYS} "
+                             f"days): the predicted tide and departure markers {state} "
+                             f"7_day_plot.png -- extend the tide prediction")
+    elif start > need_from:
+        record(WARN, "tide", f"{path.name} starts {start:%Y-%m-%d %H:%M}, after the 7-day "
+                             f"plot's window starts ({need_from:%Y-%m-%d %H:%M})")
+    elif holes:
+        a, b = max(holes, key=lambda h: h[1] - h[0])
+        record(WARN, "tide", f"{path.name} has no predicted tide from {a:%Y-%m-%d %H:%M} to "
+                             f"{b:%Y-%m-%d %H:%M}"
+                             + (f" ({len(holes)} gaps over {TIDE_GAP_HOURS} h)" if len(holes) > 1 else "")
+                             + f"; the 7-day plot needs it from {need_from:%Y-%m-%d %H:%M} to "
+                               f"{need_to:%Y-%m-%d} (newest water level + {TIDE_AHEAD_DAYS} days)")
+    else:
+        record(OK, "tide", f"{path.name} covers {start:%Y-%m-%d} to {end:%Y-%m-%d}")
 
 
 # ------------------------------------------------------------------
@@ -437,6 +886,124 @@ def check_cron_ran() -> None:
                    f"Ran {age_h:.0f}h ago; recent history includes errors")
         else:
             record(OK, f"cron/{name}", f"Ran {age_h:.0f}h ago, reported success")
+
+
+# ------------------------------------------------------------------
+# 4b. Did every step of the last processing run work?
+#     process_and_plot.sh goes on after a failed step and still exits 0
+#     (so daily_gnss.sh uploads what was made), and daily_gnss.log then
+#     says "finished successfully" -- all check_cron_ran can see. A
+#     night without the fit, or with every plot crashing, passed every
+#     check here (review finding G-B6). Each step's outcome is in
+#     logs/process_and_plot_status.json (analysis_tools/run_status.py):
+#     a step that failed in the last run is a WARN; a required one (the
+#     record, the processing, the public plot) is a FAIL once no run has
+#     gone through for RUN_OK_MAX_HOURS, which a nightly run with one bad
+#     night does not reach -- one bad night is a warning, two a failure.
+#     A diagnostic that fails only warns, but a last ok run older than
+#     RUN_OK_MAX_HOURS is a FAIL whatever the diagnostics did.
+# ------------------------------------------------------------------
+RUN_STATUS_NAME = "process_and_plot_status.json"
+RUN_OK_MAX_HOURS = 36    # the run is nightly
+RUN_LONG_HOURS = 6       # normally under an hour; a backlog of recovered days takes longer
+
+
+def _run_alive(pid) -> bool | None:
+    """True if pid is a process_and_plot.sh that is still running, False
+    if it is not, None if that cannot be told."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass                     # a process of another user: the command line says
+    except OSError:
+        return None
+    try:
+        # the pid may have been reused since by something else
+        return b"process_and_plot" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return True
+
+
+def check_run_status() -> None:
+    path = PROJECT_DIR / "logs" / RUN_STATUS_NAME
+    st = run_status.load(path)
+    if st is None:
+        record(WARN, "run", (f"could not read {path.name}" if path.exists() else
+                             f"no {path.name} yet: process_and_plot.sh has not run since it "
+                             f"began writing one, so the steps of the last run are unknown"))
+        return
+    now = utcnow()
+    start = parse_ts(str(st.get("start") or ""))
+    when = f"{start:%Y-%m-%d %H:%M}Z" if start else "(start unknown)"
+    last_ok = parse_ts(str(st.get("last_ok_end") or ""))
+    since = last_ok or parse_ts(str(st.get("first_run_start") or "")) or start
+    stale = since is not None and (now - since).total_seconds() / 3600 > RUN_OK_MAX_HOURS
+    if last_ok:
+        ok_text = f"the last run without a failed step ended {last_ok:%Y-%m-%d %H:%M}Z"
+    elif since:
+        ok_text = f"no run without a failed step since {since:%Y-%m-%d %H:%M}Z"
+    else:
+        ok_text = "no run without a failed step yet"
+    steps = [s for s in (st.get("steps") or []) if isinstance(s, dict)]
+
+    if not st.get("end"):
+        # running now -- or killed (or the machine went down) mid-run
+        last = run_status.step_label(steps[-1]) if steps else "none"
+        age_h = (now - start).total_seconds() / 3600 if start else 0.0
+        alive = _run_alive(st.get("pid"))
+        if alive is False or (alive is None and age_h > 2 * RUN_LONG_HOURS):
+            record(FAIL, "run", f"the run started {when} stopped before it finished (killed, or "
+                                f"the machine went down?) -- the last step it recorded is {last}, "
+                                f"the steps after it did not run; {ok_text}")
+        elif stale:
+            record(FAIL, "run", f"a run is in progress since {when}, but {ok_text}")
+        elif age_h > RUN_LONG_HOURS:
+            record(WARN, "run", f"the run started {when} is still running after {age_h:.0f} h "
+                                f"(last step done: {last})")
+        else:
+            record(OK, "run", f"a run is in progress since {when}")
+        return
+
+    failed = [s for s in steps if s.get("status") == "failed"]
+    for s in failed:
+        rc = f" (exit {s['rc']})" if s.get("rc") is not None else ""
+        text = (f"{run_status.step_label(s)} failed in the run of {when}{rc}: "
+                f"{s.get('message') or 'see logs/daily_gnss.log'}")
+        if not s.get("required", True):
+            record(WARN, "run", text)
+        elif stale:
+            record(FAIL, "run", f"{text} -- {ok_text}, so this is not a single bad night")
+        else:
+            record(WARN, "run", f"{text} ({ok_text})")
+    if any(s.get("required", True) for s in failed):
+        return                   # said above, a FAIL once it is not a single bad night
+    # Only diagnostics failed, or nothing did. The age of the last ok run
+    # still counts: a tide comparison that fails every night must not
+    # hide that the run itself stopped coming.
+    if st.get("ok") is False:
+        # an exit status the steps do not account for, or the run was
+        # stopped inside a diagnostic step (said above, unless it is old)
+        if stale or not failed:
+            rc_text = (f"exited {st['rc']}" if st.get("rc") is not None
+                       else "ended without an exit status (killed?)")
+            record(FAIL if stale else WARN, "run",
+                   f"process_and_plot.sh {rc_text} in the run of {when}; {ok_text}")
+    elif stale:
+        age_d = (now - since).total_seconds() / 86400
+        record(FAIL, "run", f"the last run, {when}, went through, but that was {age_d:.1f} "
+                            f"days ago: process_and_plot.sh has not run since")
+    elif not failed:
+        n_skip = sum(1 for s in steps if s.get("status") == "skipped")
+        record(OK, "run", f"last run {when}: {len(steps) - n_skip} step(s) ok"
+                          + (f", {n_skip} skipped" if n_skip else ""))
 
 
 # ------------------------------------------------------------------
@@ -543,6 +1110,7 @@ def main() -> int:
 
     station_code = "usgs"
     since = None
+    d = {}
     station_json = PROJECT_DIR / "station" / "resources" / "station.json"
     if station_json.exists():
         try:
@@ -563,8 +1131,13 @@ def main() -> int:
     check_recent_errors(db, args.days)
     check_processing_currency(station_code, since)
     check_water_level_record(station_code, since)
+    check_arc_stats(station_code)
+    check_gap_support(station_code)
+    check_public_plot(station_code)
+    check_tide_coverage(station_code, d if isinstance(d, dict) else {})
     check_raw_backlog()
     check_cron_ran()
+    check_run_status()
     check_recording(db)
     check_disk()
 

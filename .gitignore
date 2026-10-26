@@ -15,6 +15,9 @@ products/
 logs/
 archive/
 
+# Scratch folders of maintenance/recover_missing_days.py
+.recover_missing_days_*/
+
 # Database
 database/
 
@@ -74,3 +77,7 @@ reflection_zone.kml
 
 # Prepared by maintenance/prepare_ppp_upload.py; regenerate rather than track.
 ppp_upload_*.obs
+
+# Written by analysis_tools/evaluate_invsnr.py (its runs, SNR copies and
+# reports); regenerate rather than track.
+invsnr_eval/
