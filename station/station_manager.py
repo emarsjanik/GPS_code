@@ -24,8 +24,8 @@ Daily cycle
     for each UTC day:
         |
         +-- record in chunks (default 1 hour each), appending to
-        |   one growing raw file for the day, checking for a
-        |   requested stop between chunks
+        |   one growing raw file for the day (also across a restart),
+        |   checking for a requested stop between chunks
         |
         +-- once the day rolls over, hand the day just closed to a
         |   background thread, which runs the processing pipeline
@@ -90,7 +90,10 @@ checking for a stop request *between* chunks bounds the worst-case
 shutdown latency to one chunk, and means a single bad chunk (e.g. a
 USB hiccup) only risks losing that chunk's data, not the whole day's.
 Chunks are stitched into one growing per-day file using record_raw()'s
-own `append=True` -- no manual file-concatenation logic needed.
+own `append=True` -- no manual file-concatenation logic needed. The
+first chunk of a process appends too when the day's file already holds
+data: a restart mid-day (a watchdog restart, a kill, a deploy) used to
+open the file fresh and lose every hour recorded before it.
 
 Day boundaries are always UTC, matching RINEX/GNSS convention and how
 the rest of this project already treats dates (pipeline.py's own
@@ -395,12 +398,29 @@ class StationManager:
 
         return self.cfg.raw_dir / f"station_{day:%Y%m%d}.um980"
 
+    @staticmethod
+    def _append_first_chunk(raw_file: Path) -> bool:
+        """
+        True when the day's raw file already holds data from an earlier
+        run, so this process's first chunk must append, not overwrite.
+        A restart that cut the earlier run mid-message leaves a partial
+        message at the join; RINEX conversion skips to the next sync
+        word, so that costs one epoch, not the hours before it.
+        """
+
+        try:
+            return raw_file.stat().st_size > 0
+        except OSError:
+            return False
+
     def _record_day(self, day: date) -> None:
         """
         Record chunks for `day` until the day rolls over to UTC
         midnight, or a stop is requested. Each chunk appends to one
-        growing raw file for the day (record_raw()'s own append=True,
-        first chunk overwrites/creates it fresh).
+        growing raw file for the day (record_raw()'s own append=True).
+        The first chunk creates the file, or appends to it when an
+        earlier run already recorded part of the day (see
+        _append_first_chunk).
         """
 
         raw_file = self._raw_file_for_day(day)
@@ -425,7 +445,7 @@ class StationManager:
         propagated up to crash run()'s main loop.
         """
 
-        append = self._chunks_recorded_today > 0
+        append = self._chunks_recorded_today > 0 or self._append_first_chunk(raw_file)
 
         self._logger.info(
             "Recording chunk #%d for %.0fs (append=%s) -> %s",
