@@ -290,6 +290,32 @@ class TestChunkedRecording(StationManagerTestCase):
         self.assertEqual(len(filenames), 1)
         self.assertIn("20260709", str(filenames.pop()))
 
+    def test_restart_mid_day_appends_to_the_day_s_file(self) -> None:
+        # An earlier run (before a restart) recorded part of the day:
+        # the first chunk of this run must not truncate it.
+        today = date(2026, 7, 9)
+        raw = self.manager._raw_file_for_day(today)
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b"\xaa" * 5000)
+        self._run_n_chunks_then_rollover(today, n=2)
+
+        self.manager._record_day(today)
+
+        self.assertTrue(all(c["append"] for c in FakeReceiver.record_calls))
+        self.assertEqual(raw.stat().st_size, 5000)
+
+    def test_an_empty_day_file_is_started_fresh(self) -> None:
+        today = date(2026, 7, 9)
+        raw = self.manager._raw_file_for_day(today)
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b"")
+        self._run_n_chunks_then_rollover(today, n=2)
+
+        self.manager._record_day(today)
+
+        self.assertFalse(FakeReceiver.record_calls[0]["append"])
+        self.assertTrue(FakeReceiver.record_calls[1]["append"])
+
     def test_enable_logging_passed_on_every_chunk(self) -> None:
         today = date(2026, 7, 9)
         self._run_n_chunks_then_rollover(today, n=2)
@@ -1457,6 +1483,31 @@ class _WritingReceiver(FakeReceiver):
         with open(filename, "ab" if append else "wb") as handle:
             handle.write(b"\xaa" * 1000)
         return result
+
+
+class TestRestartKeepsRecordedBytes(StationManagerTestCase):
+    """A restart mid-day, with a receiver that really writes: the bytes the
+    earlier run recorded are still at the start of the day's file."""
+
+    def test_bytes_before_the_restart_survive(self) -> None:
+        today = date(2026, 7, 9)
+        raw = self.manager._raw_file_for_day(today)
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b"\x55" * 3000)
+        self.manager._make_receiver = lambda: _WritingReceiver()
+        calls = {"n": 0}
+
+        def fake_today():
+            calls["n"] += 1
+            return today if calls["n"] <= 2 else today + timedelta(days=1)
+
+        self.manager._today = fake_today
+
+        self.manager._record_day(today)
+
+        data = raw.read_bytes()
+        self.assertEqual(data[:3000], b"\x55" * 3000)
+        self.assertEqual(len(data), 3000 + 2 * 1000)
 
 
 class TestRealPipelineInBackground(StationManagerTestCase):
