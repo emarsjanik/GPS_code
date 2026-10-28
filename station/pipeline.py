@@ -183,6 +183,23 @@ def _date_from_filename(filename: str) -> str | None:
 # working directory, verified finding H1). With a same-day orbit (nav,
 # ultra) that put every day a day late.
 #
+# With gnssrefl's default orbit it is the other way round: a closed day
+# must wait for its orbits (ORBIT_WAIT_S below), and processed at its
+# midnight it fails. That default (gnssrefl_orbit_source unset) fetches
+# GFZ's rapid multi-GNSS orbit (GFZ0MGXRAP), published hours after its
+# day. On the station, 20-26 Oct 2026, it was there 24 h after its day
+# every day (orbits/2026/sp3 file times: each day's fetched by
+# station_manager's midnight run a day later), and missing at 0 and
+# 3.5 h after: once the rule above let the midnight run and the cron's
+# 02:30 UTC run take the day just closed (26-28 Oct), rinex2snr found no
+# orbit, gnssir no SNR file, and each day FAILED twice ("No results file
+# produced") before the next night's retry worked -- a FAIL in every
+# morning's health email for a day that was only early. So a past day of
+# station_manager's waits ORBIT_WAIT_S after its day's end (the midnight
+# run a day later takes it, as before) unless the station fetches a
+# same-day orbit (orbit_wait_s()). Waiting is not a failure: the file is
+# skipped, not queued, and a queued one is left for a later run.
+#
 # Every other name keeps the IN_PROGRESS_MTIME_S rule, dated or not.
 # overnight_recording.py (QUICKSTART Step 5) writes
 # raw/overnight_<LOCAL start YYYYMMDD_HHMMSS>.um980: the date in that
@@ -192,6 +209,21 @@ def _date_from_filename(filename: str) -> str | None:
 # converted it mid-recording and _archive() moved it out from under the
 # recorder, the same loss as above.
 IN_PROGRESS_MTIME_S = 15 * 60
+
+# Any wait between the cron's 3.5 h (02:30 UTC; up to an hour more on the
+# run lock) and the 24 h of the next midnight run gives that schedule;
+# 12 h leaves room on both sides.
+ORBIT_WAIT_S = 12 * 3600
+
+
+def orbit_wait_s(orbit_source: str | None) -> float:
+    """How long after its day's end a station day file waits for its
+    orbits: 0 for a same-day orbit (gnssrefl's broadcast 'nav' family,
+    'ultra'), else ORBIT_WAIT_S (gnssrefl's default, the rapid orbit)."""
+
+    src = (orbit_source or "").strip().lower()
+    return 0.0 if src.startswith("nav") or "ultra" in src else float(ORBIT_WAIT_S)
+
 
 _STATION_DAY_FILE = re.compile(r"station_\d{8}\.um980")
 
@@ -287,10 +319,20 @@ def run_lock(logs_dir, wait_s: float, logger: logging.Logger):
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
-    """Why `path` is still being recorded, or None if it is finished."""
+def _utcnow() -> datetime:
+    """The clock _in_progress_reason() reads (a test sets it)."""
 
-    now = now or datetime.now(timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _in_progress_reason(path: Path, now: datetime | None = None,
+                        orbit_wait: float = ORBIT_WAIT_S) -> str | None:
+    """Why `path` is not to be processed yet -- still being recorded, or
+    (a closed day of station_manager's) its orbits not yet published --
+    or None if it is ready. orbit_wait: orbit_wait_s() of the station's
+    orbit source."""
+
+    now = now or _utcnow()
 
     today = now.date().isoformat()
     file_date = _date_from_filename(path.name)
@@ -298,7 +340,12 @@ def _in_progress_reason(path: Path, now: datetime | None = None) -> str | None:
         return "its date is today (UTC)"
     if (file_date is not None and file_date < today
             and _STATION_DAY_FILE.fullmatch(path.name)):
-        # a past UTC day of station_manager's: closed at its midnight
+        # a past UTC day of station_manager's: closed at its midnight,
+        # ready once its orbits can be there
+        day_end = datetime.fromisoformat(file_date).replace(tzinfo=timezone.utc).timestamp() + 86400.0
+        left = day_end + orbit_wait - now.timestamp()
+        if left > 0:
+            return f"waiting for its orbits ({left / 3600:.1f} h more)"
         return None
 
     try:
@@ -671,16 +718,23 @@ class Pipeline:
             "errors": [],
         }
 
+    def _orbit_wait(self) -> float:
+        """orbit_wait_s() of the station's gnssrefl_orbit_source."""
+
+        station = getattr(self.cfg, "station", None) or {}
+        return orbit_wait_s(station.get("gnssrefl_orbit_source"))
+
     def _scan_raw_directory(self) -> list[Path]:
         """Discover raw files on disk. Does not touch the database."""
 
         assert self.cfg is not None
 
         paths = []
+        wait = self._orbit_wait()
         for path in sorted(self.cfg.raw_dir.glob("*.um980")):
-            reason = _in_progress_reason(path)
+            reason = _in_progress_reason(path, orbit_wait=wait)
             if reason is not None:
-                self._logger.info("Skipping %s, still recording: %s", path.name, reason)
+                self._logger.info("Skipping %s for now: %s", path.name, reason)
                 continue
             paths.append(path)
 
@@ -809,10 +863,12 @@ class Pipeline:
             if entry.completed:
                 continue
             # Queued by an earlier run (or before this check existed)
-            # but still being recorded: leave it waiting for tomorrow.
-            reason = _in_progress_reason(self.cfg.raw_dir / entry.filename)
+            # but still being recorded, or its orbits not out yet: leave
+            # it waiting for a later run.
+            reason = _in_progress_reason(self.cfg.raw_dir / entry.filename,
+                                         orbit_wait=self._orbit_wait())
             if reason is not None:
-                self._logger.info("Leaving %s queued, still recording: %s", entry.filename, reason)
+                self._logger.info("Leaving %s queued for now: %s", entry.filename, reason)
                 continue
             to_process.append(entry.filename)
 

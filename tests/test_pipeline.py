@@ -37,8 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "station"))
 
 import pipeline as pipeline_module  # noqa: E402
 from pipeline import (  # noqa: E402
-    PIPELINE_LOCK_NAME, Pipeline, PipelineBusyError, _date_from_filename,
-    _in_progress_reason,
+    ORBIT_WAIT_S, PIPELINE_LOCK_NAME, Pipeline, PipelineBusyError, _date_from_filename,
+    _in_progress_reason, orbit_wait_s,
 )
 
 
@@ -120,9 +120,34 @@ class TestInProgressDaySkipped(unittest.TestCase):
         self.assertIsNotNone(_in_progress_reason(path, now=self.now))
 
     def test_yesterdays_file_is_finished(self) -> None:
-        # 02:30 UTC is 22:30 EDT: yesterday's UTC file is complete.
+        # 02:30 UTC is 22:30 EDT: yesterday's UTC file is complete, and
+        # with a same-day orbit (nav, ultra) ready.
         path = self._raw("station_20261019.um980", mtime=self.now.timestamp() - 3600)
-        self.assertIsNone(_in_progress_reason(path, now=self.now))
+        self.assertIsNone(_in_progress_reason(path, now=self.now, orbit_wait=0.0))
+
+    def test_yesterdays_file_waits_for_the_default_orbit(self) -> None:
+        # gnssrefl's default (GFZ rapid) orbit is published hours after its
+        # day: at the cron's 02:30 UTC the day closed 2.5 h ago waits, not
+        # fails; by ORBIT_WAIT_S after its end it is ready.
+        path = self._raw("station_20261019.um980", mtime=self.now.timestamp() - 3600)
+        reason = _in_progress_reason(path, now=self.now)
+        self.assertIsNotNone(reason)
+        self.assertIn("waiting for its orbits (9.5 h more)", reason)
+        end = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        self.assertIsNotNone(_in_progress_reason(
+            path, now=end + timedelta(seconds=ORBIT_WAIT_S - 1)))
+        self.assertIsNone(_in_progress_reason(path, now=end + timedelta(seconds=ORBIT_WAIT_S)))
+
+    def test_orbit_wait_by_source(self) -> None:
+        # unset (gnssrefl's default), and every orbit that is not same-day, waits
+        for src in (None, "", "gnss", "rapid", "gps+glo", "final"):
+            self.assertEqual(orbit_wait_s(src), ORBIT_WAIT_S, src)
+        # gnssrefl's broadcast family and the ultra-rapid orbit are same-day
+        for src in ("nav", "nav-sopac", "NAV-ESA", "ultra", " Ultra ", "gnss-ultra"):
+            self.assertEqual(orbit_wait_s(src), 0.0, src)
+        # between the cron's 02:30 UTC (+1 h of run lock) and the next midnight run
+        self.assertGreater(ORBIT_WAIT_S, 4.5 * 3600)
+        self.assertLess(ORBIT_WAIT_S, 24 * 3600)
 
     def test_recently_written_undated_file_is_in_progress(self) -> None:
         path = self._raw("test_recording.um980", mtime=time.time() - 60)
@@ -133,13 +158,16 @@ class TestInProgressDaySkipped(unittest.TestCase):
     def test_day_just_closed_is_finished_at_the_rollover_run(self) -> None:
         # station_manager runs the pipeline at 00:00 UTC, straight after
         # the day's last chunk: yesterday's file was written seconds ago
-        # and is complete. Left as in progress, the inline run (the one
-        # that processes the record) did that day a night late.
+        # and is complete. With a same-day orbit the midnight run takes it
+        # then; with the default orbit it waits, and the next midnight run
+        # takes it (its orbit was there 24 h after its day, 20-26 Oct 2026).
         rollover = datetime(2026, 10, 20, 0, 0, 5, tzinfo=timezone.utc)
         path = self._raw("station_20261019.um980", mtime=rollover.timestamp() - 3)
-        self.assertIsNone(_in_progress_reason(path, now=rollover))
+        self.assertIsNone(_in_progress_reason(path, now=rollover, orbit_wait=0.0))
+        self.assertIsNotNone(_in_progress_reason(path, now=rollover))
+        self.assertIsNone(_in_progress_reason(path, now=rollover + timedelta(days=1)))
         today = self._raw("station_20261020.um980", mtime=rollover.timestamp() - 3)
-        self.assertIsNotNone(_in_progress_reason(today, now=rollover))
+        self.assertIsNotNone(_in_progress_reason(today, now=rollover, orbit_wait=0.0))
 
     def test_evening_overnight_recording_is_in_progress(self) -> None:
         # overnight_recording.py names its file by the LOCAL start time:
@@ -161,7 +189,7 @@ class TestInProgressDaySkipped(unittest.TestCase):
             path = self._raw(name, mtime=now.timestamp() - 3)
             self.assertIsNotNone(_in_progress_reason(path, now=now), name)
         path = self._raw("station_20261020.um980", mtime=now.timestamp() - 3)
-        self.assertIsNone(_in_progress_reason(path, now=now))
+        self.assertIsNone(_in_progress_reason(path, now=now, orbit_wait=0.0))
 
     def test_station_file_dated_after_today_keeps_the_written_time(self) -> None:
         # a clock that was set back since recording began: not a closed day
@@ -169,23 +197,50 @@ class TestInProgressDaySkipped(unittest.TestCase):
         self.assertIsNotNone(_in_progress_reason(path, now=self.now))
 
     def test_rollover_run_scans_the_day_just_closed(self) -> None:
+        # with a same-day orbit (station.json gnssrefl_orbit_source "ultra")
         now = datetime.now(timezone.utc)
         yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
         self._raw(f"station_{yesterday}.um980", mtime=time.time() - 2)
         self._raw(f"station_{now:%Y%m%d}.um980", mtime=time.time() - 2)
 
-        pipeline, _ = self._pipeline()
+        pipeline, _ = self._pipeline(station={"gnssrefl_orbit_source": "ultra"})
 
         self.assertEqual([p.name for p in pipeline._scan_raw_directory()],
                          [f"station_{yesterday}.um980"])
 
+    def test_default_orbit_scan_and_queue_wait_for_the_day_just_closed(self) -> None:
+        # gnssrefl's default orbit: just after midnight the day just closed
+        # is neither scanned nor taken from the queue (where a failed
+        # attempt left it); the day before it is.
+        rollover = datetime(2026, 10, 28, 0, 0, 5, tzinfo=timezone.utc)
+        for d in ("20261026", "20261027"):
+            self._raw(f"station_{d}.um980", mtime=rollover.timestamp() - 2)
+        names = ["station_20261026.um980", "station_20261027.um980"]
+
+        with unittest.mock.patch.object(pipeline_module, "_utcnow", return_value=rollover):
+            pipeline, processed = self._pipeline(queued=names)
+            self.assertEqual([p.name for p in pipeline._scan_raw_directory()], [names[0]])
+            pipeline._process_queue()
+        self.assertEqual(processed, [names[0]])
+
+        # the cron's 02:30 UTC run: still waiting; the next midnight run takes it
+        for when, want in ((rollover + timedelta(hours=2, minutes=25), [names[0]]),
+                           (rollover + timedelta(days=1), names)):
+            with unittest.mock.patch.object(pipeline_module, "_utcnow", return_value=when):
+                pipeline, processed = self._pipeline(queued=names)
+                pipeline._process_queue()
+            self.assertEqual(processed, want, when)
+
     def test_missing_file_with_old_date_is_not_in_progress(self) -> None:
         self.assertIsNone(_in_progress_reason(self.raw_dir / "station_20261001.um980"))
 
-    def _pipeline(self, queued=()) -> tuple[Pipeline, list[str]]:
+    def _pipeline(self, queued=(), station=None) -> tuple[Pipeline, list[str]]:
         entries = [SimpleNamespace(filename=name, completed=False) for name in queued]
         db = SimpleNamespace(processing_history=lambda filename=None: entries)
-        pipeline = Pipeline(cfg=SimpleNamespace(raw_dir=self.raw_dir), db=db)
+        cfg = SimpleNamespace(raw_dir=self.raw_dir)
+        if station is not None:
+            cfg.station = station
+        pipeline = Pipeline(cfg=cfg, db=db)
         processed: list[str] = []
         pipeline._process_one_job = processed.append
         return pipeline, processed
