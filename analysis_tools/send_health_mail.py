@@ -190,6 +190,21 @@ DOWNSCALE_ABOVE_BYTES = 1_000_000
 DOWNSCALE_LONG_EDGE = 1400
 DOWNSCALE_QUALITY = 85
 
+# Only pictures are downscaled. A data file -- the waterline's 7-day DEM
+# as a GeoTIFF -- goes as it is, byte for byte: made into a JPEG it would
+# lose its numbers and its georeferencing. One larger than DATA_MAX_BYTES
+# is not attached (the body says where it is), so a runaway grid cannot
+# make the whole email bounce.
+PICTURES = (".png", ".jpg", ".jpeg")
+DATA_MAX_BYTES = 10_000_000
+MIME_TYPES = {".png": ("image", "png"), ".jpg": ("image", "jpeg"), ".jpeg": ("image", "jpeg"),
+              ".tif": ("image", "tiff"), ".tiff": ("image", "tiff")}
+
+
+def mime_type(name: str):
+    """(maintype, subtype) for an attachment's file name; anything unknown is plain data."""
+    return MIME_TYPES.get(Path(name).suffix.lower(), ("application", "octet-stream"))
+
 
 def _downscale_for_email(path: Path, tmpdir: Path):
     """Returns (bytes, filename) for attaching.
@@ -339,17 +354,23 @@ def main() -> int:
         body += "=" * 68 + "\n"
         body += deviation_stats() + "\n"
 
-    attached, missing = [], []
+    attached, missing, too_large = [], [], []
     for path in args.attach:
-        if Path(path).is_file():
-            attached.append(Path(path))
-        else:
+        p = Path(path)
+        if not p.is_file():
             missing.append(path)
+        elif p.suffix.lower() not in PICTURES and p.stat().st_size > DATA_MAX_BYTES:
+            too_large.append(p)
+        else:
+            attached.append(p)
 
     if attached:
         body += "\n\nAttached:\n" + attachment_ages(attached) + "\n"
     if missing:
         body += "\n(not attached, file missing: " + ", ".join(missing) + ")\n"
+    for p in too_large:
+        body += (f"\n(not attached, too large to email: {p.name}, {p.stat().st_size / 1e6:.1f} MB "
+                 f"over {DATA_MAX_BYTES / 1e6:.0f} MB; on the station at {p})\n")
 
     msg = EmailMessage()
     msg["Subject"] = args.subject
@@ -361,9 +382,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="health_mail_") as td:
         tmpdir = Path(td)
         for path in attached:
-            data, name, shrunk = _downscale_for_email(path, tmpdir)
-            subtype = "jpeg" if name.lower().endswith(".jpg") else "png"
-            msg.add_attachment(data, maintype="image", subtype=subtype,
+            if path.suffix.lower() in PICTURES:
+                data, name, shrunk = _downscale_for_email(path, tmpdir)
+            else:
+                data, name, shrunk = path.read_bytes(), path.name, False
+            maintype, subtype = mime_type(name)
+            msg.add_attachment(data, maintype=maintype, subtype=subtype,
                                filename=name)
             if shrunk:
                 print(f"  {path.name}: {path.stat().st_size / 1e6:.1f} MB "

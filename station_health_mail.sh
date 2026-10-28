@@ -121,7 +121,9 @@ for attempt in $(seq 1 "$MAIL_ATTEMPTS"); do
     # Message construction moved to a Python helper: attachments
     # need a MIME multipart message, which is easy to get subtly
     # wrong in shell. msmtp is still the transport, so credentials
-    # and this retry loop are unchanged.
+    # and this retry loop are unchanged. The last attachment is the same
+    # 7-day DEM as a GeoTIFF (UTM 19N, NAVD88 heights; the waterline
+    # cron's dem_geotiff), sent as it is for GIS use, never downscaled.
     PLOTS_DIR="$PROJECT_DIR/products/refl_code/Files/$STATION_CODE"
     printf '%s\n' "$BODY" | python3 "$PROJECT_DIR/analysis_tools/send_health_mail.py" \
         --subject "$SUBJECT" \
@@ -130,7 +132,8 @@ for attempt in $(seq 1 "$MAIL_ATTEMPTS"); do
         --attach "$PLOTS_DIR/7_day_plot.png" \
         --attach "/mnt/I2Rgus_Data/waterline/elevation_map_c1_7day.png" \
         --attach "/mnt/I2Rgus_Data/waterline/elevation_map_c2_7day.png" \
-        --attach "/mnt/I2Rgus_Data/waterline/dem_intertidal_7day_dem.png"
+        --attach "/mnt/I2Rgus_Data/waterline/dem_intertidal_7day_dem.png" \
+        --attach "/mnt/I2Rgus_Data/waterline/dem_intertidal_7day_dem.tif"
     mail_exit=$?
 
     if [ "$mail_exit" -eq 0 ]; then

@@ -151,5 +151,66 @@ class TestHeaders(unittest.TestCase):
         self.assertTrue(msg["Message-ID"])
 
 
+class TestAttachments(unittest.TestCase):
+    """The pictures are downscaled for email; a data file -- the waterline's 7-day DEM as a GeoTIFF --
+    goes byte for byte as image/tiff, or, over DATA_MAX_BYTES, not at all, the body saying where it is."""
+
+    send = TestHeaders.send
+
+    def parts(self, msg):
+        return {p.get_filename(): p for p in msg.iter_attachments()}
+
+    def body(self, msg) -> str:
+        return msg.get_body(preferencelist=("plain",)).get_content()
+
+    def test_geotiff_attached_byte_for_byte(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tif = Path(td) / "dem_intertidal_7day_dem.tif"
+            data = b"II*\x00" + bytes(range(256)) * 6000          # 1.5 MB: above the pictures' limit
+            tif.write_bytes(data)
+            _, msg = self.send("--attach", str(tif))
+        part = self.parts(msg).get("dem_intertidal_7day_dem.tif")
+        self.assertIsNotNone(part)
+        self.assertEqual(part.get_content_type(), "image/tiff")
+        self.assertEqual(part.get_content(), data)
+        self.assertIn("dem_intertidal_7day_dem.tif", self.body(msg).split("Attached:", 1)[1])
+
+    def test_geotiff_over_the_cap_not_attached_body_says_where(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tif = Path(td) / "dem_intertidal_7day_dem.tif"
+            tif.write_bytes(b"II*\x00" + bytes(64))
+            with unittest.mock.patch.object(shm, "DATA_MAX_BYTES", 10):
+                _, msg = self.send("--attach", str(tif))
+        self.assertNotIn("dem_intertidal_7day_dem.tif", self.parts(msg))
+        self.assertIn("not attached, too large to email: dem_intertidal_7day_dem.tif", self.body(msg))
+        self.assertIn(str(tif), self.body(msg))
+
+    def test_missing_geotiff_noted(self) -> None:
+        _, msg = self.send("--attach", "/nonexistent/dem_intertidal_7day_dem.tif")
+        self.assertFalse(self.parts(msg))
+        self.assertIn("file missing: /nonexistent/dem_intertidal_7day_dem.tif", self.body(msg))
+
+    def test_small_png_unchanged_as_png(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            png = Path(td) / "7_day_plot.png"
+            raw = b"\x89PNG\r\n\x1a\n" + bytes(100)
+            png.write_bytes(raw)
+            _, msg = self.send("--attach", str(png))
+        part = self.parts(msg).get("7_day_plot.png")
+        self.assertEqual(part.get_content_type(), "image/png")
+        self.assertEqual(part.get_content(), raw)
+
+    def test_mime_types(self) -> None:
+        self.assertEqual(shm.mime_type("a.TIF"), ("image", "tiff"))
+        self.assertEqual(shm.mime_type("a.tiff"), ("image", "tiff"))
+        self.assertEqual(shm.mime_type("a.jpg"), ("image", "jpeg"))
+        self.assertEqual(shm.mime_type("a.png"), ("image", "png"))
+        self.assertEqual(shm.mime_type("a.asc"), ("application", "octet-stream"))
+
+    def test_the_daily_email_attaches_the_7day_geotiff(self) -> None:
+        text = (ROOT / "station_health_mail.sh").read_text()
+        self.assertIn('--attach "/mnt/I2Rgus_Data/waterline/dem_intertidal_7day_dem.tif"', text)
+
+
 if __name__ == "__main__":
     unittest.main()
