@@ -210,6 +210,9 @@ class TestAttachments(unittest.TestCase):
     def test_the_daily_email_attaches_the_7day_geotiff(self) -> None:
         text = (ROOT / "station_health_mail.sh").read_text()
         self.assertIn('--attach "/mnt/I2Rgus_Data/waterline/dem_intertidal_7day_dem.tif"', text)
+        # the picture of the same DEM: the plain north-up map (dem_map.py), not the diagnostic page
+        self.assertIn('--attach "/mnt/I2Rgus_Data/waterline/dem_intertidal_7day_map.png"', text)
+        self.assertNotIn("dem_intertidal_7day_dem.png", text)
 
 
 if __name__ == "__main__":
