@@ -66,6 +66,7 @@ import matplotlib
 matplotlib.use("Agg")  # write directly to a file, no display needed
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 import numpy as np
 
 
@@ -246,6 +247,65 @@ def break_at_gaps(times, values, gap: timedelta):
     return out_t, np.asarray(out_v, float)
 
 
+_HOUR = "%Y-%m-%d %H:%M"
+_DAY = "%Y-%m-%d"
+# (plotted span up to, in days: labelled ticks, unlabelled ticks, label)
+# The steps halve from one row to the next, so a span gets about 14 to
+# 30 labels, never fewer than matplotlib's automatic choice (checked
+# from an hour to 200 years in tests/test_tide_plot_dates.py). Under
+# half a day and over about 30 years matplotlib chooses, up to 30.
+DATE_TICKS = [
+    (0.5, lambda: mdates.AutoDateLocator(minticks=8, maxticks=30),
+     lambda: mdates.MinuteLocator(byminute=range(0, 60, 5)), _HOUR),
+    (1.2, lambda: mdates.HourLocator(),
+     lambda: mdates.MinuteLocator(byminute=[15, 30, 45]), _HOUR),
+    (2.4, lambda: mdates.HourLocator(byhour=range(0, 24, 2)), lambda: mdates.HourLocator(), _HOUR),
+    (3.6, lambda: mdates.HourLocator(byhour=range(0, 24, 3)), lambda: mdates.HourLocator(), _HOUR),
+    (7.2, lambda: mdates.HourLocator(byhour=range(0, 24, 6)),
+     lambda: mdates.HourLocator(byhour=range(0, 24, 3)), _HOUR),
+    (14.4, lambda: mdates.HourLocator(byhour=[0, 12]),
+     lambda: mdates.HourLocator(byhour=range(0, 24, 3)), _HOUR),
+    (30, lambda: mdates.DayLocator(), lambda: mdates.HourLocator(byhour=[6, 12, 18]), _DAY),
+    (60, lambda: mdates.DayLocator(bymonthday=range(1, 30, 2)), lambda: mdates.DayLocator(), _DAY),
+    (110, lambda: mdates.DayLocator(bymonthday=[1, 4, 8, 11, 15, 18, 22, 25]),
+     lambda: mdates.DayLocator(), _DAY),
+    (220, lambda: mdates.DayLocator(bymonthday=[1, 8, 15, 22]), lambda: mdates.DayLocator(), _DAY),
+    (440, lambda: mdates.DayLocator(bymonthday=[1, 15]),
+     lambda: mdates.DayLocator(bymonthday=[1, 8, 15, 22]), _DAY),
+    (900, lambda: mdates.MonthLocator(), lambda: mdates.DayLocator(bymonthday=[1, 15]), _DAY),
+    (1800, lambda: mdates.MonthLocator(bymonth=[1, 3, 5, 7, 9, 11]), lambda: mdates.MonthLocator(), _DAY),
+    (2700, lambda: mdates.MonthLocator(bymonth=[1, 4, 7, 10]), lambda: mdates.MonthLocator(), _DAY),
+    (5400, lambda: mdates.MonthLocator(bymonth=[1, 7]),
+     lambda: mdates.MonthLocator(bymonth=[1, 4, 7, 10]), _DAY),
+    (10800, lambda: mdates.YearLocator(), lambda: mdates.MonthLocator(bymonth=[1, 7]), _DAY),
+    (math.inf, lambda: mdates.AutoDateLocator(minticks=8, maxticks=30),
+     lambda: mticker.NullLocator(), _DAY),
+]
+
+
+def date_ticks(ax) -> None:
+    """Dates on the x axis, finer than matplotlib's automatic choice
+    (which labels only the 1st of each month on a few months' record):
+    labelled ticks every few days and unlabelled ones finer still, the
+    step chosen from DATE_TICKS by the plotted span (the record, or the
+    --start-date/--end-date window, plus matplotlib's margins) so the
+    labels never crowd. On the station's record of a few months the
+    labels fall on the 1st, 8th, 15th and 22nd, with a tick every day.
+    From a day's span upward the labels include the 1st of each month
+    shown (of each quarter, half year or year on the longest spans), so
+    a date is easy to find; a gridline marks each label. Under 15 days
+    the labels carry the hour. Over about 30 years (only a stray old
+    timestamp would make one) matplotlib chooses, up to 30 labels."""
+    lo, hi = ax.get_xlim()
+    days = hi - lo           # matplotlib dates are in days
+    for top, major, minor, fmt in DATE_TICKS:
+        if days <= top:
+            break
+    ax.xaxis.set_major_locator(major())
+    ax.xaxis.set_minor_locator(minor())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--spline-file", required=True)
@@ -349,8 +409,7 @@ def main():
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
 
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    date_ticks(ax)
     fig.autofmt_xdate()
 
     fig.tight_layout()
