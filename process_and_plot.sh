@@ -578,6 +578,20 @@ d = json.load(open('$STATION_JSON'))
 print(d.get('tide_model_time_column', 'time'))
 " 2>/dev/null)
 
+    # Earlier tide files for the plot (station.json tide_model_history:
+    # full paths or glob patterns), so it keeps the months that
+    # tide_model_file no longer covers. Only the plot reads them.
+    TIDE_HISTORY_ARGS=()
+    while IFS= read -r pattern; do
+        [ -n "$pattern" ] && TIDE_HISTORY_ARGS+=(--tide-history "$pattern")
+    done < <(python3 -c "
+import json, sys
+h = json.load(open(sys.argv[1])).get('tide_model_history') or []
+for p in ([h] if isinstance(h, str) else h):
+    if isinstance(p, str) and p.strip():
+        print(p.strip())
+" "$STATION_JSON" 2>/dev/null)
+
     SPLINE_FILE="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_spline_out.txt"
 
     if [ ! -f "$SPLINE_FILE" ]; then
@@ -586,6 +600,9 @@ print(d.get('tide_model_time_column', 'time'))
         step_skip "no water-level record yet"
     else
         echo "  Comparing against: $TIDE_FILE (column: $TIDE_VALUE_COL)"
+        if [ "${#TIDE_HISTORY_ARGS[@]}" -gt 0 ]; then
+            echo "  The plot adds the earlier tide files in tide_model_history."
+        fi
         echo ""
 
         TIDE_PLOT_OUTPUT="$REFL_CODE/Files/$STATION_CODE/${STATION_CODE}_vs_tide.png"
@@ -594,6 +611,7 @@ print(d.get('tide_model_time_column', 'time'))
         python3 "$PROJECT_DIR/analysis_tools/plot_gnssir_vs_tide.py" \
             --spline-file "$SPLINE_FILE" \
             --tide-file "$TIDE_FILE" \
+            ${TIDE_HISTORY_ARGS[@]+"${TIDE_HISTORY_ARGS[@]}"} \
             --tide-time-col "$TIDE_TIME_COL" \
             --tide-value-col "$TIDE_VALUE_COL" \
             --output "$TIDE_PLOT_OUTPUT"

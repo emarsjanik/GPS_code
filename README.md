@@ -106,6 +106,7 @@ See [`STATION_JSON_REFERENCE.md`](STATION_JSON_REFERENCE.md) for the complete fi
 | `record_raw_chunk_seconds` | `StationManager` recording chunk size; 3600 (1h) default, 600 (10min) recommended for cron/systemd-managed deployments so stop/restart stay responsive |
 | `manager_retry_delay_seconds`, `health_check_interval_seconds`, `manager_pipeline_in_background` | `StationManager` tuning |
 | `tide_model_file`, `tide_model_value_column`, `tide_model_time_column` | Optional — enables automatic tide model comparison in `process_and_plot.sh` |
+| `tide_model_history` | Optional — earlier tide files (paths or glob patterns) the tide comparison plot joins with `tide_model_file`, so it keeps the months that file no longer covers |
 | `tide_prediction` | Optional — refreshes a rolling 30-day tide prediction nightly (`analysis_tools/make_tide_prediction.py`, pyTMD/EOT20 or NOAA CO-OPS); used only once `tide_model_file` points at it |
 
 ## Running
