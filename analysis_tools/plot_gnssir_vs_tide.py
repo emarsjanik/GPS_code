@@ -23,18 +23,21 @@ current one, so on its own the orange line starts where that file
 starts. --tide-history adds the earlier ones: a path or a glob
 pattern, as many times as needed (station.json tide_model_history in
 process_and_plot.sh). They are joined with --tide-file into one line:
-  - each file wins over the whole period it covers: --tide-file over
-    all the earlier ones, and among those the one that starts later.
-    A file's rows inside a winning file's period are dropped, not
-    interleaved, so two files a row apart in time cannot zigzag;
+  - each file wins over the stretches it covers (from its first row
+    to its last, split at any gap in it): --tide-file over all the
+    earlier ones, and among those the one that starts later. A file's
+    rows inside a winning file's stretch are dropped, not interleaved,
+    so two files a row apart in time cannot zigzag; a gap in a winning
+    file is filled from the files below it;
   - where two files share timestamps the run prints their largest
     difference, and warns above 5 mm (merge_tide_files.py explains
     the one-row offset between the first two spreadsheets);
   - an earlier file without the height column, or one that cannot be
     read, is left out and named; a pattern that matches nothing is
     named. Neither stops the plot. --tide-file must still load.
-Where the tide has a gap (more than an hour, or three samples, with no
-row), the orange line breaks instead of drawing a straight line across
+A gap is two consecutive rows further apart than an hour or three
+sample spacings, whichever is longer. Where the joined tide still has
+one, the orange line breaks instead of drawing a straight line across
 it, and the GNSS-IR points inside the gap are left out of the offset.
 
 Usage:
@@ -125,7 +128,8 @@ def load_tide_reference(path: Path, time_col: str, value_col: str):
 # Two files whose values differ by more than this at a shared
 # timestamp are not the same model on the same clock.
 OVERLAP_TOLERANCE_M = 0.005
-# A tide gap: no row for more than this, or three sample spacings.
+# A tide gap: consecutive rows further apart than this, or than three
+# sample spacings, whichever is longer.
 MIN_GAP = timedelta(hours=1)
 
 
@@ -154,9 +158,10 @@ def load_tide_series(current: Path, history, time_col: str, value_col: str):
     by time: (times, values, one line per file for the log).
 
     Priority: --tide-file, then the earlier files from the latest
-    start back. Each file keeps only its rows outside the periods
-    (first to last row) of the files above it. --tide-file must load;
-    an earlier file that does not is left out and named."""
+    start back. Each file keeps only its rows outside the stretches
+    (covered_stretches) of the files above it, so a gap in a file is
+    filled from the files below it. --tide-file must load; an earlier
+    file that does not is left out and named."""
     loaded = [(current, *load_tide_reference(current, time_col, value_col))]
     notes = []
     for path in history:
@@ -188,10 +193,13 @@ def load_tide_series(current: Path, history, time_col: str, value_col: str):
             all_t.append(t)
             all_v.append(v)
         if times:
-            first, last = min(times), max(times)
-            spans.append((first, last))
-            notes.append(f"  {path}: {first:%Y-%m-%d %H:%M} to {last:%Y-%m-%d %H:%M}, "
-                         f"{len(used)} of {len(times)} rows used")
+            stretches = covered_stretches(times)
+            spans.extend(stretches)
+            first, last = stretches[0][0], stretches[-1][1]
+            holes = len(stretches) - 1
+            notes.append(f"  {path}: {first:%Y-%m-%d %H:%M} to {last:%Y-%m-%d %H:%M}"
+                         + (f" with {holes} gap(s)" if holes else "")
+                         + f", {len(used)} of {len(times)} rows used")
         if shared:
             worst = max(abs(a - b) for a, b in shared)
             notes.append(f"    {len(shared)} timestamps in common with a file "
@@ -202,8 +210,23 @@ def load_tide_series(current: Path, history, time_col: str, value_col: str):
     return [all_t[i] for i in order], np.asarray([all_v[i] for i in order], float), notes
 
 
+def covered_stretches(times):
+    """(first, last) of each stretch of a file's rows: its first row to
+    its last, split wherever two consecutive rows are a gap apart."""
+    ts = sorted(times)
+    gap = tide_gap(ts)
+    out, start = [], ts[0]
+    for a, b in zip(ts, ts[1:]):
+        if b - a > gap:
+            out.append((start, a))
+            start = b
+    out.append((start, ts[-1]))
+    return out
+
+
 def tide_gap(times) -> timedelta:
-    """The spacing above which two consecutive tide rows are a gap."""
+    """The spacing above which two consecutive tide rows (sorted) are a
+    gap: an hour or three median spacings, whichever is longer."""
     if len(times) < 2:
         return MIN_GAP
     steps = np.diff(np.array([(t - times[0]).total_seconds() for t in times]))

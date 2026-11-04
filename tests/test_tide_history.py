@@ -196,6 +196,34 @@ class JoinTests(Files):
                               f"{30 * 144} of {61 * 144} rows used\n    {31 * 144} timestamps "
                               "in common", "\n".join(notes))
 
+    def test_a_gap_in_a_winning_file_is_filled_from_below(self) -> None:
+        # a rolling prediction whose refresh failed for weeks: rows to
+        # 30 Sep, then from 25 Oct; the October spreadsheet fills the hole
+        before = span(datetime(2026, 8, 31), datetime(2026, 9, 30, 23, 50))
+        after = span(datetime(2026, 10, 25), datetime(2026, 11, 24, 23, 50))
+        holed = write_tides(self.dir / "tide_prediction.xlsx", before + after,
+                            [tide(t) for t in before + after])
+        octo = span(datetime(2026, 10, 1), datetime(2026, 10, 31, 23, 50))
+        oct_file = write_tides(self.dir / "oct_only.xlsx", octo, [tide(t) + 0.3 for t in octo])
+        times, values, notes = pgt.load_tide_series(holed, [oct_file], "time", COL)
+        hole = [t for t in octo if t < after[0]]
+        self.assertEqual(times, before + hole + after)
+        np.testing.assert_allclose(values, [tide(t) + (0.3 if t in set(hole) else 0) for t in times],
+                                   rtol=0, atol=1e-12)
+        text = "\n".join(notes)
+        self.assertIn(f"{holed}: 2026-08-31 00:00 to 2026-11-24 23:50 with 1 gap(s), "
+                      f"{len(before + after)} of {len(before + after)} rows used", text)
+        self.assertIn(f"{oct_file}: 2026-10-01 00:00 to 2026-10-31 23:50, "
+                      f"{len(hole)} of {len(octo)} rows used", text)
+
+    def test_the_current_file_wins_over_a_later_starting_earlier_file(self) -> None:
+        later = span(datetime(2026, 11, 5), datetime(2026, 12, 5))
+        f = write_tides(self.dir / "later.xlsx", later, [tide(t) + 0.3 for t in later])
+        times, values, _ = self.join([f])
+        self.assertEqual(times, self.nov + [t for t in later if t > self.nov[-1]])
+        np.testing.assert_allclose(values, [tide(t) + (0.3 if t > self.nov[-1] else 0)
+                                            for t in times], rtol=0, atol=1e-12)
+
     def test_agreeing_overlap_is_not_a_warning(self) -> None:
         same = write_tides(self.dir / "same.xlsx", self.octo, [tide(t) for t in self.octo])
         _, _, notes = self.join([same])
@@ -221,6 +249,25 @@ class JoinTests(Files):
                           header=("time", "FES_heightm"))
         with self.assertRaises(ValueError):
             pgt.load_tide_series(bad, [self.sep_file], "time", COL)
+
+
+class GapTests(unittest.TestCase):
+    """A gap: consecutive rows further apart than an hour or three
+    median spacings, whichever is longer."""
+
+    @unittest.skipIf(openpyxl is None, "numpy, matplotlib or openpyxl not installed")
+    def test_threshold(self) -> None:
+        t0 = datetime(2026, 11, 1)
+        for step, hole, is_gap in ((10, 50, False), (10, 70, True),
+                                   (60, 180, False), (60, 240, True)):
+            with self.subTest(step_min=step, hole_min=hole):
+                times = span(t0, t0 + timedelta(hours=12), timedelta(minutes=step))
+                times += span(times[-1] + timedelta(minutes=hole),
+                              times[-1] + timedelta(minutes=hole) + timedelta(hours=12),
+                              timedelta(minutes=step))
+                x, y = pgt.break_at_gaps(times, np.zeros(len(times)), pgt.tide_gap(times))
+                self.assertEqual(int(np.isnan(y).sum()), int(is_gap))
+                self.assertEqual(len(pgt.covered_stretches(times)), 1 + int(is_gap))
 
 
 class MainTests(Files):
