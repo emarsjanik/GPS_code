@@ -121,6 +121,12 @@ def _is_future_day_message(text: str) -> bool:
     runs nightly, this would otherwise generate a FAIL every single
     morning, and a monitor that cries wolf daily stops being read
     shortly before the morning it says something true.
+
+    The day is read from the first results path in the message, the
+    one right after "No results file produced:". What follows it in
+    brackets (gnssrefl_processor.py says what happened: no SNR file,
+    or no arc kept, with the .gen log or failQC/<doy>.txt to look at)
+    holds no other .../results/<sta>/<doy>.txt path.
     """
     if not text or "No results file produced" not in text:
         return False
@@ -132,6 +138,25 @@ def _is_future_day_message(text: str) -> bool:
     # UTC day only closes at 00:00 today, and is processed that evening.
     # Compared as dates, so 31 December still counts as yesterday on 1 January.
     return day >= utcnow().date() - timedelta(days=1)
+
+
+def _day_given_up(results_file: Path) -> bool:
+    """For a logged results path .../<year>/results/<sta>/<doy:03d>.txt:
+    the day's no-data marker is next to it, or its raw file is in
+    archive/ (see _failure_since_resolved())."""
+    if results_file.suffix != ".txt" or not results_file.stem.isdigit():
+        return False
+    doy = int(results_file.stem)
+    if (results_file.parent / f"{doy}.no_data").exists():
+        return True
+    try:
+        year = int(results_file.parent.parent.parent.name)
+        day = datetime(year, 1, 1) + timedelta(days=doy - 1)
+    except (ValueError, OverflowError):
+        return False
+    if day.year != year:
+        return False
+    return (PROJECT_DIR / "archive" / f"station_{day:%Y%m%d}.um980").exists()
 
 
 def _failure_since_resolved(text: str) -> bool:
@@ -150,6 +175,32 @@ def _failure_since_resolved(text: str) -> bool:
     day's .obs/.nav pair with a single .tar.gz once processing is
     done, so the original file being absent is the expected end
     state, not a missing output.
+
+    A missing results file also counts as resolved once the day was
+    given up -- what the pipeline now does with a day that cannot give
+    results (station/pipeline.py, "A day that can never give
+    results"):
+
+      * its <doy>.no_data marker (day of year NOT zero-padded) is
+        next to the logged path: written by pipeline.py or
+        recover_missing_days.py for a day processed with no usable
+        retrievals. The logged path's own folder is used, not
+        PROJECT_DIR's: it is where the pipeline wrote the marker.
+      * its raw file, station_YYYYMMDD.um980, is in archive/: the
+        pipeline is done with the day (results, no data, or no SNR
+        file with any orbit and handed to recover_missing_days.py,
+        which retries it every night). Such a day stays visible as a
+        gap in the record (check_processing_currency()) and in
+        recover's own output; its old failures would otherwise keep
+        a FAIL here for up to --days after it was handed over.
+
+    The pipeline's own "GNSS-IR kept no arc for <day>" row names no
+    results path, so no marker clears it: one is a WARN, the same day
+    after day a FAIL (a setting that makes gnssir keep nothing).
+
+    Messages carry what happened in brackets after the path ("No
+    results file produced: <path> (no SNR file with ...)"); the path
+    is still the first word after the marker.
     """
     if not text:
         return False
@@ -157,9 +208,13 @@ def _failure_since_resolved(text: str) -> bool:
     for marker in ("No results file produced:",
                    "observation file was not created:"):
         if marker in text:
-            candidate = text.split(marker, 1)[1].strip().split()[0]
-            p = Path(candidate)
+            words = text.split(marker, 1)[1].split()
+            if not words:
+                return False
+            p = Path(words[0])
             if p.exists():
+                return True
+            if marker == "No results file produced:" and _day_given_up(p):
                 return True
             # A processed day's RINEX is replaced by its archive.
             if p.suffix in (".obs", ".nav"):
@@ -172,6 +227,33 @@ def _failure_since_resolved(text: str) -> bool:
             return False
 
     return False
+
+
+# The example of an error group shown in the mail, in characters.
+# gnssrefl_processor.py says what happened to a day only after its
+# results path ("No results file produced: <path> (no SNR file with
+# ...)"), and on the station that path alone is 71 characters: cut at
+# 150, the mail showed the path and nothing of what happened, which was
+# left to the station log. So paths inside the project are shown
+# relative to it (_error_example()), and the example is allowed twice as
+# long.
+ERROR_EXAMPLE_CHARS = 300
+
+
+def _error_example(text: str) -> str:
+    """
+    The text the mail shows for an error group: paths inside the
+    project relative to it (/home/argus_user/GNSS/v4.1/products/... ->
+    products/...), and at most ERROR_EXAMPLE_CHARS characters, " ..."
+    marking a cut. Only for display: grouping (_normalize_message())
+    and the resolved checks read the full text.
+    """
+    t = text.strip()
+    if len(PROJECT_DIR.parts) > 1:
+        t = t.replace(str(PROJECT_DIR).rstrip("/") + "/", "")
+    if len(t) > ERROR_EXAMPLE_CHARS:
+        t = t[:ERROR_EXAMPLE_CHARS - 4].rstrip() + " ..."
+    return t
 
 
 def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
@@ -243,7 +325,7 @@ def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
             status = WARN
 
         example = examples.get((module, severity, description), description)
-        record(status, f"errors/{module}", f"{example[:150]} [{detail}]")
+        record(status, f"errors/{module}", f"{_error_example(example)} [{detail}]")
 
 
 # ------------------------------------------------------------------

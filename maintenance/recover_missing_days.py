@@ -23,7 +23,12 @@ WHERE A DAY IS RECOVERED FROM, in this order
   1. archive/station_YYYYMMDD.um980. pipeline.py moves a raw file here
      once its day has been processed. Its results can still go missing
      later (deleted to reprocess with new settings, or lost with
-     products/).
+     products/). It also moves here a day it gives up on: no SNR file
+     with any orbit, the fallbacks included, once the day is more than
+     5 days old (or 72 h old and failed 10 times; pipeline.py, "A day
+     that can never give results"). Those are the days this script
+     retries every night, until their orbit comes or they are given
+     by hand.
   2. <external_storage_path>/Raw/station_YYYYMMDD.um980.
      station_manager.py moves a day's raw file here when it exports the
      day: once the day has results, or, without results, once it is
@@ -37,7 +42,8 @@ converted again with station/rinex_processor.py (the same convbin flags
 as the pipeline), into a scratch folder, so nothing is added to rinex/ (which compress_rinex.sh, the S3 sync and
 prune_local_rinex.sh manage). The raw file itself is only read.
 The scratch folder is also the working directory, where gnssrefl's
-rinex2snr copies the day's RINEX (350-400 MB) and leaves it. It is
+rinex2snr copies the day's RINEX (350-400 MB) and leaves it
+(gnssrefl_processor.py now removes that copy itself, too). It is
 emptied after every day and removed at the end; a scratch folder
 more than a day old (left by a run that was killed) is removed at
 the start of the next run.
@@ -53,26 +59,41 @@ move it from under this script. Today's UTC day is never recovered
 either: station_manager.py is still recording it.
 
 Processing is station/gnssrefl_processor.py's process(), as in the
-pipeline: the same station codes, sample rate, orbit source and gnssir
-strategy, all from station.json, and the results land in the station's
-own results folder.
+pipeline: the same station codes, sample rate, orbit source, fallback
+orbits and gnssir strategy, all from station.json, and the results land
+in the station's own results folder. For a day that ended more than
+72 h ago, process() tries gnssrefl_orbit_fallbacks ("rapid", then
+"nav") when the configured orbit makes no SNR file -- "nav", GPS only,
+only for a day more than 5 days old. A day made with a fallback orbit
+is said so, and listed in the summary: to redo it with the multi-GNSS
+orbit later, delete its results and give it by hand. To reprocess
+days with the configured orbit only, set "gnssrefl_orbit_fallbacks": []
+in station.json for that run.
 
 WHAT CAN HAPPEN TO A DAY
 
   recovered   gnssir wrote a results file with data rows.
-  no data     rinex2snr wrote a fresh SNR file, and gnssir ran to the
-              end but kept no arc.
+  no data     rinex2snr wrote a fresh SNR file, and gnssir ran through
+              its quality control but kept no arc.
               A <doy>.no_data marker is written next to the results, so
-              the automatic search does not try the day every night.
+              the automatic search does not try the day every night
+              (pipeline.py writes the same marker for such a day).
               Delete it to try again, e.g. after changing the elevation
               or RH settings in station.json.
-  not yet     rinex2snr wrote no SNR file. Most often the orbit is not
-              published yet (it routinely takes 1-2 days), so the day is
-              tried again on the next run. No marker.
-  failed      convbin failed on the raw file, rinex2snr or gnssir raised
-              (a gnssrefl error is not a lack of data), or gnssir did
-              not replace an existing results file. Tried again on the
-              next run.
+  not yet     no SNR file with any orbit tried. For a day under 72 h
+              old the orbit is most often not published yet (it
+              routinely takes 1-2 days); for an older one the fallback
+              orbits were tried too, so it is no orbit at all, no
+              network, or a RINEX without usable data. Also a day whose
+              only SNR file came from the GPS-only fallback and kept no
+              arc: a multi-GNSS orbit may still give arcs. Tried again
+              on the next run. No marker.
+  failed      convbin failed on the raw file, rinex2snr raised with
+              every orbit tried or gnssir raised (a gnssrefl error is not
+              a lack of data; one orbit raising while another simply had
+              none is "not yet"), gnssir stopped before its quality
+              control, or it did not replace an existing results file.
+              Tried again on the next run.
 
 The shell version wrote the marker whenever gnssir left no results
 file, whatever the reason, so a day whose orbit was not out yet could
@@ -144,6 +165,17 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "station"))
 
+# Only constants and the marker helpers: nothing of gnssrefl is
+# imported until a day is processed.
+from gnssrefl_processor import (  # noqa: E402
+    OUTCOME_NO_ARCS,
+    OUTCOME_NO_ARCS_GPS_ONLY,
+    OUTCOME_NO_SNR,
+    OUTCOME_OK,
+    no_data_marker_path,
+    write_no_data_marker,
+)
+
 # station_manager.py names each UTC day's raw file station_YYYYMMDD.um980
 # (_raw_file_for_day). Other names are one-off recordings.
 RAW_NAME = re.compile(r"^station_(\d{8})\.um980$")
@@ -156,8 +188,9 @@ LEGACY_RINEX = r"^{code9}_R_(\d{{4}})(\d{{3}})0000_01D_\d\dS_MO\.RNX$"
 # modification times to the second only.
 FRESH_SLACK_S = 2.0
 
-# gnssrefl_processor.py's messages when rinex2snr or gnssir raised
-# (_process_staged()): gnssir did not run to the end.
+# gnssrefl_processor.py's messages when rinex2snr raised with every
+# orbit tried, or gnssir raised (_process_staged(), _no_snr_message()):
+# a gnssrefl error, "failed" whatever else the day left.
 STAGE_FAILED = ("rinex2snr failed:", "gnssir failed:")
 
 # tempfile.mkdtemp() prefix of the scratch folder in the project root.
@@ -200,9 +233,8 @@ class Station:
 
     def no_data_marker(self, day: date) -> Path:
         # Not zero-padded: the name the shell version wrote, and the
-        # one clean_processing_queue.py reads.
-        doy = day.timetuple().tm_yday
-        return self.results_file(day).parent / f"{doy}.no_data"
+        # one clean_processing_queue.py reads (and pipeline.py writes).
+        return no_data_marker_path(self.results_file(day).parent, day)
 
     def snr_files(self, day: date) -> list[Path]:
         # gnssrefl gps.snr_name(): <sta><DDD>0.<YY>.snr<type>, maybe
@@ -371,6 +403,9 @@ class Recovery:
         self._gnssir_factory = gnssir_factory or self._real_gnssir
         self._rinex = None
         self._gnssir = None
+        # The last day's GNSS-IR result, for main() to say which orbit
+        # made it (None when the day did not get that far).
+        self.last_result = None
 
     def _real_rinex(self, scratch: Path):
         from rinex_processor import RinexProcessor
@@ -397,6 +432,7 @@ class Recovery:
         results = self.station.results_file(day)
         started = time.time()
         converted: list[Path] = []
+        self.last_result = None
 
         try:
             if source.is_raw:
@@ -414,7 +450,10 @@ class Recovery:
 
             if self._gnssir is None:
                 self._gnssir = self._gnssir_factory()
+            # No retry_count: for a day more than 72 h old, its age alone
+            # lets process() try the fallback orbits.
             result = self._gnssir.process(observation_file, day=day)
+            self.last_result = result
 
         finally:
             for path in converted:
@@ -432,19 +471,42 @@ class Recovery:
                 marker.unlink()
             return "recovered", result.message
 
+        if str(result.message).startswith(STAGE_FAILED):
+            # rinex2snr raised with every orbit tried, or gnssir raised: a
+            # gnssrefl error, not a missing orbit. Checked before the SNR
+            # file, which a raising rinex2snr never leaves (the processor
+            # removes whatever such an attempt wrote), and before the
+            # outcome, which is "no_snr" for it (the pipeline's hand-off
+            # rule treats it as a day without an SNR file).
+            return "failed", result.message
+
         if any(_fresh(p, started) for p in self.station.snr_files(day)):
-            if str(result.message).startswith(STAGE_FAILED):
-                return "failed", result.message
+            # What the processor says it was, when it says (a stand-in
+            # may not): a fresh SNR file alone is not enough, since one
+            # orbit's attempt may have left one while another made none.
+            outcome = getattr(result, "outcome", "")
+            if outcome in (OUTCOME_NO_SNR, OUTCOME_NO_ARCS_GPS_ONLY):
+                return "not yet", result.message
             if results.exists() and not _fresh(results, started):
                 return "failed", ("gnssir did not replace the existing "
                                   f"results file: {result.message}")
-            marker = self.station.no_data_marker(day)
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(datetime.now(timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ -- no usable retrievals\n"))
+            if outcome and outcome not in (OUTCOME_NO_ARCS, OUTCOME_OK):
+                # gnssir stopped before its quality control: not a
+                # lack of data, never a marker
+                return "failed", result.message
+            write_no_data_marker(results.parent, day)
             return "no data", result.message
 
         return "not yet", result.message
+
+
+def _fallback_orbit(result) -> str:
+    """The fallback orbit that made the day's SNR file, or "" (the
+    configured orbit, or no result)."""
+
+    tried = tuple(getattr(result, "orbits_tried", ()) or ())
+    used = getattr(result, "orbit_used", "") or ""
+    return used if used and len(tried) > 1 and used != tried[0] else ""
 
 
 def _parse_since(text: str | None) -> date | None:
@@ -581,6 +643,7 @@ def main(argv=None, cfg=None, now: datetime | None = None,
     _remove_stale_scratch(project_root, time.time())
     scratch = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=str(project_root)))
     outcomes: dict[str, list[int]] = {}
+    with_fallback: list[str] = []
     previous_handlers = {}
     previous_cwd = os.getcwd()
     held = contextlib.ExitStack()
@@ -618,6 +681,10 @@ def main(argv=None, cfg=None, now: datetime | None = None,
                 return 1
             print(f"     {outcome}: {detail}")
             outcomes.setdefault(outcome, []).append(doy)
+            fallback = _fallback_orbit(recovery.last_result)
+            if fallback and outcome in ("recovered", "no data"):
+                print(f"     made with fallback orbit {fallback}")
+                with_fallback.append(f"{doy} ({fallback})")
 
     except KeyboardInterrupt as exc:
         print(f"\n  Interrupted ({exc or 'Ctrl+C'}); the scratch folder is removed.")
@@ -635,12 +702,16 @@ def main(argv=None, cfg=None, now: datetime | None = None,
     for outcome, label in (
         ("recovered", "Recovered"),
         ("no data", "Processed, no usable retrievals (marker written)"),
-        ("not yet", "No SNR file yet (orbit not published?), tried again next run"),
+        ("not yet", "No SNR file with any orbit tried (orbit not published yet, "
+                    "no network, or no usable RINEX), tried again next run"),
         ("failed", "Failed, tried again next run"),
     ):
         days = outcomes.get(outcome)
         if days:
             print(f"    {label}: {' '.join(str(d) for d in days)}")
+    if with_fallback:
+        print(f"    Made with a fallback orbit (rapid: no BeiDou; nav: GPS only, "
+              f"about half the tracks): {' '.join(with_fallback)}")
     if outcomes.get("recovered"):
         print("  The next process_and_plot.sh run (nightly, via daily_gnss.sh)")
         print("  refits the record with the recovered day(s).")

@@ -267,7 +267,8 @@ class TestAutomaticMode(RecoverTestCase):
         self.assertEqual(code, 0)
         self.assertTrue(self.station.no_data_marker(nodata).exists())
         self.assertFalse(self.station.no_data_marker(noorbit).exists())
-        self.assertIn("No SNR file yet (orbit not published?), tried again next run: "
+        self.assertIn("No SNR file with any orbit tried (orbit not published yet, "
+                      "no network, or no usable RINEX), tried again next run: "
                       f"{doy_of(noorbit)}", out)
 
         self.gnssir.calls.clear()
@@ -382,6 +383,131 @@ class TestAutomaticMode(RecoverTestCase):
             day.unlink()
         self.run_main("--year", "2026", "--since", "2027-01-03")
         self.assertEqual(self.gnssir.calls, [])
+
+
+class TestProcessorOutcomes(RecoverTestCase):
+    """
+    gnssrefl_processor.py now says what kind of outcome a day had, and
+    tries fallback orbits itself: a fresh SNR file alone no longer
+    decides "no data".
+    """
+
+    def with_outcome(self, outcome: str, writes_snr: bool = True, message: str = "", **extra):
+        station = self.station
+
+        class Reports(FakeGnssir):
+            def process(self, observation_file, day):
+                super().process(observation_file, day)        # an SNR file, no results
+                if not writes_snr:
+                    for snr in station.snr_files(day):
+                        snr.unlink()
+                return SimpleNamespace(success=outcome == "ok", outcome=outcome,
+                                       message=message or f"processor said {outcome}",
+                                       **extra)
+
+        self.gnssir = Reports(self.station, default="nodata")
+
+    def test_no_snr_is_not_yet_even_with_a_fresh_snr_file(self) -> None:
+        # one orbit's attempt may have left an SNR file while none worked
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome("no_snr")
+
+        _code, out = self.run_main()
+
+        self.assertFalse(self.station.no_data_marker(day).exists())
+        self.assertIn("not yet: processor said no_snr", out)
+
+    def test_a_gps_only_fallback_without_arcs_is_not_yet(self) -> None:
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome("no_arcs_gps_only")
+
+        _code, out = self.run_main()
+
+        self.assertFalse(self.station.no_data_marker(day).exists())
+        self.assertIn("not yet: processor said no_arcs_gps_only", out)
+
+    def test_rinex2snr_raising_with_every_orbit_is_failed(self) -> None:
+        # The processor reports it as "no_snr" and removes any SNR file
+        # such an attempt left; still a gnssrefl error, not a missing orbit.
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome(
+            "no_snr", writes_snr=False,
+            message=("rinex2snr failed: simulated rinex2snr failure (orbits tried: "
+                     "gnss (gnssrefl default), rapid, nav)"))
+
+        _code, out = self.run_main()
+
+        self.assertFalse(self.station.no_data_marker(day).exists())
+        self.assertIn("failed: rinex2snr failed: simulated rinex2snr failure", out)
+        self.assertIn(f"Failed, tried again next run: {doy_of(day)}", out)
+        self.assertNotIn("not yet", out)
+
+    def test_one_orbit_raising_while_the_others_had_none_is_not_yet(self) -> None:
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome(
+            "no_snr", writes_snr=False,
+            message=("No results file produced: /x/2026/results/abcd/182.txt (no SNR "
+                     "file with orbits gnss (gnssrefl default), rapid, nav: no orbit for "
+                     "this day, or the RINEX has no usable data; rinex2snr raised with "
+                     "rapid: timed out; see /x/182_translation.txt.gen)"))
+
+        _code, out = self.run_main()
+
+        self.assertIn("not yet: No results file produced", out)
+
+    def test_gnssir_stopping_before_its_quality_control_is_failed(self) -> None:
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome("error")
+
+        _code, out = self.run_main()
+
+        self.assertFalse(self.station.no_data_marker(day).exists())
+        self.assertIn("failed: processor said error", out)
+
+    def test_no_arcs_is_no_data_with_the_pipelines_marker(self) -> None:
+        day = date(2026, 1, 5)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome("no_arcs")
+
+        _code, out = self.run_main("--year", "2026")
+
+        marker = self.station.no_data_marker(day)
+        self.assertEqual(marker.name, "5.no_data")
+        self.assertRegex(marker.read_text(),
+                         r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -- no usable retrievals\n$")
+        self.assertIn("no data: processor said no_arcs", out)
+
+    def test_marker_path_is_the_pipelines(self) -> None:
+        from gnssrefl_processor import no_data_marker_path
+        for day in (date(2026, 1, 5), date(2026, 11, 5)):
+            self.assertEqual(
+                no_data_marker_path(self.station.results_file(day).parent, day),
+                self.station.no_data_marker(day))
+
+    def test_a_day_made_with_a_fallback_orbit_is_said(self) -> None:
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        station = self.station
+
+        class Fallback(FakeGnssir):
+            def process(self, observation_file, day):
+                result = super().process(observation_file, day)
+                result.orbit_used = "rapid"
+                result.orbits_tried = ("gnss (gnssrefl default)", "rapid")
+                return result
+
+        self.gnssir = Fallback(station)
+
+        _code, out = self.run_main()
+
+        self.assertIn("made with fallback orbit rapid", out)
+        self.assertIn(f"Made with a fallback orbit (rapid: no BeiDou; nav: GPS only, "
+                      f"about half the tracks): {doy_of(day)} (rapid)", out)
 
 
 class TestRealConverterWritesToScratch(RecoverTestCase):

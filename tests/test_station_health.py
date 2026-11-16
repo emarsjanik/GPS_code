@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
 import unittest.mock
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -527,6 +528,174 @@ class TestArcStats(HealthTest):
         gr.write_status(self.files, ok=True)
         st = json.loads((self.files / "fit" / gr.STATUS_NAME).read_text())
         self.assertEqual(st["arc_stats"][-1]["day"], "2026-10-19")
+
+
+class TestPipelineErrors(HealthTest):
+    """
+    A day the pipeline gave up on (no usable retrievals, or no SNR file
+    with any orbit and handed to recover_missing_days.py) must not keep
+    the errors FAIL in the mail for days; a setting that makes gnssir
+    keep nothing, day after day, still must FAIL.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.results = self.proj / "products" / "refl_code" / "2026" / "results" / STA
+        self.results.mkdir(parents=True)
+
+    def msg(self, doy: int) -> str:
+        # what the pipeline logs since gnssrefl_processor.py says what happened
+        return (f"GNSS-IR processing failed: No results file produced: "
+                f"{self.results}/{doy:03d}.txt (no SNR file with orbits gnss (gnssrefl "
+                f"default), rapid, nav: no orbit for this day, or the RINEX has no usable "
+                f"data; see {self.proj}/products/refl_code/logs/{STA}/2026/"
+                f"{doy:03d}_translation.txt.gen, which shows the last orbit tried only)")
+
+    def no_arcs_msg(self, doy: int) -> str:
+        return (f"GNSS-IR processing failed: No results file produced: "
+                f"{self.results}/{doy:03d}.txt (SNR file made with orbit rapid, but gnssir "
+                f"kept no arc; see {self.results}/failQC/{doy:03d}.txt)")
+
+    def test_results_or_a_no_data_marker_resolve_a_missing_results_file(self) -> None:
+        self.assertFalse(sh._failure_since_resolved(self.msg(309)))
+        (self.results / "310.no_data").write_text("x\n")
+        self.assertFalse(sh._failure_since_resolved(self.msg(309)))
+        (self.results / "309.no_data").write_text("x\n")
+        self.assertTrue(sh._failure_since_resolved(self.msg(309)))
+        (self.results / "309.no_data").unlink()
+        (self.results / "309.txt").write_text("% header\n")
+        self.assertTrue(sh._failure_since_resolved(self.msg(309)))
+
+    def test_the_marker_is_not_zero_padded(self) -> None:
+        (self.results / "005.no_data").write_text("x\n")
+        self.assertFalse(sh._failure_since_resolved(self.msg(5)))
+        (self.results / "5.no_data").write_text("x\n")
+        self.assertTrue(sh._failure_since_resolved(self.msg(5)))
+
+    def test_a_day_whose_raw_file_is_archived_is_resolved(self) -> None:
+        # handed to recover_missing_days.py: the pipeline is done with it
+        archive = self.proj / "archive"
+        archive.mkdir()
+        (archive / "station_20261106.um980").write_bytes(b"x")
+        self.assertFalse(sh._failure_since_resolved(self.msg(309)))
+        (archive / "station_20261105.um980").write_bytes(b"x")
+        self.assertTrue(sh._failure_since_resolved(self.msg(309)))
+
+    def test_messages_without_a_path_stay_unresolved(self) -> None:
+        self.assertFalse(sh._failure_since_resolved(
+            "GNSS-IR processing failed: No results file produced:"))
+        (self.results / "309.no_data").write_text("x\n")
+        self.assertFalse(sh._failure_since_resolved(
+            "GNSS-IR processing failed: rinex2snr failed: simulated (orbits tried: "
+            "gnss (gnssrefl default), rapid, nav)"))
+        # the pipeline's own row for a day given up as no data: never
+        # cleared by its marker
+        self.assertFalse(sh._failure_since_resolved(
+            "GNSS-IR kept no arc for 2026-11-05 (SNR file made with orbit rapid); "
+            "309.no_data written and the raw file archived."))
+
+    def test_the_day_is_read_from_the_results_path_not_the_note(self) -> None:
+        now = datetime(2026, 11, 6, 12, tzinfo=timezone.utc)      # 309 is yesterday
+        with unittest.mock.patch.object(sh, "utcnow", return_value=now):
+            self.assertTrue(sh._is_future_day_message(self.msg(309)))
+            self.assertTrue(sh._is_future_day_message(self.no_arcs_msg(309)))
+            self.assertFalse(sh._is_future_day_message(self.msg(306)))
+            self.assertFalse(sh._is_future_day_message(self.no_arcs_msg(306)))
+
+    def errors_db(self, rows) -> sqlite3.Connection:
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE error_log (id INTEGER PRIMARY KEY, timestamp TEXT, "
+                   "module TEXT, severity TEXT, description TEXT, recovered INTEGER DEFAULT 0)")
+        db.executemany("INSERT INTO error_log (timestamp, module, severity, description) "
+                       "VALUES (?, 'pipeline', ?, ?)", rows)
+        return db
+
+    def check(self, db) -> list:
+        sh.findings.clear()
+        with unittest.mock.patch.object(sh, "utcnow",
+                                        return_value=datetime(2026, 11, 12, 12, tzinfo=timezone.utc)):
+            sh.check_recent_errors(db, 7)
+        return [(f[0], f[1]) for f in sh.findings]
+
+    def test_a_given_up_day_stops_failing_the_mail(self) -> None:
+        db = self.errors_db([(f"2026-11-{d:02d}T00:00:10.000Z", "ERROR", self.msg(309))
+                             for d in (8, 9, 10)])
+        self.assertEqual(self.check(db), [("FAIL", "errors/pipeline")])
+
+        (self.results / "309.no_data").write_text("x\n")
+        self.assertEqual(self.check(db), [("OK", "errors")])
+
+    def test_a_warning_alone_is_ok(self) -> None:
+        db = self.errors_db([("2026-11-10T00:00:10.000Z", "WARNING", "anything")])
+        self.assertEqual(self.check(db), [("OK", "errors")])
+        self.assertIn("none at ERROR level", sh.findings[0][2])
+
+    def test_the_mail_shows_what_happened_after_the_stations_long_path(self) -> None:
+        # On the station the results path alone is 71 characters: cut at
+        # 150, the example showed the path and none of the stage after it.
+        station = Path("/home/argus_user/GNSS/v4.1")
+        refl = station / "products" / "refl_code"
+        head = (f"GNSS-IR processing failed: No results file produced: "
+                f"{refl}/2026/results/{STA}/309.txt (")
+        gen = f"{refl}/logs/{STA}/2026/309_translation.txt.gen"
+        cases = {
+            "no orbit for this day": (
+                f"{head}no SNR file with orbits gnss (gnssrefl default), rapid, nav: no "
+                f"orbit for this day, or the RINEX has no usable data; see {gen}, which "
+                f"shows the last orbit tried only)"),
+            "fallback orbit(s) not tried yet": (
+                f"{head}no SNR file with orbit gnss (gnssrefl default): the orbit may not "
+                f"be published yet, or the RINEX has no usable data; fallback orbit(s) not "
+                f"tried yet: rapid (from the 3rd attempt at least 36 h after the day, or "
+                f"72 h after it), nav (GPS only: once the day is more than 5 days old); "
+                f"see {gen})"),
+            "gnssir kept no arc": (
+                f"{head}SNR file made with orbit gnss (gnssrefl default), but gnssir kept "
+                f"no arc; see {refl}/2026/results/{STA}/failQC/309.txt)"),
+            "gnssir wrote no failQC/309.txt either": (
+                f"{head}SNR file made with orbit gnss (gnssrefl default), but gnssir wrote "
+                f"no failQC/309.txt either: it stopped before its quality control; see the "
+                f"station log)"),
+        }
+        with unittest.mock.patch.object(sh, "PROJECT_DIR", station):
+            for stage, msg in cases.items():
+                with self.subTest(stage=stage):
+                    db = self.errors_db([(f"2026-11-{d:02d}T00:00:10.000Z", "ERROR", msg)
+                                         for d in (8, 9, 10)])
+                    self.assertEqual(self.check(db), [("FAIL", "errors/pipeline")])
+                    message = sh.findings[0][2]
+                    self.assertIn(stage, message)
+                    self.assertIn(f"No results file produced: products/refl_code/2026/"
+                                  f"results/{STA}/309.txt (", message)
+                    self.assertNotIn(str(station), message)
+                    self.assertIn("[3x since 2026-11-08", message)
+
+    def test_error_example_is_cut_with_a_mark(self) -> None:
+        # paths inside the project relative to it, others as they are
+        self.assertEqual(sh._error_example(f"  {self.proj}/raw/x.um980 missing "),
+                         "raw/x.um980 missing")
+        self.assertEqual(sh._error_example("/elsewhere/x.um980"), "/elsewhere/x.um980")
+        cut = sh._error_example("word " * 100)
+        self.assertLessEqual(len(cut), sh.ERROR_EXAMPLE_CHARS)
+        self.assertTrue(cut.endswith(" ..."), cut)
+        full = "x" * sh.ERROR_EXAMPLE_CHARS
+        self.assertEqual(sh._error_example(full), full)
+
+    def test_no_arcs_kept_day_after_day_still_fails(self) -> None:
+        rows = []
+        for d, doy in ((8, 312), (9, 313), (10, 314)):
+            (self.results / f"{doy}.no_data").write_text("x\n")
+            rows.append((f"2026-11-{d:02d}T00:00:10.000Z", "ERROR",
+                         f"GNSS-IR kept no arc for 2026-11-{d - 1:02d} (SNR file made "
+                         f"with orbit gnss (gnssrefl default)); {doy}.no_data written and "
+                         f"the raw file archived. Once is weather; day after day, check "
+                         f"the gnssir settings in station.json (nr1 and nr2, reqAmp, the "
+                         f"azimuth mask)"))
+        db = self.errors_db(rows)
+        self.assertEqual(self.check(db), [("FAIL", "errors/pipeline")])
+        # one such day is a WARN
+        self.assertEqual(self.check(self.errors_db(rows[:1])), [("WARN", "errors/pipeline")])
 
 
 class TestRecordStatusAge(HealthTest):

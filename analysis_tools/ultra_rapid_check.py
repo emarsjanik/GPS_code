@@ -21,10 +21,13 @@ WHAT IT DOES (each run)
      receiver keeps appending to the original) and converts the copy to
      RINEX in products/refl_code_ultra/rinex.
   2. Runs rinex2snr + gnssir on it with orb=ultra -- or, when today's
-     ultra-rapid file is not published yet, the broadcast orbits in the
-     station's own data (orb=nav: GPS only) -- writing ONLY under
-     products/refl_code_ultra (its own REFL_CODE: orbits, SNR, results).
-     The production products/refl_code is never written.
+     ultra-rapid file is not published yet, GPS broadcast orbits
+     (orb=nav: GPS only; gnssrefl downloads them from SOPAC/CDDIS, it
+     does not read the station's own navigation file) -- writing ONLY
+     under products/refl_code_ultra (its own REFL_CODE: orbits, SNR,
+     results). The production products/refl_code is never written.
+     Its own --orbits list is the only fallback: station.json's
+     gnssrefl_orbit_fallbacks is turned off for this check.
   3. Copies the production results of the previous two days into that
      folder (for continuity), runs subdaily over the three days with the
      same settings as process_and_plot.sh (-rhdot True -knots 8, azimuth
@@ -198,11 +201,14 @@ def main() -> int:
     shutil.copy2(raw, snap)                       # the receiver keeps writing the original
     print(f"raw snapshot      : {raw.name} ({snap.stat().st_size / 1e6:.0f} MB)")
 
-    # the same configuration, pointed at its own folders and ultra orbits -- in memory only
+    # the same configuration, pointed at its own folders and ultra orbits -- in memory only;
+    # the --orbits loop below is the fallback, not the production gnssrefl_orbit_fallbacks
     cfg.rinex_dir = ultra / "rinex"
-    base_station = dict(cfg.station, gnssrefl_refl_code=str(ultra / "refl_code"))
+    base_station = dict(cfg.station, gnssrefl_refl_code=str(ultra / "refl_code"),
+                        gnssrefl_orbit_fallbacks=[])
 
-    # gnssrefl also copies the RINEX into the current directory: use our own
+    # gnssrefl also copies the RINEX into the current directory (GnssIrProcessor now
+    # removes that copy itself): use our own all the same
     os.chdir(work)
     from rinex_processor import RinexProcessor
     from gnssrefl_processor import GnssIrProcessor
@@ -212,8 +218,8 @@ def main() -> int:
         print(f"RINEX conversion failed: {conv.message}")
         return 1
     # orbits in order: ultra-rapid multi-GNSS (often not yet published for the
-    # current day), then the broadcast orbits in the station's own data (always
-    # there; GPS only, so fewer tracks, but direction is all GNSS-IR needs)
+    # current day), then GPS broadcast orbits, which gnssrefl downloads (published
+    # within the day; GPS only, so fewer tracks, but direction is all GNSS-IR needs)
     used = None
     for orb in args.orbits.split(","):
         cfg.station = dict(base_station, gnssrefl_orbit_source=orb)

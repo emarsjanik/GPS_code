@@ -1,8 +1,12 @@
 """
 tests/test_pipeline.py
 
-Focused regression tests for the filename-based date extraction fix
-in pipeline.py.
+Focused regression tests for pipeline.py: the filename-based date
+extraction fix, the day still being recorded, the run lock, and (from
+PipelineRunTestCase on) a whole run of one file through a real SQLite
+database with fake converters -- above all a day that can never give
+results (no orbit ever published, no arc kept), which must stop
+failing every run.
 
 Confirmed against a real backlog of raw files that computing a raw
 file's date from its modification time (the original behavior) is
@@ -20,8 +24,12 @@ a recognizable date at all (ad-hoc test recordings).
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import io
+import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -36,9 +44,11 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "station"))
 
 import pipeline as pipeline_module  # noqa: E402
+from database import Database, DatabaseError  # noqa: E402
+from gnssrefl_processor import GPS_ONLY_FALLBACK_AGE_S  # noqa: E402
 from pipeline import (  # noqa: E402
-    ORBIT_WAIT_S, PIPELINE_LOCK_NAME, Pipeline, PipelineBusyError, _date_from_filename,
-    _in_progress_reason, orbit_wait_s,
+    HANDOFF_AGE_S, HANDOFF_RETRIES, ORBIT_WAIT_S, PIPELINE_LOCK_NAME, Pipeline,
+    PipelineBusyError, _date_from_filename, _in_progress_reason, orbit_wait_s,
 )
 
 
@@ -442,6 +452,493 @@ class TestRunLock(unittest.TestCase):
         holder.wait()
         self.assertEqual(pipeline().initialize(lock_wait_s=5), "READY")
         self.assertEqual(done, ["processors", "processors"])
+
+
+# ------------------------------------------------------------------
+# A whole run, file by file: a day that can never give results
+# ------------------------------------------------------------------
+
+NAME = "station_20261105.um980"          # day of year 309, as on CACO-05
+DAY = "2026-11-05"
+
+
+class FakeRinex:
+    """RinexProcessor's convert()/verify(), writing a small .obs file."""
+
+    def __init__(self, rinex_dir: Path):
+        self.rinex_dir = rinex_dir
+        self.converted: list[str] = []
+
+    def convert(self, raw_path: Path):
+        self.converted.append(raw_path.name)
+        if not raw_path.exists():
+            return SimpleNamespace(
+                observation_file="", navigation_file="", sbas_file="", success=False,
+                convbin_version="fake", message=f"Raw file does not exist: {raw_path}")
+        obs = self.rinex_dir / f"{raw_path.stem}.obs"
+        obs.write_text("     3.05           OBSERVATION DATA\n")
+        return SimpleNamespace(observation_file=obs, navigation_file="", sbas_file="",
+                               success=True, convbin_version="fake", message="ok")
+
+    def verify(self, result) -> bool:
+        return True
+
+
+class FakeGnssir:
+    """
+    GnssIrProcessor's process()/verify(). `outcome` (or outcomes[day])
+    is what process() reports; None returns a result without an
+    outcome at all, as a processor or stand-in from before outcomes.
+    """
+
+    def __init__(self, products_dir: Path, outcome: str | None = "ok"):
+        self.products_dir = products_dir
+        self.outcome = outcome
+        self.outcomes: dict = {}
+        self.output_directory: str | None = None
+        self.calls: list[tuple] = []
+
+    def process(self, observation_file, day, retry_count=0):
+        self.calls.append((day, retry_count))
+        outcome = self.outcomes.get(day, self.outcome)
+        output = (self.output_directory if self.output_directory is not None
+                  else str(self.products_dir / str(day.year) / "results" / "usgs"))
+        result = SimpleNamespace(
+            success=outcome == "ok", message=f"fake {outcome}", output_directory=output,
+            reflector_height=19.0 if outcome == "ok" else None, soil_moisture=None,
+            snow_depth=None, quality_score=None, runtime_seconds=0.0,
+            orbit_used="rapid", orbits_tried=("gnss (gnssrefl default)", "rapid", "nav"))
+        if outcome is not None:
+            result.outcome = outcome
+        return result
+
+    def verify(self, result) -> bool:
+        return result.success
+
+
+class PipelineRunTestCase(unittest.TestCase):
+    """One real Pipeline and Database; convbin and gnssrefl faked."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        # Run from the temporary folder: a regression that writes a
+        # marker into the working directory must land here, not in the
+        # checkout, where it would fail every later run of these tests.
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.root)
+        for sub in ("raw", "rinex", "archive", "products", "logs"):
+            (self.root / sub).mkdir()
+        self.cfg = SimpleNamespace(
+            raw_dir=self.root / "raw", rinex_dir=self.root / "rinex",
+            archive_dir=self.root / "archive", products_dir=self.root / "products",
+            logs_dir=self.root / "logs", station={})
+        self.db = Database(path=str(self.root / "station.db"), log_file=None)
+        self.db.connect()
+        self.addCleanup(self.db.close)
+        # every run after the first re-registers its raw files, which the
+        # database refuses (UNIQUE filename) and logs with a traceback
+        db_logger = logging.getLogger("station.database")
+        self.addCleanup(db_logger.setLevel, db_logger.level)
+        db_logger.setLevel(logging.CRITICAL)
+        self.rinex = FakeRinex(self.cfg.rinex_dir)
+        self.gnssir = FakeGnssir(self.cfg.products_dir)
+        self.pipeline = self.new_pipeline()
+        self.out = ""
+
+    def new_pipeline(self) -> Pipeline:
+        pipeline = Pipeline(cfg=self.cfg, db=self.db)
+        pipeline._rinex = self.rinex
+        pipeline._gnssir = self.gnssir
+        pipeline._initialized = True
+        return pipeline
+
+    def raw(self, name: str = NAME, mtime: float | None = None) -> Path:
+        path = self.cfg.raw_dir / name
+        path.write_bytes(b"x" * 100)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def run_at(self, now: datetime):
+        out = io.StringIO()
+        with unittest.mock.patch.object(pipeline_module, "_utcnow", return_value=now), \
+                contextlib.redirect_stdout(out):
+            summary = self.pipeline.run(lock_wait_s=0)
+        self.out = out.getvalue()
+        return summary
+
+    def entry(self, name: str = NAME):
+        return self.db.processing_history(name)[0]
+
+    def errors(self):
+        return self.db.recent_errors(module="pipeline")
+
+    def results(self, year: int = 2026) -> Path:
+        return self.cfg.products_dir / str(year) / "results" / "usgs"
+
+    def fail_times(self, n: int, name: str = NAME) -> None:
+        for _ in range(n):
+            self.db.start_processing(name)
+            self.db.finish_processing(name, success=False, error_message="x")
+
+
+NOV7 = datetime(2026, 11, 7, 0, 0, 5, tzinfo=timezone.utc)      # 1 day after the day
+NOV11 = datetime(2026, 11, 11, 0, 0, 5, tzinfo=timezone.utc)    # 5 days and 5 s after
+
+
+class TestDayWithoutResults(PipelineRunTestCase):
+
+    def test_handoff_age_is_the_gps_only_fallback_age(self) -> None:
+        # the run that hands a day over has tried every fallback, nav included
+        self.assertEqual(HANDOFF_AGE_S, GPS_ONLY_FALLBACK_AGE_S)
+        self.assertEqual(HANDOFF_AGE_S, 5 * 86400)
+        self.assertEqual(HANDOFF_RETRIES, 10)
+
+    def test_a_late_day_fails_and_is_retried_with_its_count(self) -> None:
+        # The first misses of a day are ordinary failures, retried; the
+        # processor gets the day's earlier failures as retry_count.
+        self.raw()
+        self.gnssir.outcome = "no_snr"
+        for _ in range(3):
+            summary = self.run_at(NOV7)
+            self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+        self.assertEqual([c[1] for c in self.gnssir.calls], [0, 1, 2])
+        self.assertTrue((self.cfg.raw_dir / NAME).exists())
+        self.assertEqual(self.entry().retry_count, 3)
+        self.assertFalse(self.entry().completed)
+        errors = self.errors()
+        self.assertEqual([e.severity for e in errors], ["ERROR"] * 3)
+        for e in errors:
+            self.assertTrue(e.description.startswith("GNSS-IR processing failed: fake no_snr"))
+
+    def test_success_archives_as_before(self) -> None:
+        self.raw()
+        summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_processed, summary.files_failed), (1, 0))
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
+        self.assertTrue(self.entry().completed)
+        self.assertIsNone(self.entry().error_message)
+        self.assertEqual(self.db.latest_raw_file().notes, "archived after successful processing")
+        self.assertEqual(self.db.gnssir_history(day=DAY)[0].notes, "fake ok")
+
+    def test_no_arc_kept_marks_the_day_and_archives_it(self) -> None:
+        self.raw()
+        self.gnssir.outcome = "no_arcs"
+        with self.assertLogs("station.pipeline", level="WARNING") as logs:
+            summary = self.run_at(NOV7)
+
+        marker = self.results() / "309.no_data"
+        self.assertTrue(marker.exists())
+        self.assertRegex(marker.read_text(),
+                         r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -- no usable retrievals\n$")
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
+        self.assertFalse((self.cfg.raw_dir / NAME).exists())
+        entry = self.entry()
+        self.assertTrue(entry.completed)
+        self.assertEqual(entry.retry_count, 0)
+        self.assertIn("gnssir kept no arc", entry.error_message)
+        self.assertIn("309.no_data", entry.error_message)
+        self.assertIn("archived without results", self.db.latest_raw_file().notes)
+        self.assertEqual((summary.files_failed, summary.files_no_data,
+                          summary.files_processed, summary.products_created), (0, 1, 0, 0))
+        product = self.db.gnssir_history(day=DAY)[0]
+        self.assertEqual(product.notes, "fake no_arcs")
+        self.assertFalse(product.processing_success)
+        # one ERROR row that the marker does not clear: once is weather,
+        # day after day a setting
+        (error,) = self.errors()
+        self.assertEqual(error.severity, "ERROR")
+        self.assertIn("GNSS-IR kept no arc for 2026-11-05", error.description)
+        self.assertIn("309.no_data written", error.description)
+        self.assertNotIn("No results file produced", error.description)
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertIn("NO DATA", logs.output[0])
+
+        # never converted again
+        summary = self.run_at(NOV7 + timedelta(days=1))
+        self.assertEqual(self.rinex.converted, [NAME])
+        self.assertEqual(summary.files_failed, 0)
+
+    def test_marker_name_is_not_zero_padded(self) -> None:
+        self.raw("station_20260105.um980")
+        self.gnssir.outcome = "no_arcs"
+        self.run_at(datetime(2026, 1, 7, 0, 0, 5, tzinfo=timezone.utc))
+        self.assertTrue((self.results() / "5.no_data").exists())
+        self.assertFalse((self.results() / "005.no_data").exists())
+
+    def test_overnight_recording_with_no_arc_is_archived_without_a_marker(self) -> None:
+        name = "overnight_20261105_120000.um980"
+        self.raw(name, mtime=NOV7.timestamp() - 86400)
+        self.gnssir.outcome = "no_arcs"
+        summary = self.run_at(NOV7)
+        self.assertTrue((self.cfg.archive_dir / name).exists())
+        self.assertTrue(self.entry(name).completed)
+        self.assertEqual(summary.files_no_data, 1)
+        self.assertEqual(list(self.results().glob("*.no_data")), [])
+        (error,) = self.errors()
+        self.assertNotIn("no_data", error.description)
+
+    def test_marker_that_cannot_be_written_is_an_ordinary_failure(self) -> None:
+        self.raw()
+        self.gnssir.outcome = "no_arcs"
+        self.gnssir.output_directory = "."      # no results folder: never the cwd
+        summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_failed, summary.files_no_data), (1, 0))
+        self.assertTrue((self.cfg.raw_dir / NAME).exists())
+        self.assertFalse(self.entry().completed)
+        self.assertEqual(list(Path.cwd().glob("309.no_data")), [])
+
+    def test_a_day_without_an_snr_file_is_handed_to_step_1_after_5_days(self) -> None:
+        self.raw()
+        self.gnssir.outcome = "no_snr"
+        with self.assertLogs("station.pipeline", level="WARNING") as logs:
+            summary = self.run_at(NOV11)
+
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
+        self.assertFalse((self.cfg.raw_dir / NAME).exists())
+        entry = self.entry()
+        self.assertTrue(entry.completed)
+        self.assertIn("recover_missing_days", entry.error_message)
+        self.assertIn("gnss (gnssrefl default), rapid, nav", entry.error_message)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
+        self.assertEqual(list(self.results().glob("*.no_data")), [])
+        # ONE WARNING, not an ERROR: in the station log ...
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertTrue(logs.output[0].startswith(f"WARNING:station.pipeline:HANDED OFF {NAME}"))
+        self.assertIn("recover_missing_days", logs.output[0])
+        # ... and as a WARNING row, the only trace when Step 2 hands the
+        # day off (its output is shown only when the step fails)
+        (row,) = self.errors()
+        self.assertEqual(row.severity, "WARNING")
+        self.assertEqual(row.description, logs.records[0].getMessage())
+        self.assertIn("Handed Off           : 1", self.out)
+        self.assertIn("No Usable Data       : 0", self.out)
+
+        # the moved file is never converted, nor reported missing
+        summary = self.run_at(NOV11 + timedelta(days=1))
+        self.assertEqual(self.rinex.converted, [NAME])
+        self.assertEqual(summary.files_failed, 0)
+        self.assertFalse(any("does not exist" in e.description for e in self.errors()))
+
+    def test_exactly_5_days_is_not_yet_handed_off(self) -> None:
+        self.raw()
+        self.gnssir.outcome = "no_snr"
+        summary = self.run_at(datetime(2026, 11, 11, tzinfo=timezone.utc))
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+        self.assertTrue((self.cfg.raw_dir / NAME).exists())
+
+    def test_a_day_is_handed_off_on_its_11th_attempt(self) -> None:
+        # reruns by hand: from 72 h after the day, 10 failures are enough
+        nov9 = datetime(2026, 11, 9, 0, 0, 5, tzinfo=timezone.utc)     # 72 h and 5 s after
+        self.raw()
+        self.gnssir.outcome = "no_snr"
+        self.run_at(NOV7)                       # retry_count 1
+        self.fail_times(8)                      # retry_count 9
+        summary = self.run_at(nov9)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+        summary = self.run_at(nov9)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
+        self.assertEqual([c[1] for c in self.gnssir.calls], [0, 9, 10])
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
+
+    def test_a_count_raised_while_gnssrefl_was_down_hands_off_no_young_day(self) -> None:
+        # failures that never reached gnssrefl raise the count too: a day
+        # whose orbit is only late is not given up for them
+        self.raw()
+        self.gnssir.outcome = "no_snr"
+        self.run_at(NOV7)
+        self.fail_times(HANDOFF_RETRIES + 5)
+        summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+        self.assertTrue((self.cfg.raw_dir / NAME).exists())
+
+    def test_gps_only_no_arcs_is_handed_off_not_marked(self) -> None:
+        # a GPS-only fallback kept no arc: a multi-GNSS orbit still might
+        self.raw()
+        self.gnssir.outcome = "no_arcs_gps_only"
+        summary = self.run_at(NOV11)
+        self.assertEqual((summary.files_handed_off, summary.files_no_data), (1, 0))
+        self.assertEqual(list(self.results().glob("*.no_data")), [])
+
+    def test_any_other_recording_is_given_up_too_and_retried_by_nobody(self) -> None:
+        # recover_missing_days.py knows station day files only, so an
+        # overnight_ recording is not handed to it -- but retried here it
+        # would fail every run for good: archived, by the same rule
+        name = "overnight_20261105_120000.um980"
+        self.raw(name, mtime=NOV7.timestamp() - 86400)
+        self.gnssir.outcome = "no_snr"
+        summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+
+        with self.assertLogs("station.pipeline", level="WARNING") as logs:
+            summary = self.run_at(NOV11)
+
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
+        self.assertTrue((self.cfg.archive_dir / name).exists())
+        self.assertFalse((self.cfg.raw_dir / name).exists())
+        entry = self.entry(name)
+        self.assertTrue(entry.completed)
+        self.assertIn("nothing retries this recording", entry.error_message)
+        self.assertNotIn("handed to", entry.error_message)
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertTrue(logs.records[0].getMessage().startswith(f"GIVEN UP {name}"))
+        warning, first = self.errors()                  # newest first
+        self.assertEqual((warning.severity, first.severity), ("WARNING", "ERROR"))
+        self.assertTrue(warning.description.startswith(f"GIVEN UP {name}"))
+        self.assertEqual(list(self.results().glob("*.no_data")), [])
+
+        summary = self.run_at(NOV11 + timedelta(days=1))
+        self.assertEqual(self.rinex.converted, [name, name])
+        self.assertEqual(summary.files_failed, 0)
+
+    def test_any_other_recording_waits_as_long_as_a_station_day(self) -> None:
+        name = "overnight_20261105_120000.um980"
+        self.raw(name, mtime=NOV7.timestamp() - 86400)
+        self.gnssir.outcome = "no_snr"
+        # exactly 5 days after the day, on its first attempt
+        summary = self.run_at(datetime(2026, 11, 11, tzinfo=timezone.utc))
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+        # a raised count on a day not yet 72 h old
+        self.fail_times(HANDOFF_RETRIES + 5, name)
+        summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+        self.assertTrue((self.cfg.raw_dir / name).exists())
+
+    def test_a_handoff_whose_warning_row_cannot_be_written_is_still_no_failure(self) -> None:
+        self.raw()
+        self.gnssir.outcome = "no_snr"
+        real_log_error = self.db.log_error
+
+        def log_error(module, severity, *args, **kwargs):
+            if severity == "WARNING":
+                raise DatabaseError("Database operation failed: database is locked")
+            return real_log_error(module, severity, *args, **kwargs)
+
+        with unittest.mock.patch.object(self.db, "log_error", log_error):
+            summary = self.run_at(NOV11)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
+        self.assertTrue(self.entry().completed)
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
+
+    def test_errors_are_never_handed_off(self) -> None:
+        # a gnssrefl or setup problem is not a lack of data
+        for outcome in ("error", None):
+            with self.subTest(outcome=outcome):
+                self.raw()
+                self.gnssir.outcome = outcome
+                self.run_at(NOV11)
+                self.fail_times(HANDOFF_RETRIES)
+                summary = self.run_at(NOV11 + timedelta(days=30))
+                self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+                self.assertTrue((self.cfg.raw_dir / NAME).exists())
+                self.assertEqual(self.errors()[0].severity, "ERROR")
+
+    def test_a_failed_archive_is_an_ordinary_failure_and_the_run_goes_on(self) -> None:
+        other = "station_20261104.um980"
+        self.raw()
+        self.raw(other)
+        self.gnssir.outcome = "no_arcs"
+        real_archive = Pipeline._archive
+
+        def archive(pipeline, raw_path, job, notes="archived after successful processing"):
+            if raw_path.name == other:
+                raise OSError("disk full")
+            return real_archive(pipeline, raw_path, job, notes=notes)
+
+        with unittest.mock.patch.object(Pipeline, "_archive", archive):
+            summary = self.run_at(NOV7)
+
+        self.assertEqual((summary.files_failed, summary.files_no_data), (1, 1))
+        self.assertTrue((self.cfg.raw_dir / other).exists())
+        self.assertFalse(self.entry(other).completed)
+        self.assertTrue(any("disk full" in e.description for e in self.errors()))
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
+
+    def test_a_queued_file_found_in_archive_is_finished_not_failed(self) -> None:
+        # moved to archive/ by hand (README, "A day without results"), or
+        # by a run stopped before finishing its entry: no "Raw file does
+        # not exist" on every run
+        path = self.raw()
+        self.gnssir.outcome = "no_snr"
+        self.run_at(NOV7)
+        path.rename(self.cfg.archive_dir / NAME)
+        with self.assertLogs("station.pipeline", level="WARNING") as logs:
+            summary = self.run_at(NOV7 + timedelta(days=1))
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
+        self.assertEqual(self.rinex.converted, [NAME])
+        self.assertTrue(self.entry().completed)
+        self.assertIn("already in archive/", self.entry().error_message)
+        # the first attempt's ERROR, then this run's one WARNING
+        self.assertEqual([e.severity for e in self.errors()], ["WARNING", "ERROR"])
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertIn("HANDED OFF", logs.output[0])
+
+    def test_an_entry_removed_during_the_run_is_skipped(self) -> None:
+        # clean_processing_queue.py --execute does not take the run lock
+        self.raw()
+        real_start = self.db.start_processing
+
+        def start(filename):
+            with self.db._cursor() as cursor:
+                cursor.execute("DELETE FROM processing_queue WHERE filename = ?", (filename,))
+            return real_start(filename)
+
+        with unittest.mock.patch.object(self.db, "start_processing", start):
+            summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_failed, summary.files_processed), (0, 0))
+        self.assertEqual(self.rinex.converted, [])
+
+    def test_a_database_error_outside_the_steps_does_not_end_the_run(self) -> None:
+        other = "station_20261104.um980"
+        self.raw()
+        self.raw(other)
+        real_start = self.db.start_processing
+
+        def start(filename):
+            if filename == other:
+                raise DatabaseError("Database operation failed: database is locked")
+            return real_start(filename)
+
+        with unittest.mock.patch.object(self.db, "start_processing", start):
+            summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_failed, summary.files_processed), (1, 1))
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
+        self.assertIn("Pipeline Summary", self.out)
+
+    def test_an_unreadable_retry_count_is_taken_as_0(self) -> None:
+        self.raw()
+        real_history = self.db.processing_history
+
+        def history(filename=None):
+            if filename is not None:
+                raise sqlite3.OperationalError("database is locked")
+            return real_history(filename)
+
+        with unittest.mock.patch.object(self.db, "processing_history", history):
+            summary = self.run_at(NOV7)
+        self.assertEqual(summary.files_processed, 1)
+        self.assertEqual(self.gnssir.calls[0][1], 0)
+
+
+class TestFinishProcessingNote(PipelineRunTestCase):
+
+    def test_a_finished_entry_keeps_its_note(self) -> None:
+        for name, note, want in (("a.um980", "why", "why"), ("b.um980", "", None)):
+            self.db.queue_file(name)
+            self.db.start_processing(name)
+            self.db.finish_processing(name, success=True, note=note)
+            entry = self.entry(name)
+            self.assertTrue(entry.completed)
+            self.assertEqual(entry.error_message, want)
+
+        self.db.queue_file("c.um980")
+        self.db.start_processing("c.um980")
+        self.db.finish_processing("c.um980", success=False, error_message="boom")
+        entry = self.entry("c.um980")
+        self.assertEqual((entry.retry_count, entry.error_message, entry.completed),
+                         (1, "boom", False))
 
 
 if __name__ == "__main__":

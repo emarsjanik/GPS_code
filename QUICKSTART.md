@@ -247,9 +247,9 @@ over time. A few things worth knowing before you trust what you see:
 - **Not every day will produce results, and that's normal.** Depending
   on your elevation mask, azimuth mask, and site geometry, some days
   simply won't have enough usable satellite passes. This project's
-  tooling (`recover_missing_days.sh`) distinguishes this genuine
-  "no data" outcome from a transient failure (like a not-yet-published
-  orbit product) automatically.
+  tooling (`recover_missing_days.sh`, and the pipeline itself)
+  distinguishes this genuine "no data" outcome from a transient failure
+  (like a not-yet-published orbit product) automatically.
 - **A pattern that correlates with something external does not by
   itself prove the antenna is sensing that thing.** Before trusting a
   result, especially one you plan to publish or rely on, use
@@ -340,6 +340,18 @@ timing).**
 Double-check `latitude`/`longitude`/`height` in `station.json` first —
 these are the single most common source of confusing results, since an
 error here doesn't cause a processing failure, just a wrong answer.
+
+**A day has no results, or the health mail keeps reporting "No results
+file produced" for the same day.**
+Usually its orbit is not published yet (about a day late; up to 2 days
+is normal) and the next night's run takes care of it. A day whose orbit
+never comes, or that has no usable retrievals, is now handled by the
+pipeline itself: it tries GFZ's other rapid orbit from the day's 3rd
+attempt, marks a day with no arc kept as having no data, and hands a day
+still without an orbit after 5 days to `recover_missing_days`, which
+retries it every night. See [A day without results](README.md#a-day-without-results)
+in the README for what you will see, and for how to process a day by
+hand (`maintenance/recover_missing_days.sh <doy>`).
 
 **"convbin not found" or receiver connection errors.**
 Re-run `./test_installation.sh` for a clear diagnosis, then
