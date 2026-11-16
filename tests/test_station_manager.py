@@ -1553,7 +1553,7 @@ class TestRealPipelineInBackground(StationManagerTestCase):
                 return True
 
         class FakeGnssir:
-            def process(self, observation_file, day):
+            def process(self, observation_file, day, retry_count=0):
                 return SimpleNamespace(
                     reflector_height=19.0, soil_moisture=None, snow_depth=None,
                     quality_score=1.0, output_directory=str(root / "products"),

@@ -1981,11 +1981,20 @@ class Database:
                 raise NotFoundError(f"{filename!r} is not in the processing queue")
 
     def finish_processing(
-        self, filename: str, success: bool = True, error_message: str = ""
+        self,
+        filename: str,
+        success: bool = True,
+        error_message: str = "",
+        note: str = "",
     ) -> None:
         """
         Mark a file's processing as finished, successfully or not.
         On failure, increments retry_count and records error_message.
+        On success, error_message holds `note` (NULL without one):
+        pipeline.py finishes a day it gives up on -- no usable
+        retrievals, or handed to recover_missing_days.py -- as
+        completed, so it is never retried, and says why here (the
+        table has no notes column).
 
         Raises
         ------
@@ -1997,9 +2006,9 @@ class Database:
             if success:
                 cursor.execute(
                     "UPDATE processing_queue SET running = 0, "
-                    "completed = 1, failed = 0, error_message = NULL "
+                    "completed = 1, failed = 0, error_message = ? "
                     "WHERE filename = ?",
-                    (filename,),
+                    (note or None, filename),
                 )
             else:
                 cursor.execute(

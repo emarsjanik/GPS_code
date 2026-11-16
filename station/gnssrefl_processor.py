@@ -67,7 +67,9 @@ Confirmed against gnssrefl's own documentation (gnssrefl.readthedocs.io)
           it, even if a newer, correct version has since been staged
           properly. Worked around by removing any same-named file
           from the current working directory immediately before
-          staging (_stage_rinex_file()).
+          staging (_stage_rinex_file()), and its .rnx.gz and
+          .crx.gz forms too: rinex2snr unpacks those into that very
+          name first (rinex2snr.py:231-237).
         - gnssir's own noise-floor estimation reads two config
           fields, nr1/nr2, defining the region of the reflector-
           height spectrum used to estimate background noise -- NOT
@@ -91,20 +93,26 @@ Confirmed against gnssrefl's own documentation (gnssrefl.readthedocs.io)
           earlier version of this fix assumed the latter, which is
           not a valid parameter name and raised TypeError on every
           call; caught via a live pipeline run and corrected).
-        - _stage_rinex_file() copies the day's RINEX observation
-          file into gnssrefl's working directory (both the properly
-          staged directory AND, per the stale-file-reuse workaround
-          above, indirectly into gnssrefl's own current-working-
-          directory lookup path) so rinex2snr(nolook=True) can find
-          it. That staged copy was never cleaned up afterward --
-          confirmed directly on real hardware: 29 accumulated files,
-          9.3GB, spanning weeks of normal single-pass operation
-          (never reprocessed), since the only existing cleanup
-          (removing a same-named stale file before staging a new
-          one) never triggers for a day that's processed exactly
-          once. process() now removes its staged file in a finally
-          block once done with it, success or failure, since it is
-          only ever needed transiently for rinex2snr() to read.
+        - Every day processed left two copies of its RINEX
+          (350-400 MB each) behind. _stage_rinex_file() copies the
+          file into $REFL_CODE/<year>/rinex/<4-char station>/ so
+          rinex2snr(nolook=True) can find it; rinex2snr then finds
+          no such file in the current working directory and copies
+          it there itself (`cp <staged file> .`, gnssrefl
+          rinex2snr.py:243-244). On the RINEX 3 path nothing ever
+          removes that second copy: only conv2snr's RINEX 2 branch
+          deletes its input (rinex2snr.py:496-499), and gnssrefl
+          never changes directory. The "29 files, 9.3GB" first found
+          in station/ over weeks of ordinary, never-reprocessed
+          operation were these working-directory copies -- station/
+          is station_manager's working directory; the staged folder
+          is under products/. Removing the staged copy after every
+          day (done first) was right, but did not stop the growth:
+          by November 2026, 29 GB had piled up in station/ and in
+          $HOME (cron's working directory). process() now removes
+          both, in a finally block, success or failure
+          (_remove_cwd_copy(), _cleanup_staged_file()); both are
+          only ever needed while rinex2snr() reads them.
 
 What this does, and what it deliberately does NOT do
 --------------------------------------------------------
@@ -156,7 +164,38 @@ What this does, and what it deliberately does NOT do
       available as a genuine fallback specifically for same-day/
       real-time processing before that day's multi-GNSS orbit product
       has been published yet, or for a station with no reliable
-      internet at all -- not as a general-purpose default.
+      internet at all -- not as a general-purpose default. It is GPS
+      broadcast ephemeris that gnssrefl downloads (SOPAC/CDDIS,
+      gps.py getnavfile()), not the station's own navigation file.
+
+      A day whose orbit never comes, confirmed on the station in
+      November 2026: GFZ never published its multi-GNSS rapid orbit
+      (GFZ0MGXRAP, what gnssrefl's default 'gnss' fetches as 'gbm'
+      from CDDIS) for 2026-11-05, DOY 309 -- CDDIS gps/products/2443
+      lists 308 and 310 only. rinex2snr printed "The orbit file you
+      requested does not exist." (to stdout only, not to its .gen
+      log) and returned without an SNR file; gnssir found no SNR
+      file; and the day failed on every run, 20 retries and three
+      FAILs in every morning's health mail, until it was processed
+      by hand with "rapid": GFZ0OPSRAP from isdc-data.gfz.de, which
+      was there (GPS, GLONASS and Galileo, no BeiDou; 139 tracks
+      against 148 and 158 for the days either side).
+
+      Hence "gnssrefl_orbit_fallbacks" (default ["rapid", "nav"]):
+      when the configured or default orbit made no SNR file,
+      process() tries those orbits in order, in the same call. Only
+      once the normal wait is over, since the default orbit
+      routinely takes 1-2 days and a fallback result is kept for
+      good (recover_missing_days.py skips days with results): a
+      multi-GNSS fallback from the day's 3rd attempt (at least 36 h
+      after the day) or 72 h after the day, a GPS-only one (nav)
+      only 5 days after the day, when pipeline.py is about to give
+      the day up anyway (_orbit_plan()). A fallback that is the same
+      product as an orbit already in the list, after rinex2snr's own
+      renames (rapid=gfr, gnss=gbm, gps=nav, gps+glo=jax), is
+      skipped. The orbit that made the SNR file is in the result's
+      orbit_used and message, so the log and gnssir_products.notes
+      say which days were made with a fallback.
 
 This module knows nothing about SQLite, the receiver, station.py, or
 pipeline decisions -- same boundaries as rinex_processor.py.
@@ -165,7 +204,7 @@ pipeline decisions -- same boundaries as rinex_processor.py.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import json
 import logging
@@ -174,6 +213,179 @@ import shutil
 import time
 
 from config import Config
+
+
+# ----------------------------------------------------------------
+# Orbits (see "A day whose orbit never comes" in the module docstring)
+# ----------------------------------------------------------------
+
+# gnssrefl 4.1.5's orbit_list (rinex2snr_cl.py:526-528). Any other name
+# makes rinex2snr print "You picked an orbit type I do not recognize"
+# and return without an SNR file, so a fallback must be one of these.
+GNSSREFL_ORBITS = frozenset({
+    "gps", "gps+glo", "gnss", "nav", "igs", "igr", "jax", "gbm", "grg",
+    "wum", "wum2", "gfr", "esa", "ultra", "rapid", "gnss2", "nav-sopac",
+    "nav-esa", "nav-cddis", "gnss3", "gnss-gfz",
+})
+
+# rinex2snr's own renames before it fetches anything (rinex2snr_cl.py
+# 536-564): "rapid" IS gfr, "gnss" IS gbm. gnss2 also ends at gbm but
+# fetches it from IGN, another source, so it is not an alias here.
+_ORBIT_ALIASES = {"gps": "nav", "rapid": "gfr", "gnss": "gbm", "gps+glo": "jax"}
+
+# GPS-only products, by their name after _ORBIT_ALIASES (gnssrefl's own
+# rinex2snr documentation: nav is GPS broadcast, igs/igr IGS GPS only).
+# "nav" took a 5.5 h recording of this station from 48 tracks to 20.
+GPS_ONLY_ORBITS = frozenset({"nav", "nav-sopac", "nav-esa", "nav-cddis", "igs", "igr"})
+
+# What a fallback costs against the multi-GNSS default, said wherever a
+# day made with it is reported.
+_ORBIT_COVERAGE = {
+    "gfr": "GPS, GLONASS and Galileo; no BeiDou",
+    "jax": "GPS and GLONASS only",
+}
+_GPS_ONLY_COVERAGE = "GPS only, about half the tracks"
+
+DEFAULT_ORBIT_FALLBACKS = ("rapid", "nav")
+
+# When a fallback may be tried for a day whose orbit made no SNR file.
+# Not on a day's first attempts: the default orbit routinely takes 1-2
+# days, and a day made with a fallback is kept for good. The pipeline
+# first tries a day 24 h after its end (pipeline.py ORBIT_WAIT_S; the
+# midnight run, then the cron's 02:30 UTC), so its 3rd attempt is the
+# midnight run 48 h after it. FALLBACK_RETRY_MIN_AGE_S keeps a
+# retry_count raised by failures that never reached gnssrefl (a
+# RINEX conversion failure, gnssrefl not initialized, reruns by hand)
+# from bringing that forward to the attempts at 24 and 26.5 h.
+FALLBACK_MIN_RETRIES = 2                  # earlier failed attempts of the day
+FALLBACK_RETRY_MIN_AGE_S = 36 * 3600      # ... and at least this long after it
+FALLBACK_MIN_AGE_S = 72 * 3600            # or this long after the day, whatever the count
+# A GPS-only fallback (when the orbit tried first is not GPS-only) only
+# once the day is more than this old: the last resort before
+# pipeline.py hands the day over (its HANDOFF_AGE_S is this value).
+GPS_ONLY_FALLBACK_AGE_S = 5 * 86400
+
+# Slack on "written during this attempt", for file systems that keep
+# modification times to the second only (as recover_missing_days.py).
+FRESH_SLACK_S = 2.0
+
+# GnssIrResult.outcome
+OUTCOME_OK = "ok"                         # a results file with data rows
+OUTCOME_NO_SNR = "no_snr"                 # no SNR file with any orbit tried
+OUTCOME_NO_ARCS = "no_arcs"               # SNR file made, gnssir kept no arc
+OUTCOME_NO_ARCS_GPS_ONLY = "no_arcs_gps_only"   # the same, from a GPS-only fallback
+OUTCOME_ERROR = "error"                   # anything else
+
+# The marker recover_missing_days.py has always written for a day with
+# no usable retrievals, next to the results, named by the UNPADDED day
+# of year (<doy>.no_data).
+NO_DATA_MARKER_FORMAT = "%Y-%m-%dT%H:%M:%SZ -- no usable retrievals\n"
+
+
+def _utcnow() -> datetime:
+    """The clock of the fallback rules (a test sets it)."""
+
+    return datetime.now(timezone.utc)
+
+
+def day_age_s(day: date, now: datetime | None = None) -> float:
+    """Seconds since the end (24:00 UTC) of `day`; negative before it."""
+
+    day_end = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(days=1)
+    return ((now or _utcnow()) - day_end).total_seconds()
+
+
+def gnssrefl_default_orbit(day: date) -> str:
+    """
+    The orbit rinex2snr picks for `day` when given none, exactly as
+    gnssrefl 4.1.5 does (rinex2snr_cl.py:453-472): 'gnss' after
+    2025 + 168/365.25, 'rapid' after 2021 + 137/365.25, else 'nav'.
+    (A station json with an 'orb' key would win over this, but
+    make_gnssir_input() writes that key only when given one, and this
+    module never gives it.)
+    """
+
+    t = day.year + day.timetuple().tm_yday / 365.25
+    if t > 2025 + 168 / 365.25:
+        return "gnss"
+    if t > 2021 + 137 / 365.25:
+        return "rapid"
+    return "nav"
+
+
+def _canonical_orbit(orb, day: date) -> str:
+    """
+    The product rinex2snr fetches for `orb` on `day`, after its own
+    renames. A name it does not know (e.g. "Rapid": rinex2snr compares
+    as given, and refuses it) is returned as it is, so it never
+    matches -- and never removes -- a fallback that would work.
+    """
+
+    name = orb if orb else gnssrefl_default_orbit(day)
+    if not isinstance(name, str) or name not in GNSSREFL_ORBITS:
+        return str(name)
+    return _ORBIT_ALIASES.get(name, name)
+
+
+def _orbit_label(orb, day: date) -> str:
+    """How an orbit is named in messages: as configured, or e.g.
+    "gnss (gnssrefl default)" when none is."""
+
+    return str(orb) if orb else f"{gnssrefl_default_orbit(day)} (gnssrefl default)"
+
+
+def _orbit_coverage(orb, day: date) -> str:
+    """What `orb` covers, when that is less than the default's; else ""."""
+
+    canonical = _canonical_orbit(orb, day)
+    if canonical in GPS_ONLY_ORBITS:
+        return _GPS_ONLY_COVERAGE
+    return _ORBIT_COVERAGE.get(canonical, "")
+
+
+def _fresh(path: Path, since: float) -> bool:
+    """Written at or after `since` (time.time()), as recover_missing_days.py."""
+
+    try:
+        return path.stat().st_mtime >= since - FRESH_SLACK_S
+    except OSError:
+        return False
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def no_data_marker_path(results_dir, day: date) -> Path:
+    """<results_dir>/<doy>.no_data -- the day of year NOT zero-padded
+    (309.no_data, 5.no_data), unlike the results file (005.txt): the
+    name recover_missing_days.py, clean_processing_queue.py and
+    station_health.py read."""
+
+    return Path(results_dir) / f"{day.timetuple().tm_yday}.no_data"
+
+
+def write_no_data_marker(results_dir, day: date) -> Path:
+    """
+    Mark `day` as processed with no usable retrievals: the same name,
+    place and text recover_missing_days.py writes, so its automatic
+    search, clean_processing_queue.py and station_health.py's
+    currency and error checks all read it. Returns the marker's path.
+
+    Raises ValueError when no results folder is given (an empty path
+    would put the marker in the working directory), OSError when it
+    cannot be written.
+    """
+
+    if str(Path(results_dir)) in ("", "."):
+        raise ValueError("no results folder to write the no-data marker in")
+    marker = no_data_marker_path(results_dir, day)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(datetime.now(timezone.utc).strftime(NO_DATA_MARKER_FORMAT))
+    return marker
 
 
 # ----------------------------------------------------------------
@@ -196,7 +408,39 @@ class GnssIrProcessorError(Exception):
 
 @dataclass
 class GnssIrResult:
-    """The outcome of one process() call."""
+    """
+    The outcome of one process() call.
+
+    outcome says what kind of outcome it was, for a caller that must
+    tell a day that is only late from one that can never give results
+    (pipeline.py's bounded retries, recover_missing_days.py's markers):
+
+        "ok"                a results file with data rows (success).
+        "no_snr"            no fresh SNR file with any orbit tried,
+                            whether rinex2snr returned or raised: the
+                            orbit is not published (yet), or the RINEX
+                            has no usable data. gnssir was not run.
+        "no_arcs"           a fresh SNR file; gnssir ran through its
+                            quality control (a fresh failQC/<doy>.txt)
+                            and kept no arc, so it wrote no results
+                            file. The day has no usable retrievals.
+        "no_arcs_gps_only"  the same, but the SNR file was made with a
+                            GPS-only fallback orbit: a multi-GNSS orbit
+                            may still give arcs, so it is not a no-data
+                            day yet.
+        "error"             everything else: not initialized, bad
+                            input, staging, gnssir raised or stopped
+                            before its quality control, a results file
+                            it did not replace, empty, or without data
+                            rows. A gnssrefl or setup problem, not a
+                            lack of data.
+
+    orbit_used is the orbit whose rinex2snr made the SNR file, and
+    orbits_tried every orbit tried, in order, as named in messages
+    ("gnss (gnssrefl default)" when none is configured). The three
+    default to empty, for results built before they existed; read
+    them with getattr() where a stand-in may lack them.
+    """
 
     success: bool
     observation_file: Path
@@ -211,6 +455,9 @@ class GnssIrResult:
     message: str
     runtime_seconds: float
     gnssrefl_version: str
+    outcome: str = ""
+    orbit_used: str = ""
+    orbits_tried: tuple = ()
 
 
 @dataclass
@@ -278,6 +525,7 @@ class GnssIrProcessor:
     _station_code_9ch: str = field(default="", init=False, repr=False)
     _sample_rate: int = field(default=1, init=False, repr=False)
     _orbit_source: str | None = field(default=None, init=False, repr=False)
+    _orbit_fallbacks: tuple = field(default=(), init=False, repr=False)
     _stats: GnssIrStatistics = field(
         default_factory=GnssIrStatistics, init=False, repr=False
     )
@@ -348,6 +596,21 @@ class GnssIrProcessor:
         )
         self._sample_rate = int(station_section.get("gnssrefl_sample_rate", 1))
         self._orbit_source = station_section.get("gnssrefl_orbit_source") or None
+        self._orbit_fallbacks = self._resolve_orbit_fallbacks(station_section)
+        if self._orbit_source is not None and not (
+            isinstance(self._orbit_source, str)
+            and self._orbit_source in GNSSREFL_ORBITS
+        ):
+            # Not refused (that would be new behaviour for an old
+            # setting), but said: rinex2snr compares the name as given.
+            self._logger.warning(
+                "station.json gnssrefl_orbit_source %r is not an orbit "
+                "gnssrefl 4.1.5 knows (%s): rinex2snr will refuse it and "
+                "make no SNR file, so only gnssrefl_orbit_fallbacks can "
+                "process a day",
+                self._orbit_source,
+                ", ".join(sorted(GNSSREFL_ORBITS)),
+            )
 
         self._verify_gnssrefl_importable()
         self._setup_station_strategy()
@@ -356,34 +619,43 @@ class GnssIrProcessor:
 
         self._logger.info(
             "GnssIrProcessor initialized: station=%s (%s) REFL_CODE=%s "
-            "gnssrefl=%s orbit_source=%s sample_rate=%ds",
+            "gnssrefl=%s orbit_source=%s orbit_fallbacks=%s sample_rate=%ds",
             self._station_code,
             self._station_code_9ch,
             self._refl_code,
             self._gnssrefl_version,
             self._orbit_source or "(gnssrefl default)",
+            ", ".join(self._orbit_fallbacks) or "(none)",
             self._sample_rate,
         )
 
         return "READY"
 
-    def process(self, observation_file: Path, day: date) -> GnssIrResult:
+    def process(
+        self, observation_file: Path, day: date, retry_count: int = 0
+    ) -> GnssIrResult:
         """
         Run rinex2snr then gnssir against `observation_file` for
         `day`. Never raises: every failure mode (not initialized,
         missing input, rinex2snr failing, gnssir failing) comes back
-        as a GnssIrResult with success=False and a clear message.
+        as a GnssIrResult with success=False, an outcome and a clear
+        message.
 
-        The RINEX file staged into gnssrefl's working directory
-        (_stage_rinex_file()) is always removed once this call is
-        done with it, success or failure -- confirmed, real bug this
-        fixes: previously the staged copy (~350-400MB per day) was
-        never cleaned up afterward, only ever opportunistically
-        removed if a file with that exact same name happened to be
-        staged again later, which never happens for a day processed
-        exactly once. Confirmed directly on real hardware: 29
-        accumulated files, 9.3GB, after normal operation with no
-        reprocessing.
+        When the configured (or gnssrefl's default) orbit makes no
+        SNR file, the orbits of station.json's gnssrefl_orbit_fallbacks
+        are tried in turn, once the day's normal wait for its orbit is
+        over (_orbit_plan()): never on a day's first attempts, since
+        the default orbit routinely takes 1-2 days
+        (STATION_JSON_REFERENCE.md, "Orbit source").
+
+        Both copies of the RINEX this call makes are always removed
+        once it is done with them, success or failure: the one
+        _stage_rinex_file() puts under $REFL_CODE, and the one
+        rinex2snr itself copies into the current working directory
+        and never removes (_remove_cwd_copy()). Confirmed, real bug
+        this fixes: at ~350-400MB a day, those copies had piled up to
+        29 GB in station/ and $HOME by November 2026 -- see the
+        module docstring.
 
         Parameters
         ----------
@@ -395,7 +667,18 @@ class GnssIrProcessor:
             gnssrefl's API is year/day-of-year based, not filename-
             based, so this is required explicitly rather than parsed
             out of `observation_file`'s name.
+        retry_count:
+            How many earlier attempts of this day failed
+            (pipeline.py passes processing_queue.retry_count). From 2,
+            i.e. the 3rd attempt, a multi-GNSS fallback orbit may be
+            tried; left at 0 (recover_missing_days.py,
+            ultra_rapid_check.py) only the day's age decides.
         """
+
+        try:
+            retry_count = max(0, int(retry_count or 0))
+        except (TypeError, ValueError):
+            retry_count = 0
 
         observation_file = Path(observation_file)
 
@@ -437,16 +720,17 @@ class GnssIrProcessor:
             )
 
         # Everything from here on operates on the file we just
-        # staged, so it must be cleaned up afterward regardless of
-        # how _process_staged() finishes -- success, a caught
-        # rinex2snr/gnssir failure, or (belt-and-suspenders) an
-        # uncaught exception. See the "confirmed, real bug" note
-        # above and in the module docstring.
+        # staged (and rinex2snr's own copy of it), so both must be
+        # cleaned up afterward regardless of how _process_staged()
+        # finishes -- success, a caught rinex2snr/gnssir failure, or
+        # (belt-and-suspenders) an uncaught exception. See the
+        # "confirmed, real bug" note above and in the module docstring.
         try:
             return self._process_staged(
-                observation_file, day, staged_path, started
+                observation_file, day, staged_path, started, retry_count
             )
         finally:
+            self._remove_cwd_copy(staged_path, observation_file)
             self._cleanup_staged_file(staged_path)
 
     def verify(self, result: GnssIrResult) -> bool:
@@ -586,6 +870,44 @@ class GnssIrProcessor:
             code = (code + "00usa")[:9]
 
         return code
+
+    @staticmethod
+    def _resolve_orbit_fallbacks(station_section: dict) -> tuple:
+        """
+        station.json's "gnssrefl_orbit_fallbacks": the orbits tried,
+        in order, when the configured or default orbit made no SNR
+        file for a day (see the module docstring). Unset means
+        DEFAULT_ORBIT_FALLBACKS, ["rapid", "nav"]; [] turns the
+        fallback off. Names are compared as gnssrefl 4.1.5 does, after
+        trimming and lower-casing.
+
+        A wrong value is refused here, naming it, rather than left to
+        fail every day: rinex2snr only prints "You picked an orbit
+        type I do not recognize" and returns without an SNR file, and
+        a string such as "rapid,nav" would otherwise be read as a
+        list of letters.
+        """
+
+        key = "gnssrefl_orbit_fallbacks"
+        value = station_section.get(key)
+        if value is None:
+            return DEFAULT_ORBIT_FALLBACKS
+        if not isinstance(value, (list, tuple)):
+            raise GnssIrProcessorError(
+                f'station.json {key} must be a list of orbit names, e.g. '
+                f'["rapid", "nav"], or [] for none, not {value!r}'
+            )
+        names: list[str] = []
+        for item in value:
+            name = item.strip().lower() if isinstance(item, str) else None
+            if name not in GNSSREFL_ORBITS:
+                raise GnssIrProcessorError(
+                    f"station.json {key}: {item!r} is not an orbit gnssrefl "
+                    f"knows ({', '.join(sorted(GNSSREFL_ORBITS))})"
+                )
+            if name not in names:
+                names.append(name)
+        return tuple(names)
 
     def _verify_gnssrefl_importable(self) -> None:
         try:
@@ -1108,7 +1430,12 @@ class GnssIrProcessor:
           directory is silently reused forever after, never
           refreshed, with no error or warning. To make this
           impossible to hit, any same-named file in the current
-          working directory is removed before staging.
+          working directory is removed before staging -- and its
+          .rnx.gz and .crx.gz forms, which rinex2snr unpacks into
+          that name before looking (rinex2snr.py:231-237) -- unless
+          it is the observation file itself (a RINEX processed from
+          the working directory under this name), which would
+          otherwise be deleted before it is copied.
 
         The path returned here is the same one process() now passes
         to _cleanup_staged_file() once it's done being used -- see
@@ -1119,26 +1446,30 @@ class GnssIrProcessor:
         assert self._refl_code is not None
 
         year = day.year
-        doy = day.timetuple().tm_yday
 
-        staged_name = (
-            f"{self._station_code_9ch.upper()}_R_{year}{doy:03d}0000"
-            f"_01D_{self._sample_rate:02d}S_MO.rnx"
-        )
+        staged_name = self._staged_name(day)
 
         # Defend against gnssrefl's confirmed stale-file-reuse bug:
         # remove any same-named file sitting in the current working
         # directory before staging, so it can never be silently
         # reused instead of the file we're about to stage.
-        stale_cwd_file = Path.cwd() / staged_name
-        if stale_cwd_file.exists():
-            self._logger.warning(
-                "Removing stale file from the current working "
-                "directory that would otherwise be silently reused "
-                "by gnssrefl instead of today's staged file: %s",
-                stale_cwd_file,
-            )
-            stale_cwd_file.unlink()
+        cwd = Path.cwd()
+        for name in (
+            staged_name,
+            staged_name + ".gz",
+            staged_name[: -len(".rnx")] + ".crx.gz",
+        ):
+            stale_cwd_file = cwd / name
+            if stale_cwd_file.exists() and not _same_file(
+                stale_cwd_file, observation_file
+            ):
+                self._logger.warning(
+                    "Removing stale file from the current working "
+                    "directory that would otherwise be silently reused "
+                    "by gnssrefl instead of today's staged file: %s",
+                    stale_cwd_file,
+                )
+                stale_cwd_file.unlink()
 
         staged_dir = self._refl_code / str(year) / "rinex" / self._station_code
         staged_dir.mkdir(parents=True, exist_ok=True)
@@ -1148,23 +1479,80 @@ class GnssIrProcessor:
 
         return staged_path
 
+    def _staged_name(self, day: date) -> str:
+        """The RINEX 3 long name rinex2snr looks for (see _stage_rinex_file())."""
+
+        doy = day.timetuple().tm_yday
+        return (
+            f"{self._station_code_9ch.upper()}_R_{day.year}{doy:03d}0000"
+            f"_01D_{self._sample_rate:02d}S_MO.rnx"
+        )
+
+    def _remove_cwd_copy(self, staged_path: Path, observation_file: Path) -> None:
+        """
+        Remove the copy of the day's RINEX that gnssrefl's rinex2snr
+        made in the current working directory, once process() is done.
+
+        Confirmed in gnssrefl 4.1.5's source: with nolook=True and a
+        9-character station, rinex2snr looks for the RINEX 3 file in
+        the current working directory and, when it is not there, runs
+        `cp $REFL_CODE/<year>/rinex/<sta4>/<file> .` (rinex2snr.py:
+        243-244). conv2snr's RINEX 3 branch then removes nothing --
+        only its RINEX 2 branch deletes its input (496-499) -- and
+        gnssrefl never changes directory. So every day processed left
+        a 350-400 MB copy in whatever directory the caller ran from:
+        29 GB had piled up in station/ (station_manager's working
+        directory) and $HOME (cron's) by November 2026.
+
+        Only that exact name (_staged_name()) is touched, and never
+        when it is the observation file itself (a RINEX processed
+        from the working directory under that name). When the working
+        directory is the staging folder, this is the staged file,
+        which _cleanup_staged_file() removes next anyway. Every
+        process that runs rinex2snr in a shared working directory
+        holds pipeline.py's run lock, so the copy is this call's.
+
+        Called from a finally block in process(). Never raises: a
+        leftover copy is logged, not a processing failure.
+        """
+
+        try:
+            copy = Path.cwd() / staged_path.name
+        except OSError as exc:
+            self._logger.warning(
+                "Could not check the working directory for gnssrefl's "
+                "copy of %s: %s", staged_path.name, exc
+            )
+            return
+
+        try:
+            if not copy.exists() or _same_file(copy, observation_file):
+                return
+            copy.unlink()
+            self._logger.debug("Removed gnssrefl's working copy %s", copy)
+        except OSError as exc:
+            self._logger.warning(
+                "Could not remove gnssrefl's working copy %s: %s", copy, exc
+            )
+
     def _cleanup_staged_file(self, staged_path: Path) -> None:
         """
         Remove the RINEX file staged into gnssrefl's working
         directory by _stage_rinex_file(), once process() is done
         using it.
 
-        Confirmed, real bug this fixes: without this, the staged
-        copy (~350-400MB per day, since it's a copy of the full raw
-        RINEX observation file) was never cleaned up afterward. The
-        only existing cleanup -- _stage_rinex_file() itself removing
-        a same-named stale file before staging a new one -- only
-        triggers when a day is staged a SECOND time under the exact
-        same filename, which never happens for a day processed
-        exactly once (the normal, expected case). Confirmed directly
-        on real hardware: 29 files, 9.3GB, accumulated in station/
-        over several weeks of ordinary, non-reprocessing operation,
-        with no upper bound on further growth.
+        Without this, the staged copy (~350-400MB per day, since
+        it's a copy of the full raw RINEX observation file) was never
+        cleaned up afterward. The only existing cleanup --
+        _stage_rinex_file() itself removing a same-named stale file
+        before staging a new one -- only triggers when a day is
+        staged a SECOND time under the exact same filename, which
+        never happens for a day processed exactly once (the normal,
+        expected case). This was first taken for the "29 files,
+        9.3GB" found in station/; those were gnssrefl's own copies in
+        the working directory, which _remove_cwd_copy() removes (see
+        the module docstring). The staged copies, under
+        $REFL_CODE/<year>/rinex/<sta4>/, would have grown the same way.
 
         Called from a finally block in process(), so this runs
         whether processing succeeded, failed partway through, or
@@ -1184,7 +1572,7 @@ class GnssIrProcessor:
                 "Could not remove staged RINEX file %s: %s", staged_path, exc
             )
 
-    def _run_rinex2snr(self, year: int, doy: int) -> None:
+    def _run_rinex2snr(self, year: int, doy: int, orb) -> None:
         from gnssrefl.rinex2snr_cl import rinex2snr
 
         rinex2snr(
@@ -1193,7 +1581,7 @@ class GnssIrProcessor:
             doy=doy,
             nolook=True,
             overwrite=True,
-            orb=self._orbit_source,
+            orb=orb,
             samplerate=self._sample_rate,
             quiet=True,
         )
@@ -1215,6 +1603,7 @@ class GnssIrProcessor:
         day: date,
         staged_path: Path,
         started: float,
+        retry_count: int = 0,
     ) -> GnssIrResult:
         """
         Runs rinex2snr and gnssir against a file that has already
@@ -1224,46 +1613,152 @@ class GnssIrProcessor:
         (see _cleanup_staged_file()), without deeply re-indenting
         this entire body inside that try block. `staged_path` is not
         otherwise used here -- gnssrefl locates the file itself via
-        year/doy -- it's threaded through only for log-message
-        parity with the rest of this class.
+        year/doy.
+
+        1. rinex2snr, once per orbit of _orbit_plan(), until one
+           leaves a FRESH SNR file: one written during that attempt
+           (its mtime), so a file from an earlier run is never taken
+           for this one's. rinex2snr says nothing when it has no
+           orbit -- it prints "The orbit file you requested does not
+           exist." to stdout and returns -- so the SNR file is the
+           only evidence. An attempt that raised counts as having
+           made none, and whatever SNR file it may have left is
+           removed, so the next step never runs on a broken one.
+        2. No SNR file with any orbit: outcome "no_snr", and gnssir
+           is not run (it could only print "SNR file not found", and
+           would leave any older results file where it is).
+        3. gnssir, then the results file, which must have been
+           written by this gnssir run. Without one, a fresh
+           failQC/<doy>.txt (gnssrefl 4.1.5 writes it whenever its
+           quality control ran, header-only when it kept nothing, and
+           deletes <doy>.txt when no arc passed) means "no_arcs"; no
+           fresh failQC means gnssir stopped before its quality
+           control (e.g. an RH range under 5 m, a station-code
+           mismatch), an "error".
+
+        The message always starts as it did ("No results file
+        produced: <results file>", "rinex2snr failed: ...", "gnssir
+        failed: ..."): station_health.py and recover_missing_days.py
+        key on those starts and on the path as the first word after
+        them. What happened follows the path, in brackets.
         """
 
         year = day.year
         doy = day.timetuple().tm_yday
+        name = observation_file.name
 
-        try:
-            self._run_rinex2snr(year, doy)
-        except (Exception, SystemExit) as exc:
-            # Catches SystemExit too: gnssrefl is research-grade code
-            # that may call sys.exit() internally on some error
-            # paths rather than raising cleanly. "Never crash" means
-            # never crash even if the external library tries to.
+        plan, pending, why = self._orbit_plan(day, retry_count)
+        tried: list[str] = []
+        raised: list[tuple[str, BaseException]] = []
+        made_index = None
+
+        for index, orb in enumerate(plan):
+            label = _orbit_label(orb, day)
+            if index:
+                self._logger.info(
+                    "%s: no SNR file with orbit %s; trying fallback orbit %s (%s)",
+                    name, tried[-1], label, why,
+                )
+            attempt_started = time.time()   # wall clock: `started` is monotonic
+            tried.append(label)
+            try:
+                self._run_rinex2snr(year, doy, orb)
+            except (Exception, SystemExit) as exc:
+                # Catches SystemExit too: gnssrefl is research-grade code
+                # that may call sys.exit() internally on some error
+                # paths rather than raising cleanly. "Never crash" means
+                # never crash even if the external library tries to.
+                # (Never KeyboardInterrupt: recover_missing_days.py
+                # stops on it.)
+                raised.append((label, exc))
+                self._logger.warning(
+                    "%s: rinex2snr raised with orbit %s: %s", name, label, exc
+                )
+                self._remove_fresh_snr_files(day, attempt_started)
+                continue
+            if self._snr_file_made(day, attempt_started):
+                made_index = index
+                break
+
+        if made_index is None:
             elapsed = time.monotonic() - started
-            message = f"rinex2snr failed: {exc}"
-            self._logger.error(
-                "FAILED %s: %s (%.2f sec)", observation_file.name, message, elapsed
+            message = self._no_snr_message(day, tried, raised, pending)
+            self._logger.warning(
+                "NO SNR FILE %s (day %s): %s (%.2f sec)", name, day, message, elapsed
             )
             return self._record(
-                self._failure_result(observation_file, day, message, elapsed)
+                self._failure_result(
+                    observation_file, day, message, elapsed,
+                    outcome=OUTCOME_NO_SNR, orbits_tried=tuple(tried),
+                )
             )
 
+        made_with = tried[made_index]
+        made_orb = plan[made_index]
+        fallback = made_index > 0
+        coverage = _orbit_coverage(made_orb, day) if fallback else ""
+
+        gnssir_started = time.time()
         try:
             self._run_gnssir(year, doy)
         except (Exception, SystemExit) as exc:
             elapsed = time.monotonic() - started
-            message = f"gnssir failed: {exc}"
+            message = f"gnssir failed: {exc} (SNR file made with orbit {made_with})"
             self._logger.error(
-                "FAILED %s: %s (%.2f sec)", observation_file.name, message, elapsed
+                "FAILED %s: %s (%.2f sec)", name, message, elapsed
             )
             return self._record(
-                self._failure_result(observation_file, day, message, elapsed)
+                self._failure_result(
+                    observation_file, day, message, elapsed,
+                    orbit_used=made_with, orbits_tried=tuple(tried),
+                )
             )
 
         elapsed = time.monotonic() - started
 
         ok, num_tracks, notes, reflector_height, quality_score = self._read_results(
-            year, doy
+            year, doy, since=gnssir_started
         )
+
+        results_file = self._results_file_path(day)
+
+        if ok:
+            outcome = OUTCOME_OK
+            if fallback:
+                notes += (
+                    f"; orbit {made_with} (fallback: {', '.join(tried[:made_index])} "
+                    f"made no SNR file" + (f"; {coverage}" if coverage else "") + ")"
+                )
+            else:
+                notes += f"; orbit {made_with}"
+        elif results_file.exists():
+            # stale, empty or without data rows: _read_results() says which
+            outcome = OUTCOME_ERROR
+            notes += f" (SNR file made with orbit {made_with})"
+        elif _fresh(self._failqc_path(day), gnssir_started):
+            if fallback and self._gps_only_gate(made_orb, day):
+                outcome = OUTCOME_NO_ARCS_GPS_ONLY
+                notes = (
+                    f"No results file produced: {results_file} (SNR file made with "
+                    f"GPS-only fallback orbit {made_with}, but gnssir kept no arc; a "
+                    f"multi-GNSS orbit may still give arcs, so the day is not taken "
+                    f"as having no usable data; see {self._failqc_path(day)})"
+                )
+            else:
+                outcome = OUTCOME_NO_ARCS
+                notes = (
+                    f"No results file produced: {results_file} (SNR file made with "
+                    f"orbit {made_with}, but gnssir kept no arc; see "
+                    f"{self._failqc_path(day)})"
+                )
+        else:
+            outcome = OUTCOME_ERROR
+            notes = (
+                f"No results file produced: {results_file} (SNR file made with "
+                f"orbit {made_with}, but gnssir wrote no failQC/{doy:03d}.txt "
+                f"either: it stopped before its quality control; see the "
+                f"station log)"
+            )
 
         output_directory = self._refl_code / str(year) / "results" / self._station_code
 
@@ -1281,21 +1776,217 @@ class GnssIrProcessor:
             message=notes,
             runtime_seconds=elapsed,
             gnssrefl_version=self._gnssrefl_version,
+            outcome=outcome,
+            orbit_used=made_with,
+            orbits_tried=tuple(tried),
         )
 
-        if ok:
+        if ok and fallback:
+            # Said louder than an ordinary success: the day is kept as
+            # made with a lesser orbit, and only a person can redo it.
+            self._logger.warning(
+                "SUCCESS %s (%.2f sec, %d track(s)) with fallback orbit %s%s",
+                name, elapsed, num_tracks, made_with,
+                f" ({coverage})" if coverage else "",
+            )
+        elif ok:
             self._logger.info(
-                "SUCCESS %s (%.2f sec, %d track(s))",
-                observation_file.name,
-                elapsed,
-                num_tracks,
+                "SUCCESS %s (%.2f sec, %d track(s), orbit %s)",
+                name, elapsed, num_tracks, made_with,
+            )
+        elif outcome in (OUTCOME_NO_ARCS, OUTCOME_NO_ARCS_GPS_ONLY):
+            self._logger.warning(
+                "NO ARCS %s (day %s): %s (%.2f sec)", name, day, notes, elapsed
             )
         else:
             self._logger.error(
-                "FAILED %s: %s (%.2f sec)", observation_file.name, notes, elapsed
+                "FAILED %s: %s (%.2f sec)", name, notes, elapsed
             )
 
         return self._record(result)
+
+    # ----------------------------------------------------------
+    # Orbit fallback (see the module docstring)
+    # ----------------------------------------------------------
+
+    def _gps_only_gate(self, orb, day: date) -> bool:
+        """True for a GPS-only fallback when the orbit tried first is
+        not GPS-only itself: one that would halve the day's tracks."""
+
+        return (
+            _canonical_orbit(orb, day) in GPS_ONLY_ORBITS
+            and _canonical_orbit(self._orbit_source, day) not in GPS_ONLY_ORBITS
+        )
+
+    def _fallback_due(self, orb, day: date, retry_count: int, age_s: float) -> bool:
+        """
+        Whether fallback `orb` may be tried on this attempt of `day`.
+
+        A multi-GNSS one: from the day's 3rd attempt (two earlier
+        failures) once it is at least FALLBACK_RETRY_MIN_AGE_S after
+        the day -- the pipeline's midnight run 48 h after it -- or
+        from FALLBACK_MIN_AGE_S (72 h) after the day whatever the
+        count. Never earlier: the default orbit routinely takes 1-2
+        days, and the day would be kept with the lesser orbit.
+
+        A GPS-only one (_gps_only_gate()): only once the day is more
+        than GPS_ONLY_FALLBACK_AGE_S old, when pipeline.py would give
+        it up anyway. A storm day, when arcs are fewest and matter
+        most, must not be left with half its tracks while a
+        multi-GNSS orbit can still come.
+        """
+
+        if self._gps_only_gate(orb, day):
+            return age_s > GPS_ONLY_FALLBACK_AGE_S
+        if age_s >= FALLBACK_MIN_AGE_S:
+            return True
+        return retry_count >= FALLBACK_MIN_RETRIES and age_s >= FALLBACK_RETRY_MIN_AGE_S
+
+    def _fallback_schedule(self, orb, day: date) -> str:
+        """When fallback `orb` becomes due, for messages."""
+
+        if self._gps_only_gate(orb, day):
+            return (
+                f"GPS only: once the day is more than "
+                f"{GPS_ONLY_FALLBACK_AGE_S / 86400:.0f} days old"
+            )
+        return (
+            f"from the 3rd attempt at least {FALLBACK_RETRY_MIN_AGE_S / 3600:.0f} h "
+            f"after the day, or {FALLBACK_MIN_AGE_S / 3600:.0f} h after it"
+        )
+
+    def _orbit_plan(self, day: date, retry_count: int) -> tuple[list, list, str]:
+        """
+        The orbits to try for `day`, in order: the configured one
+        (None: gnssrefl's default), then each due fallback
+        (_fallback_due()). A fallback that is the same product as an
+        orbit already listed, after rinex2snr's renames, is left out
+        (with no orbit configured, "rapid" after 2025/168 is a
+        different product from the default "gnss"; before, it is the
+        default itself).
+
+        Returns (plan, pending, why): pending is the fallbacks not due
+        yet, why a few words on the attempt for the log.
+        """
+
+        primary = self._orbit_source
+        plan = [primary]
+        pending: list[str] = []
+        seen = {_canonical_orbit(primary, day)}
+        age_s = day_age_s(day)
+
+        for orb in self._orbit_fallbacks:
+            canonical = _canonical_orbit(orb, day)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            if self._fallback_due(orb, day, retry_count, age_s):
+                plan.append(orb)
+            else:
+                pending.append(orb)
+
+        why = f"attempt {retry_count + 1}, the day ended {age_s / 3600:.0f} h ago"
+        return plan, pending, why
+
+    def _no_snr_message(
+        self,
+        day: date,
+        tried: list[str],
+        raised: list,
+        pending: list[str],
+    ) -> str:
+        """
+        What to say when no orbit tried made an SNR file. It names
+        every orbit tried itself: gnssrefl says "The orbit file you
+        requested does not exist." on stdout only, and its .gen log
+        is rewritten by every rinex2snr call, so it shows the last
+        orbit tried only.
+        """
+
+        if raised and len(raised) == len(tried):
+            # Every attempt raised: the message rinex2snr failures have
+            # always had (recover_missing_days.py STAGE_FAILED).
+            message = f"rinex2snr failed: {raised[-1][1]}"
+            if len(tried) > 1:
+                message += f" (orbits tried: {', '.join(tried)})"
+            return message
+
+        plural = "s" if len(tried) > 1 else ""
+        head = f"no SNR file with orbit{plural} {', '.join(tried)}"
+        if pending:
+            parts = [
+                f"{head}: the orbit may not be published yet, or the RINEX "
+                f"has no usable data",
+                "fallback orbit(s) not tried yet: " + ", ".join(
+                    f"{orb} ({self._fallback_schedule(orb, day)})" for orb in pending
+                ),
+            ]
+        elif not self._orbit_fallbacks:
+            parts = [
+                f"{head}: the orbit may not be published yet, or the RINEX "
+                f"has no usable data",
+                "no fallback orbits (gnssrefl_orbit_fallbacks is [])",
+            ]
+        else:
+            parts = [f"{head}: no orbit for this day, or the RINEX has no usable data"]
+        for label, exc in raised:
+            parts.append(f"rinex2snr raised with {label}: {exc}")
+        see = f"see {self._gen_log_path(day)}"
+        if len(tried) > 1:
+            see += ", which shows the last orbit tried only"
+        parts.append(see)
+
+        return (
+            f"No results file produced: {self._results_file_path(day)} ("
+            + "; ".join(parts) + ")"
+        )
+
+    def _snr_files(self, day: date) -> list[Path]:
+        """The day's SNR files: gnssrefl gps.snr_name(),
+        <sta4><DDD>0.<YY>.snr<type>, gzipped afterwards by default --
+        the same names recover_missing_days.py looks for."""
+
+        assert self._refl_code is not None
+        doy = day.timetuple().tm_yday
+        folder = self._refl_code / str(day.year) / "snr" / self._station_code
+        return sorted(folder.glob(f"{self._station_code}{doy:03d}0.{day:%y}.snr*"))
+
+    def _snr_file_made(self, day: date, since: float) -> bool:
+        return any(_fresh(p, since) for p in self._snr_files(day))
+
+    def _remove_fresh_snr_files(self, day: date, since: float) -> None:
+        """After a rinex2snr attempt that raised: any SNR file it wrote
+        may be incomplete (e.g. the disk filled while it gzipped), and
+        must not be taken by gnssir, or by recover_missing_days.py as
+        evidence that gnssir ran."""
+
+        for path in self._snr_files(day):
+            if _fresh(path, since):
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    self._logger.warning(
+                        "Could not remove SNR file %s left by a failed "
+                        "rinex2snr: %s", path, exc
+                    )
+
+    def _gen_log_path(self, day: date) -> Path:
+        """rinex2snr's log of the day (gps.py:6746-6752), rewritten by every call."""
+
+        assert self._refl_code is not None
+        return (
+            self._refl_code / "logs" / self._station_code / str(day.year)
+            / f"{day.timetuple().tm_yday:03d}_translation.txt.gen"
+        )
+
+    def _failqc_path(self, day: date) -> Path:
+        """The arcs gnssir's quality control rejected (gnssrefl utils.py:142)."""
+
+        assert self._refl_code is not None
+        return (
+            self._refl_code / str(day.year) / "results" / self._station_code
+            / "failQC" / f"{day.timetuple().tm_yday:03d}.txt"
+        )
 
     def _results_file_path(self, day: date) -> Path:
         assert self._refl_code is not None
@@ -1319,7 +2010,7 @@ class GnssIrProcessor:
     _PK_NOISE_COLUMN = 13  # column (14), peak-to-noise ratio
 
     def _read_results(
-        self, year: int, doy: int
+        self, year: int, doy: int, since: float | None = None
     ) -> tuple[bool, int, str, float | None, float | None]:
         """
         Parse the results file: confirm it exists and is non-empty,
@@ -1329,6 +2020,12 @@ class GnssIrProcessor:
         columns, non-numeric RH) is skipped rather than failing the
         whole result -- gnssrefl's own output format, not something
         this module should be strict about beyond what it needs.
+
+        With `since` (time.time() before gnssir ran), a results file
+        older than that is not this run's: gnssir leaves an existing
+        one untouched when it returns early (no SNR file; an RH range
+        under 5 m), and reading it as fresh would report success for
+        a run that made nothing.
 
         Returns (success, num_tracks, message, reflector_height,
         quality_score). reflector_height/quality_score are None if
@@ -1346,6 +2043,15 @@ class GnssIrProcessor:
 
         if not results_file.exists():
             return False, 0, f"No results file produced: {results_file}", None, None
+
+        if since is not None and not _fresh(results_file, since):
+            return (
+                False,
+                0,
+                f"gnssir did not replace the existing results file {results_file}",
+                None,
+                None,
+            )
 
         if results_file.stat().st_size == 0:
             return False, 0, f"Results file is empty: {results_file}", None, None
@@ -1434,6 +2140,9 @@ class GnssIrProcessor:
         day: date,
         message: str,
         runtime_seconds: float,
+        outcome: str = OUTCOME_ERROR,
+        orbit_used: str = "",
+        orbits_tried: tuple = (),
     ) -> GnssIrResult:
         return GnssIrResult(
             success=False,
@@ -1453,4 +2162,7 @@ class GnssIrProcessor:
             message=message,
             runtime_seconds=runtime_seconds,
             gnssrefl_version=self._gnssrefl_version,
+            outcome=outcome,
+            orbit_used=orbit_used,
+            orbits_tried=orbits_tried,
         )

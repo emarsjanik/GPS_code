@@ -88,28 +88,69 @@ rinex_processor.py is implemented; it will simply start succeeding.
 
 GNSS-IR usage
 -------------
-Only gnssrefl_processor.process() and gnssrefl_processor.verify(),
-under the same "not implemented yet, fails gracefully" arrangement,
-assuming:
+Only GnssIrProcessor.process() and GnssIrProcessor.verify():
 
-    process(observation_file: Path, output_dir: Path, cfg: Config) -> GnssirResult
-        where GnssirResult has:
+    process(observation_file: Path, day: date, retry_count: int = 0) -> GnssIrResult
+        retry_count: the day's earlier failed attempts
+        (processing_queue.retry_count), for the orbit fallback.
+        GnssIrResult has:
             .success (bool)
-            .runtime (float, seconds)
-            .output_directory (Path | str)
-            .products (list[str])
+            .outcome ("ok", "no_snr", "no_arcs", "no_arcs_gps_only",
+                      "error"; "" from a processor or stand-in that
+                      does not classify)
+            .orbit_used, .orbits_tried (which orbit made the SNR file)
+            .message (str; saved as gnssir_products.notes)
+            .output_directory (Path | str; the day's results folder)
             .reflector_height, .soil_moisture, .snow_depth,
             .quality_score (float | None)
-            .notes (str)
+            .runtime_seconds (float)
 
-    verify(output_directory: Path, expected_products: list[str]) -> bool
+    verify(result) -> bool
+
+outcome, orbit_used and orbits_tried are read with getattr(): the
+fakes in the tests return SimpleNamespace objects without them, and
+such a result is an ordinary failure when not successful.
+
+A day that can never give results
+---------------------------------
+A failure is retried on every run, which is right for a day that is
+only late, and was wrong for 2026-11-05, whose orbit was never
+published: 20 retries and three FAILs in every morning's health mail
+until it was processed by hand. Now:
+
+    * GnssIrProcessor tries its fallback orbits (gnssrefl_orbit_fallbacks)
+      from the day's 3rd attempt, 48 h after the day (a GPS-only one
+      only once the day is more than 5 days old).
+    * gnssir ran on a fresh SNR file and kept no arc ("no_arcs"): the
+      day has no usable retrievals. Its <doy>.no_data marker is written
+      (as recover_missing_days.py writes it), the raw file is archived
+      as after a success and the queue entry finished with a note. One
+      ERROR row says so -- once is weather, day after day is a setting.
+    * No SNR file with any orbit ("no_snr"; or "no_arcs_gps_only", only
+      the GPS-only fallback made one and gnssir kept no arc from it),
+      for a station day file that ended more than HANDOFF_AGE_S ago, or
+      at least HANDOFF_RETRY_MIN_AGE_S ago and failed HANDOFF_RETRIES
+      times: the raw file is archived and the
+      entry finished, with one WARNING. The day is then
+      maintenance/recover_missing_days.py's, which process_and_plot.sh
+      Step 1 runs every night and which looks for exactly such days in
+      archive/.
+    * A queued file found in archive/ instead of raw/ (moved there by
+      hand, or by a run stopped before it finished the entry) is
+      finished, with one WARNING, instead of failing on every run with
+      "Raw file does not exist".
+
+None of these counts as a failed file (process_and_plot.sh Step 2 exits
+1 on files_failed). Every other failure ("error": a gnssrefl or setup
+problem, not a lack of data) is retried on every run, as before, and
+logged at ERROR. See _without_results_kind() and _finish_without_results().
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 import fcntl
@@ -121,9 +162,17 @@ import time
 import traceback
 
 from rinex_processor import RinexProcessor
-from gnssrefl_processor import GnssIrProcessor
+from gnssrefl_processor import (
+    FALLBACK_MIN_AGE_S,
+    GPS_ONLY_FALLBACK_AGE_S,
+    GnssIrProcessor,
+    OUTCOME_NO_ARCS,
+    OUTCOME_NO_ARCS_GPS_ONLY,
+    OUTCOME_NO_SNR,
+    write_no_data_marker,
+)
 from config import Config
-from database import Database, DatabaseError, ProcessingStatistics
+from database import Database, DatabaseError, NotFoundError, ProcessingStatistics
 
 _FILENAME_DATE_PATTERN = re.compile(r"(\d{8})")
 
@@ -213,7 +262,26 @@ IN_PROGRESS_MTIME_S = 15 * 60
 # Any wait between the cron's 3.5 h (02:30 UTC; up to an hour more on the
 # run lock) and the 24 h of the next midnight run gives that schedule;
 # 12 h leaves room on both sides.
+#
+# If the orbit never comes (GFZ never published 2026-11-05's), waiting
+# longer does not help. GnssIrProcessor tries its fallback orbits from
+# the day's 3rd attempt (the midnight run 48 h after it), and a station
+# day still without an SNR file is handed to process_and_plot.sh Step 1
+# (maintenance/recover_missing_days.py, which retries it every night)
+# once it ended more than HANDOFF_AGE_S ago or has failed HANDOFF_RETRIES
+# times: its raw file is archived and its queue entry finished, so it
+# stops failing every run (_without_results_kind()). HANDOFF_AGE_S is the
+# processor's GPS_ONLY_FALLBACK_AGE_S, so the run that hands a day over
+# has tried every fallback, the GPS-only one included. HANDOFF_RETRIES
+# counts only once the day is HANDOFF_RETRY_MIN_AGE_S old (when every
+# multi-GNSS fallback is tried whatever the count): failures that never
+# reached gnssrefl (gnssrefl not initialized for a few days, a RINEX
+# conversion failure, reruns by hand) also raise the count, and must not
+# hand over a day whose orbit is only late.
 ORBIT_WAIT_S = 12 * 3600
+HANDOFF_AGE_S = GPS_ONLY_FALLBACK_AGE_S     # 5 days
+HANDOFF_RETRIES = 10                        # earlier failed attempts ...
+HANDOFF_RETRY_MIN_AGE_S = FALLBACK_MIN_AGE_S    # ... of a day at least 72 h old
 
 
 def orbit_wait_s(orbit_source: str | None) -> float:
@@ -320,9 +388,22 @@ def run_lock(logs_dir, wait_s: float, logger: logging.Logger):
 
 
 def _utcnow() -> datetime:
-    """The clock _in_progress_reason() reads (a test sets it)."""
+    """The clock _in_progress_reason() and the hand-off rule read (a
+    test sets it)."""
 
     return datetime.now(timezone.utc)
+
+
+def _day_end(day_iso: str) -> datetime:
+    """24:00 UTC of a YYYY-MM-DD day."""
+
+    return datetime.fromisoformat(day_iso).replace(tzinfo=timezone.utc) + timedelta(days=1)
+
+
+def _day_age_s(day_iso: str, now: datetime | None = None) -> float:
+    """Seconds since the end of a YYYY-MM-DD day; negative before it."""
+
+    return (now or _utcnow()).timestamp() - _day_end(day_iso).timestamp()
 
 
 def _in_progress_reason(path: Path, now: datetime | None = None,
@@ -342,8 +423,7 @@ def _in_progress_reason(path: Path, now: datetime | None = None,
             and _STATION_DAY_FILE.fullmatch(path.name)):
         # a past UTC day of station_manager's: closed at its midnight,
         # ready once its orbits can be there
-        day_end = datetime.fromisoformat(file_date).replace(tzinfo=timezone.utc).timestamp() + 86400.0
-        left = day_end + orbit_wait - now.timestamp()
+        left = _day_end(file_date).timestamp() + orbit_wait - now.timestamp()
         if left > 0:
             return f"waiting for its orbits ({left / 3600:.1f} h more)"
         return None
@@ -390,7 +470,14 @@ class JobState(str, Enum):
 
 @dataclass
 class ProcessingJob:
-    """In-memory tracking for one file moving through the pipeline."""
+    """
+    In-memory tracking for one file moving through the pipeline.
+
+    retries is the file's earlier failed attempts: read from
+    processing_queue.retry_count at the start of every attempt
+    (_retry_count()), so it is the same whichever process runs the
+    file, and goes to GnssIrProcessor.process() as retry_count.
+    """
 
     filename: str
     date: str
@@ -407,7 +494,18 @@ class ProcessingJob:
 
 @dataclass
 class PipelineSummary:
-    """The "Pipeline Summary" report generated at the end of run()."""
+    """
+    The "Pipeline Summary" report generated at the end of run().
+
+    files_processed: files with results. files_failed: files that
+    failed and will be retried on the next run (process_and_plot.sh
+    Step 2 exits 1 when there are any). files_no_data: days processed
+    with no usable retrievals, archived with their <doy>.no_data
+    marker. files_handed_off: days without an SNR file with any orbit
+    after HANDOFF_AGE_S (or HANDOFF_RETRIES), and files found already in
+    archive/, left to recover_missing_days.py (Step 1). The last two
+    are not failures and are never retried by the pipeline.
+    """
 
     files_found: int = 0
     files_processed: int = 0
@@ -416,6 +514,8 @@ class PipelineSummary:
     products_created: int = 0
     average_runtime: float = 0.0
     errors: list[str] = field(default_factory=list)
+    files_no_data: int = 0
+    files_handed_off: int = 0
 
 
 @dataclass
@@ -712,6 +812,8 @@ class Pipeline:
             "files_found": 0,
             "files_processed": 0,
             "files_failed": 0,
+            "files_no_data": 0,
+            "files_handed_off": 0,
             "rinex_created": 0,
             "products_created": 0,
             "runtimes": [],
@@ -852,6 +954,16 @@ class Pipeline:
         be picked up again if this used that instead. processing_
         queue's waiting/running/completed/failed flags are the
         actual authoritative queue state for retry purposes.
+
+        A failure is retried on every run -- except a day that can
+        never give results, which is finished instead and stops being
+        retried (see "A day that can never give results" in the
+        module docstring, and _without_results_kind()).
+
+        Anything that escapes _process_one_job() (a database error
+        outside its own error handling) is logged and counted as a
+        failed file here, so the files after it are still processed
+        and the run still ends with its summary.
         """
 
         assert self.db is not None
@@ -875,7 +987,17 @@ class Pipeline:
         self._logger.info("Processing queue: %d file(s) pending", len(to_process))
 
         for filename in to_process:
-            self._process_one_job(filename)
+            try:
+                self._process_one_job(filename)
+            except Exception as exc:
+                self._logger.error(
+                    "FAILED %s outside its processing steps: %s",
+                    filename,
+                    exc,
+                    exc_info=True,
+                )
+                self._run_stats["files_failed"] = self._run_stats.get("files_failed", 0) + 1
+                self._run_stats.setdefault("errors", []).append(f"{filename}: {exc}")
 
     def _process_one_job(self, filename: str) -> None:
         assert self.db is not None
@@ -908,21 +1030,52 @@ class Pipeline:
             filename,
             ProcessingJob(filename=filename, date=file_date, raw_path=str(raw_path)),
         )
+        # From the database, not this object's own count: the cron's
+        # run and station_manager's each have their own, and the
+        # fallback and hand-off rules go by every attempt of the day.
+        job.retries = self._retry_count(filename)
 
         self._logger.info("START %s", filename)
 
         started_at = time.monotonic()
         job.started = datetime.now(timezone.utc).isoformat()
 
-        self.db.start_processing(filename)
+        try:
+            self.db.start_processing(filename)
+        except NotFoundError:
+            # Removed from the queue since this run listed it
+            # (maintenance/clean_processing_queue.py --execute does not
+            # take the run lock): nothing left to do for it.
+            self._logger.info(
+                "%s left the processing queue during this run; skipped", filename
+            )
+            return
         job.status = JobState.PROCESSING
 
         try:
+            if not raw_path.exists() and self._in_archive(filename):
+                # Moved to archive/ without its queue entry being
+                # finished: by hand (README, "A day without results"),
+                # or by a run stopped between _archive() and
+                # finish_processing(). Converting it would fail on every
+                # run with "Raw file does not exist"; archive/ is where
+                # recover_missing_days.py (Step 1) looks for such days.
+                self._finish_already_archived(job)
+                return
+
             rinex_result = self._convert_rinex(raw_path, job)
             self._verify_rinex(rinex_result)
             job.status = JobState.RINEX_COMPLETE
 
-            gnssir_result = self._run_gnssrefl(rinex_result, job)
+            gnssir_result, without_results = self._run_gnssrefl(rinex_result, job)
+            if without_results is not None:
+                # Inside this try on purpose: an error while giving the
+                # day up (the move, the marker, the database) is an
+                # ordinary failure, retried on the next run. Raised
+                # from the except clause below it would escape the file.
+                self._finish_without_results(raw_path, job, gnssir_result, without_results)
+                return
+
             self._verify_products(gnssir_result)
             job.status = JobState.GNSSIR_COMPLETE
 
@@ -1022,6 +1175,12 @@ class Pipeline:
         Step 7: run GNSS-IR via GnssIrProcessor.process(), then
         record the result with db.save_gnssir_product() regardless
         of success, for the same reason save_rinex() always records.
+        The result's message, which names the orbit used, becomes the
+        row's notes.
+
+        Returns (result, None) on success, and (result, kind) for a
+        day to finish without results (_without_results_kind()).
+        Raises for every other failure, retried on the next run.
         """
 
         assert self.db is not None
@@ -1035,7 +1194,9 @@ class Pipeline:
 
         day = date.fromisoformat(job.date)
 
-        result = self._gnssir.process(rinex_result.observation_file, day=day)
+        result = self._gnssir.process(
+            rinex_result.observation_file, day=day, retry_count=job.retries
+        )
 
         self.db.save_gnssir_product(
             date_=job.date,
@@ -1051,13 +1212,16 @@ class Pipeline:
         )
 
         if not result.success:
-            raise RuntimeError(f"GNSS-IR processing failed: {result.message}")
+            kind = self._without_results_kind(result, job)
+            if kind is None:
+                raise RuntimeError(f"GNSS-IR processing failed: {result.message}")
+            return result, kind
 
         self._run_stats["products_created"] += 1
 
         job.product_path = str(result.output_directory)
 
-        return result
+        return result, None
 
     def _verify_products(self, gnssir_result) -> None:
         """Step 8: verify the products GnssIrProcessor claims to have made."""
@@ -1070,11 +1234,17 @@ class Pipeline:
                 f"{gnssir_result.output_directory}"
             )
 
-    def _archive(self, raw_path: Path, job: ProcessingJob) -> None:
+    def _archive(
+        self,
+        raw_path: Path,
+        job: ProcessingJob,
+        notes: str = "archived after successful processing",
+    ) -> None:
         """
         Step 10: move the raw file into the archive directory once
-        it has been successfully converted and processed, and mark
-        it archived in the database.
+        it has been successfully converted and processed -- or given
+        up on (_finish_without_results()) -- and mark it archived in
+        the database, with `notes` saying which.
 
         RINEX and product retention policy is left for a future
         revision (the source vision for this module doesn't specify
@@ -1095,17 +1265,207 @@ class Pipeline:
             shutil.move(str(raw_path), str(destination))
             self._logger.debug("Archived %s -> %s", raw_path, destination)
 
-        self.db.update_raw_file(
-            raw_path.name, archived=True, notes="archived after successful processing"
+        self.db.update_raw_file(raw_path.name, archived=True, notes=notes)
+
+    # ==========================================================
+    # Private: a day that can never give results
+    # ==========================================================
+
+    _NO_DATA = "no data"
+    _HANDED_OFF = "handed off"
+
+    def _retry_count(self, filename: str) -> int:
+        """
+        processing_queue.retry_count of `filename`: how many earlier
+        attempts failed. 0 when it cannot be read; the age rules then
+        still apply.
+        """
+
+        try:
+            history = self.db.processing_history(filename)
+        except Exception as exc:
+            self._logger.warning(
+                "Could not read the retry count of %s (%s); taking 0", filename, exc
+            )
+            return 0
+        if not history:
+            return 0
+        try:
+            return int(getattr(history[0], "retry_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _without_results_kind(self, result, job: ProcessingJob) -> str | None:
+        """
+        Whether an unsuccessful GNSS-IR result is a day to finish
+        without results rather than retry:
+
+        "no data"     gnssir ran on a fresh SNR file and kept no arc
+                      (outcome "no_arcs"). Retrying cannot change that.
+        "handed off"  no SNR file with any orbit tried (outcome
+                      "no_snr", or "no_arcs_gps_only": a GPS-only
+                      fallback kept no arc, while a multi-GNSS orbit
+                      still might), for station_manager's day file
+                      station_YYYYMMDD.um980, once the day ended more
+                      than HANDOFF_AGE_S ago, or at least
+                      HANDOFF_RETRY_MIN_AGE_S ago and the file has
+                      failed HANDOFF_RETRIES times (its 11th attempt:
+                      reruns by hand). Only that name:
+                      recover_missing_days.py, which
+                      takes the day over, knows no other, and an
+                      overnight_ recording handed to it would be
+                      retried by nobody.
+
+        None for everything else -- a not yet late enough day, and
+        every "error": a gnssrefl or setup problem is not a lack of
+        data, and handing it to Step 1, which exits 0 on a failed
+        day, would hide it.
+        """
+
+        outcome = getattr(result, "outcome", "")
+        if outcome == OUTCOME_NO_ARCS:
+            return self._NO_DATA
+        if outcome in (OUTCOME_NO_SNR, OUTCOME_NO_ARCS_GPS_ONLY) and _STATION_DAY_FILE.fullmatch(
+            job.filename
+        ):
+            age_s = _day_age_s(job.date)
+            if age_s > HANDOFF_AGE_S or (
+                job.retries >= HANDOFF_RETRIES and age_s >= HANDOFF_RETRY_MIN_AGE_S
+            ):
+                return self._HANDED_OFF
+        return None
+
+    def _finish_without_results(self, raw_path: Path, job: ProcessingJob, result, kind: str) -> None:
+        """
+        Give a day up (_without_results_kind()): archive its raw file
+        as a success does and finish its queue entry, with a note
+        saying why, so no run converts it again. Moving the file to
+        archive/ is also what hands it on: recover_missing_days.py's
+        automatic search (process_and_plot.sh Step 1) leaves days in
+        raw/ to the pipeline and takes those in archive/ that have no
+        results and no marker.
+
+        "no data": the day's <doy>.no_data marker is written first (a
+        station day file only; the same name, place and text as
+        recover_missing_days.py, so it, clean_processing_queue.py and
+        station_health.py all read it), and one ERROR row is logged
+        whose text does not clear with the marker: one such day is a
+        WARN in the health mail, the same day after day (a setting
+        that makes gnssir keep nothing, e.g. nr1/nr2 or reqAmp) is a
+        FAIL, as it was before days were given up.
+
+        "handed off": one WARNING in the station log, no error row.
+        The day's earlier ERROR rows stop counting in the health mail
+        once its raw file is in archive/ (station_health.py
+        _failure_since_resolved()).
+
+        Neither counts as a failed file. The entry is finished as
+        completed (finish_processing(success=True), with the note in
+        error_message), so it is never retried and
+        clean_processing_queue.py, which lists only unfinished
+        entries, never shows it; processing_statistics() then counts
+        it in last_successful_attempt (station.py's "Last Successful
+        Run").
+
+        Order: marker, archive, finish, error row. A failure before
+        the move leaves everything to the next run (a marker written
+        twice is harmless). A failure after the move but before the
+        entry is finished is the same double fault as on the success
+        path; the next run finds the file in archive/ and finishes
+        the entry then (_finish_already_archived()).
+        """
+
+        assert self.db is not None
+
+        orbit = getattr(result, "orbit_used", "") or "?"
+        if kind == self._NO_DATA:
+            marker = None
+            if _STATION_DAY_FILE.fullmatch(job.filename):
+                marker = write_no_data_marker(
+                    result.output_directory, date.fromisoformat(job.date)
+                )
+            note = f"gnssir kept no arc (SNR file made with orbit {orbit})" + (
+                f"; {marker.name} written" if marker is not None
+                else "; no marker (not a station day file)"
+            )
+        else:
+            tried = list(getattr(result, "orbits_tried", ()) or ())
+            if getattr(result, "outcome", "") == OUTCOME_NO_ARCS_GPS_ONLY:
+                what = (
+                    f"no SNR file with orbit(s) {', '.join(tried[:-1]) or '?'}, and "
+                    f"no arc kept from GPS-only fallback orbit {orbit}"
+                )
+            else:
+                what = f"no SNR file with orbit(s) {', '.join(tried) or 'the configured orbit'}"
+            note = (
+                f"{what} after {job.retries + 1} attempt(s), "
+                f"{_day_age_s(job.date) / 86400:.1f} days after the day; "
+                f"handed to maintenance/recover_missing_days.py "
+                f"(process_and_plot.sh Step 1), which tries it every night"
+            )
+
+        self._archive(raw_path, job, notes=f"archived without results: {note}")
+        job.status = JobState.ARCHIVED
+
+        self.db.finish_processing(job.filename, success=True, note=note)
+        job.status = JobState.FINISHED
+        job.finished = datetime.now(timezone.utc).isoformat()
+
+        if kind == self._NO_DATA:
+            self.db.log_error(
+                "pipeline",
+                "ERROR",
+                exception="NoArcsKept",
+                description=(
+                    f"GNSS-IR kept no arc for {job.date} (SNR file made with "
+                    f"orbit {orbit}); "
+                    + (f"{marker.name} written and " if marker is not None else "")
+                    + "the raw file archived. Once is weather; day after day, "
+                    "check the gnssir settings in station.json (nr1 and nr2, "
+                    "reqAmp, the azimuth mask)"
+                ),
+                notes=f"day={job.date}",
+            )
+            self._run_stats["files_no_data"] += 1
+            self._logger.warning(
+                "NO DATA %s (day %s): %s; raw file archived", job.filename, job.date, note
+            )
+        else:
+            self._run_stats["files_handed_off"] += 1
+            self._logger.warning("HANDED OFF %s (day %s): %s", job.filename, job.date, note)
+
+    def _in_archive(self, filename: str) -> bool:
+        archive_dir = getattr(self.cfg, "archive_dir", None)
+        return archive_dir is not None and (Path(archive_dir) / filename).exists()
+
+    def _finish_already_archived(self, job: ProcessingJob) -> None:
+        """A queued file found in archive/ instead of raw/: finish its
+        entry, with one WARNING (see _process_one_job())."""
+
+        assert self.db is not None
+
+        note = (
+            "raw file already in archive/ (moved by hand, or by a run that "
+            "stopped before finishing this entry); not converted again"
+            + (
+                "; recover_missing_days.py (process_and_plot.sh Step 1) "
+                "processes the day if it has no results"
+                if _STATION_DAY_FILE.fullmatch(job.filename) else ""
+            )
         )
+        self.db.finish_processing(job.filename, success=True, note=note)
+        job.status = JobState.FINISHED
+        job.finished = datetime.now(timezone.utc).isoformat()
+        self._run_stats["files_handed_off"] += 1
+        self._logger.warning("HANDED OFF %s (day %s): %s", job.filename, job.date, note)
 
     def _cleanup(self, job: ProcessingJob) -> None:
         """
         Reserved for cleaning up intermediate/temp files a processor
-        module leaves behind (e.g. convbin scratch files). Neither
-        processor module exists yet, so there is nothing to clean up
-        today; called unconditionally (success or failure) so it's
-        wired in once there is.
+        module leaves behind. Nothing to do today: GnssIrProcessor
+        removes both RINEX copies a day makes (its staged file and
+        the one rinex2snr copies into the working directory) itself.
+        Called unconditionally (success or failure).
         """
 
         pass
@@ -1142,15 +1502,19 @@ class Pipeline:
             products_created=self._run_stats["products_created"],
             average_runtime=average_runtime,
             errors=list(self._run_stats["errors"]),
+            files_no_data=self._run_stats["files_no_data"],
+            files_handed_off=self._run_stats["files_handed_off"],
         )
 
     def _log_statistics(self, summary: PipelineSummary) -> None:
         self._logger.info(
-            "Summary: found=%d processed=%d failed=%d rinex=%d "
-            "products=%d avg_runtime=%.2fs",
+            "Summary: found=%d processed=%d failed=%d no_data=%d handed_off=%d "
+            "rinex=%d products=%d avg_runtime=%.2fs",
             summary.files_found,
             summary.files_processed,
             summary.files_failed,
+            summary.files_no_data,
+            summary.files_handed_off,
             summary.rinex_created,
             summary.products_created,
             summary.average_runtime,
@@ -1162,6 +1526,8 @@ class Pipeline:
         print(f"Files Found          : {summary.files_found}")
         print(f"Files Processed      : {summary.files_processed}")
         print(f"Files Failed         : {summary.files_failed}")
+        print(f"No Usable Data       : {summary.files_no_data}")
+        print(f"Handed to Step 1     : {summary.files_handed_off}")
         print(f"RINEX Created        : {summary.rinex_created}")
         print(f"Products Created     : {summary.products_created}")
         print(f"Average Runtime      : {summary.average_runtime:.2f} sec")

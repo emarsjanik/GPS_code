@@ -13,6 +13,10 @@ exercised for real, not mocked around.
 The fake gnssir() reads the REFL_CODE environment variable itself
 (exactly like the real one would) to decide where to write its
 results file, so it stays a faithful stand-in rather than a shortcut.
+The fake rinex2snr() likewise writes the day's SNR file where gnssrefl
+4.1.5 does ($REFL_CODE/<year>/snr/<sta4>/<sta4><doy>0.<yy>.snr66.gz),
+unless told the orbit is missing, and can copy the staged RINEX into
+the working directory as the real one does (`cp <staged> .`).
 
 Run with:
     python3 -m unittest discover -s tests -p "test_gnssrefl_processor.py" -v
@@ -23,12 +27,14 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
+import time
 import unittest
 import unittest.mock
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "station"))
@@ -44,6 +50,15 @@ _behavior = {
     "rinex2snr": "success",
     "gnssir": "success",
     "num_tracks": 3,
+    # orbits (rinex2snr's `orb`, None = gnssrefl's default) for which
+    # rinex2snr finds no orbit: it prints and returns, no SNR file
+    "orbits_without_snr": set(),
+    # orbits for which rinex2snr raises
+    "orbits_raising": set(),
+    # orbits for which rinex2snr writes the SNR file, then raises
+    "orbits_raising_after_snr": set(),
+    # copy the staged RINEX into the working directory, as gnssrefl does
+    "cwd_copy": False,
 }
 
 
@@ -52,6 +67,16 @@ def _reset_behavior() -> None:
     _behavior["rinex2snr"] = "success"
     _behavior["gnssir"] = "success"
     _behavior["num_tracks"] = 3
+    _behavior["orbits_without_snr"] = set()
+    _behavior["orbits_raising"] = set()
+    _behavior["orbits_raising_after_snr"] = set()
+    _behavior["cwd_copy"] = False
+
+
+def _snr_path(station4: str, year: int, doy: int) -> Path:
+    """Where gnssrefl 4.1.5 leaves the day's SNR file (gzipped by default)."""
+    return (Path(os.environ["REFL_CODE"]) / str(year) / "snr" / station4
+            / f"{station4}{doy:03d}0.{year % 100:02d}.snr66.gz")
 
 
 calls: dict[str, list] = {"make_gnssir_input": [], "rinex2snr": [], "gnssir": []}
@@ -86,14 +111,37 @@ def _fake_make_gnssir_input(station, lat=0, lon=0, height=0, **kwargs):
 
 
 def _fake_rinex2snr(station, year, doy, **kwargs):
-    calls["rinex2snr"].append({"station": station, "year": year, "doy": doy, **kwargs})
+    call = {"station": station, "year": year, "doy": doy, **kwargs}
+    calls["rinex2snr"].append(call)
+
+    if _behavior["cwd_copy"]:
+        # rinex2snr.py:239-249: use the file in the working directory,
+        # else `cp $REFL_CODE/<y>/rinex/<sta4>/<r3> .`
+        r3 = (f"{station.upper()}_R_{year}{doy:03d}0000_01D_"
+              f"{kwargs.get('samplerate', 1):02d}S_MO.rnx")
+        local = Path.cwd() / r3
+        staged = Path(os.environ["REFL_CODE"]) / str(year) / "rinex" / station[:4].lower() / r3
+        call["cwd_existed"] = local.exists()
+        if not local.exists() and staged.exists():
+            shutil.copy(staged, local)
+        call["cwd_content"] = local.read_text() if local.exists() else None
 
     mode = _behavior["rinex2snr"]
 
-    if mode == "raise":
+    if mode == "raise" or kwargs.get("orb") in _behavior["orbits_raising"]:
         raise RuntimeError("simulated rinex2snr failure")
     if mode == "sys_exit":
         raise SystemExit(1)
+    if kwargs.get("orb") in _behavior["orbits_without_snr"]:
+        # gnssrefl prints "The orbit file you requested does not exist."
+        # (to stdout only) and returns
+        return
+
+    snr = _snr_path(station[:4].lower(), year, doy)
+    snr.parent.mkdir(parents=True, exist_ok=True)
+    snr.write_bytes(b"fake snr\n")
+    if kwargs.get("orb") in _behavior["orbits_raising_after_snr"]:
+        raise OSError(28, "No space left on device")
 
 
 def _fake_gnssir(station, year, doy, **kwargs):
@@ -112,6 +160,18 @@ def _fake_gnssir(station, year, doy, **kwargs):
     results_dir = refl_code / str(year) / "results" / station
     results_dir.mkdir(parents=True, exist_ok=True)
     results_file = results_dir / f"{doy:03d}.txt"
+
+    # retrieve_rh.py:248-255: the rejected arcs, written whenever the
+    # quality control ran (header-only when it rejected none)
+    failqc = results_dir / "failQC" / f"{doy:03d}.txt"
+    failqc.parent.mkdir(parents=True, exist_ok=True)
+    failqc.write_text("% year, doy, RH, sat,UTCtime, Azim, Amp ...\n")
+
+    if mode == "no_arcs":
+        # retrieve_rh.py:240-245: no arc kept, the results file is removed
+        if results_file.exists():
+            results_file.unlink()
+        return
 
     if mode == "empty_output":
         results_file.write_text("")
@@ -214,6 +274,11 @@ class GnssIrProcessorTestCase(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmpdir.name)
 
+        # gnssrefl works in the current working directory (and leaves
+        # its RINEX copy there): keep that inside the temporary folder.
+        self._old_cwd = os.getcwd()
+        os.chdir(self.root)
+
         self.cfg = FakeConfig(products_dir=self.root / "products")
 
         self.observation_file = self.root / "test_20260708.obs"
@@ -224,6 +289,7 @@ class GnssIrProcessorTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self._metadata_patcher.stop()
         _uninstall_fake_gnssrefl_package()
+        os.chdir(self._old_cwd)
         self.tmpdir.cleanup()
 
 
@@ -621,6 +687,43 @@ class TestInitialize(GnssIrProcessorTestCase):
         self.assertEqual(len(written["reqAmp"]), len(FAKE_FREQS))
         self.assertTrue(any("[2]" in line for line in logs.output))
 
+    # ---- orbit fallbacks ------------------------------------------------
+
+    def test_orbit_fallbacks_default_to_rapid_then_nav(self) -> None:
+        self.processor.initialize()
+
+        self.assertEqual(self.processor._orbit_fallbacks, ("rapid", "nav"))
+
+    def test_orbit_fallbacks_are_read_as_gnssrefl_compares_them(self) -> None:
+        for value, want in ((["Rapid", " nav "], ("rapid", "nav")),
+                            (["gfr", "gfr"], ("gfr",)),
+                            ([], ())):
+            with self.subTest(value=value):
+                self.cfg.station = {"gnssrefl_orbit_fallbacks": value}
+                processor = gnssrefl_processor.GnssIrProcessor(cfg=self.cfg)
+                processor.initialize()
+                self.assertEqual(processor._orbit_fallbacks, want)
+
+    def test_bad_orbit_fallbacks_are_refused_by_name(self) -> None:
+        # rinex2snr only prints for an orbit it does not know, and
+        # "rapid,nav" would be a list of letters
+        for value in ("rapid,nav", "rapid", 3, {"a": 1}, ["rapid", "bogus"], [None], [7]):
+            with self.subTest(value=value):
+                self.cfg.station = {"gnssrefl_orbit_fallbacks": value}
+                processor = gnssrefl_processor.GnssIrProcessor(cfg=self.cfg)
+                with self.assertRaises(gnssrefl_processor.GnssIrProcessorError) as caught:
+                    processor.initialize()
+                self.assertIn("gnssrefl_orbit_fallbacks", str(caught.exception))
+
+    def test_an_orbit_source_gnssrefl_does_not_know_is_said(self) -> None:
+        # not refused (an old setting), but rinex2snr refuses "Rapid" as given
+        self.cfg.station["gnssrefl_orbit_source"] = "Rapid"
+
+        with self.assertLogs("station.gnssir", level="WARNING") as logs:
+            self.processor.initialize()
+
+        self.assertTrue(any("'Rapid' is not an orbit" in line for line in logs.output))
+
     def test_status_before_initialize(self) -> None:
         status = self.processor.status()
 
@@ -719,15 +822,30 @@ class TestProcessSuccess(GnssIrProcessorTestCase):
         # one, with no error -- this is the exact bug that cost
         # hours to track down. A stale file with the expected staged
         # name must be removed before every conversion.
+        _behavior["cwd_copy"] = True
         stale = Path.cwd() / "USGS00USA_R_20261890000_01D_01S_MO.rnx"
         stale.write_text("stale content from an earlier run")
 
-        try:
-            self.processor.process(self.observation_file, day=date(2026, 7, 8))
-            self.assertFalse(stale.exists())
-        finally:
-            if stale.exists():
-                stale.unlink()
+        self.processor.process(self.observation_file, day=date(2026, 7, 8))
+
+        # rinex2snr read the day just staged, not the stale file ...
+        self.assertEqual(calls["rinex2snr"][0]["cwd_content"],
+                         self.observation_file.read_text())
+        # ... and its own copy is gone afterwards too
+        self.assertFalse(stale.exists())
+
+    def test_stale_compressed_forms_are_removed_before_staging(self) -> None:
+        # rinex2snr unpacks <name>.gz and <name minus .rnx>.crx.gz into
+        # the name it reads, before looking for it (rinex2snr.py:231-237)
+        stale = [Path.cwd() / "USGS00USA_R_20261890000_01D_01S_MO.rnx.gz",
+                 Path.cwd() / "USGS00USA_R_20261890000_01D_01S_MO.crx.gz"]
+        for path in stale:
+            path.write_text("stale")
+
+        self.processor.process(self.observation_file, day=date(2026, 7, 8))
+
+        for path in stale:
+            self.assertFalse(path.exists(), path.name)
 
     def test_original_observation_file_is_not_moved_or_deleted(self) -> None:
         self.processor.process(self.observation_file, day=date(2026, 7, 8))
@@ -1026,6 +1144,416 @@ class TestProcessFailureModes(GnssIrProcessorTestCase):
         self.assertEqual(status.files_processed, 1)
         self.assertEqual(status.successful, 0)
         self.assertEqual(status.failed, 1)
+
+
+# ------------------------------------------------------------
+# Orbit fallback: a day whose orbit never comes (2026-11-05)
+# ------------------------------------------------------------
+
+DAY = date(2026, 7, 8)                                          # day of year 189
+DAY_END = datetime(2026, 7, 9, tzinfo=timezone.utc)
+YOUNG = DAY_END + timedelta(hours=12)
+MID = DAY_END + timedelta(hours=48)              # the midnight run of the 3rd attempt
+OLD = DAY_END + timedelta(hours=72)
+FIVE_DAYS = DAY_END + timedelta(days=5)
+PAST_5_DAYS = FIVE_DAYS + timedelta(seconds=1)
+DEFAULT = "gnss (gnssrefl default)"
+
+
+class FallbackTestCase(GnssIrProcessorTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.processor.initialize()
+        refl = self.processor._refl_code
+        self.R = refl / "2026" / "results" / "usgs" / "189.txt"
+        self.G = refl / "logs" / "usgs" / "2026" / "189_translation.txt.gen"
+        self.F = refl / "2026" / "results" / "usgs" / "failQC" / "189.txt"
+        self.staged = refl / "2026" / "rinex" / "usgs" / "USGS00USA_R_20261890000_01D_01S_MO.rnx"
+
+    def process(self, now: datetime, retry_count: int = 0, processor=None, day: date = DAY):
+        processor = processor or self.processor
+        with unittest.mock.patch.object(gnssrefl_processor, "_utcnow", return_value=now):
+            return processor.process(self.observation_file, day=day, retry_count=retry_count)
+
+    def orbs(self) -> list:
+        return [c["orb"] for c in calls["rinex2snr"]]
+
+    def fresh_processor(self, **station):
+        self.cfg.station = dict(station)
+        processor = gnssrefl_processor.GnssIrProcessor(cfg=self.cfg)
+        processor.initialize()
+        calls["rinex2snr"].clear()
+        return processor
+
+
+class TestOrbitFallback(FallbackTestCase):
+
+    def test_a_young_day_gets_its_own_orbit_only(self) -> None:
+        _behavior["orbits_without_snr"] = {None}
+
+        result = self.process(YOUNG)
+
+        self.assertEqual(self.orbs(), [None])
+        self.assertEqual(calls["gnssir"], [])
+        self.assertFalse(result.success)
+        self.assertEqual(result.outcome, "no_snr")
+        self.assertEqual(result.orbits_tried, (DEFAULT,))
+        self.assertTrue(result.message.startswith(
+            f"No results file produced: {self.R} (no SNR file with orbit {DEFAULT}: "
+            f"the orbit may not be published yet"), result.message)
+        self.assertIn(str(self.G), result.message)
+        self.assertIn("fallback orbit(s) not tried yet: rapid (from the 3rd attempt at "
+                      "least 36 h after the day, or 72 h after it), nav (GPS only: once "
+                      "the day is more than 5 days old)", result.message)
+        self.assertNotIn("last orbit tried only", result.message)
+
+    def test_the_3rd_attempt_tries_rapid_48_h_after_the_day(self) -> None:
+        _behavior["orbits_without_snr"] = {None}
+
+        self.process(MID, retry_count=1)
+        self.assertEqual(self.orbs(), [None])
+
+        calls["rinex2snr"].clear()
+        with self.assertLogs("station.gnssir", level="INFO") as logs:
+            result = self.process(MID, retry_count=2)
+
+        self.assertEqual(self.orbs(), [None, "rapid"])
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(result.outcome, "ok")
+        self.assertEqual(result.orbit_used, "rapid")
+        self.assertEqual(result.orbits_tried, (DEFAULT, "rapid"))
+        self.assertEqual(len(calls["gnssir"]), 1)
+        self.assertTrue(result.message.endswith(
+            f"; orbit rapid (fallback: {DEFAULT} made no SNR file; GPS, GLONASS and "
+            f"Galileo; no BeiDou)"), result.message)
+        # a day made with a lesser orbit is said louder than a success
+        warnings = [r for r in logs.records if r.levelname == "WARNING"]
+        self.assertTrue(any("with fallback orbit rapid" in r.getMessage() for r in warnings))
+        self.assertTrue(any("trying fallback orbit rapid (attempt 3" in line
+                            for line in logs.output))
+
+    def test_a_high_count_on_a_young_day_is_not_enough(self) -> None:
+        # failures that never reached gnssrefl (convbin, gnssrefl not
+        # initialized, reruns) raise the count: not before 36 h
+        _behavior["orbits_without_snr"] = {None}
+
+        self.process(YOUNG, retry_count=5)
+        self.process(DAY_END + timedelta(hours=36) - timedelta(seconds=1), retry_count=5)
+        self.assertEqual(self.orbs(), [None, None])
+
+        self.process(DAY_END + timedelta(hours=36), retry_count=2)
+        self.assertEqual(self.orbs(), [None, None, None, "rapid"])
+
+    def test_72_h_after_the_day_whatever_the_count(self) -> None:
+        _behavior["orbits_without_snr"] = {None}
+
+        self.process(OLD - timedelta(seconds=1))
+        self.assertEqual(self.orbs(), [None])
+
+        calls["rinex2snr"].clear()
+        self.process(OLD)
+        self.assertEqual(self.orbs(), [None, "rapid"])
+
+    def test_gps_only_nav_only_once_the_day_is_more_than_5_days_old(self) -> None:
+        _behavior["orbits_without_snr"] = {None, "rapid"}
+
+        result = self.process(FIVE_DAYS, retry_count=9)
+        self.assertEqual(self.orbs(), [None, "rapid"])
+        self.assertEqual(result.outcome, "no_snr")
+        self.assertIn("nav (GPS only: once the day is more than 5 days old)", result.message)
+        self.assertIn("which shows the last orbit tried only", result.message)
+
+        calls["rinex2snr"].clear()
+        result = self.process(PAST_5_DAYS)
+        self.assertEqual(self.orbs(), [None, "rapid", "nav"])
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(result.orbit_used, "nav")
+        self.assertIn("GPS only, about half the tracks", result.message)
+
+    def test_no_orbit_at_all(self) -> None:
+        _behavior["orbits_without_snr"] = {None, "rapid", "nav"}
+
+        result = self.process(PAST_5_DAYS, retry_count=2)
+
+        self.assertEqual(self.orbs(), [None, "rapid", "nav"])
+        self.assertEqual(result.outcome, "no_snr")
+        self.assertEqual(result.orbits_tried, (DEFAULT, "rapid", "nav"))
+        self.assertTrue(result.message.startswith(
+            f"No results file produced: {self.R} (no SNR file with orbits {DEFAULT}, "
+            f"rapid, nav: no orbit for this day"), result.message)
+        self.assertTrue(result.message.endswith(
+            f"see {self.G}, which shows the last orbit tried only)"), result.message)
+        self.assertEqual(calls["gnssir"], [])
+        self.assertFalse(self.staged.exists())
+
+    def test_fallbacks_turned_off(self) -> None:
+        processor = self.fresh_processor(gnssrefl_orbit_fallbacks=[])
+        _behavior["orbits_without_snr"] = {None}
+
+        result = self.process(PAST_5_DAYS, retry_count=5, processor=processor)
+
+        self.assertEqual(self.orbs(), [None])
+        self.assertIn("no fallback orbits (gnssrefl_orbit_fallbacks is [])", result.message)
+
+    def test_a_gps_only_station_needs_no_gate(self) -> None:
+        processor = self.fresh_processor(gnssrefl_orbit_fallbacks=["nav"])
+        _behavior["orbits_without_snr"] = {None}
+        self.process(OLD, processor=processor)
+        self.assertEqual(self.orbs(), [None])
+
+        processor = self.fresh_processor(gnssrefl_orbit_source="nav",
+                                         gnssrefl_orbit_fallbacks=["nav-sopac"])
+        _behavior["orbits_without_snr"] = {"nav"}
+        self.process(OLD, processor=processor)
+        self.assertEqual(self.orbs(), ["nav", "nav-sopac"])
+
+    def test_a_fallback_that_is_the_same_product_is_skipped(self) -> None:
+        processor = self.fresh_processor(gnssrefl_orbit_source="rapid",
+                                         gnssrefl_orbit_fallbacks=["gfr", "rapid", "nav"])
+        _behavior["orbits_without_snr"] = {"rapid", "gfr", "nav"}
+        self.process(PAST_5_DAYS, processor=processor)
+        self.assertEqual(self.orbs(), ["rapid", "nav"])
+
+        processor = self.fresh_processor(gnssrefl_orbit_fallbacks=["gnss", "gbm", "rapid"])
+        _behavior["orbits_without_snr"] = {None, "rapid"}
+        self.process(OLD, processor=processor)
+        self.assertEqual(self.orbs(), [None, "rapid"])
+
+    def test_gnss2_is_another_source_not_an_alias(self) -> None:
+        processor = self.fresh_processor(gnssrefl_orbit_fallbacks=["gnss2"])
+        _behavior["orbits_without_snr"] = {None}
+        self.process(OLD, processor=processor)
+        self.assertEqual(self.orbs(), [None, "gnss2"])
+
+    def test_a_source_rinex2snr_refuses_keeps_the_working_fallback(self) -> None:
+        # "Rapid" is not "rapid" to rinex2snr: it must not remove rapid
+        processor = self.fresh_processor(gnssrefl_orbit_source="Rapid")
+        _behavior["orbits_without_snr"] = {"Rapid"}
+        result = self.process(OLD, processor=processor)
+        self.assertEqual(self.orbs(), ["Rapid", "rapid"])
+        self.assertEqual(result.orbit_used, "rapid")
+
+    def test_before_2025_the_default_is_rapid_itself(self) -> None:
+        day = date(2023, 7, 8)
+        _behavior["orbits_without_snr"] = {None, "rapid", "nav"}
+
+        result = self.process(datetime(2023, 7, 20, tzinfo=timezone.utc), day=day)
+
+        self.assertEqual(self.orbs(), [None, "nav"])
+        self.assertEqual(result.orbits_tried, ("rapid (gnssrefl default)", "nav"))
+
+    def test_a_stale_snr_file_is_not_this_attempts(self) -> None:
+        snr = _snr_path("usgs", 2026, 189)
+        snr.parent.mkdir(parents=True, exist_ok=True)
+        snr.write_bytes(b"old")
+        hour_ago = time.time() - 3600
+        os.utime(snr, (hour_ago, hour_ago))
+        _behavior["orbits_without_snr"] = {None}
+
+        result = self.process(YOUNG)
+        self.assertEqual(result.outcome, "no_snr")
+        self.assertEqual(calls["gnssir"], [])
+
+        _behavior["orbits_without_snr"] = {None, "rapid", "nav"}
+        calls["rinex2snr"].clear()
+        result = self.process(PAST_5_DAYS)
+        self.assertEqual(len(calls["rinex2snr"]), 3)
+        self.assertEqual(result.outcome, "no_snr")
+
+    def test_an_orbit_that_raises_moves_on_to_the_next(self) -> None:
+        _behavior["orbits_raising"] = {None}
+
+        result = self.process(MID, retry_count=2)
+
+        self.assertEqual(self.orbs(), [None, "rapid"])
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(result.orbit_used, "rapid")
+
+    def test_every_orbit_raising_keeps_the_rinex2snr_failed_message(self) -> None:
+        # recover_missing_days.py STAGE_FAILED keys on "rinex2snr failed:"
+        _behavior["rinex2snr"] = "raise"
+
+        result = self.process(PAST_5_DAYS, retry_count=2)
+
+        self.assertEqual(len(calls["rinex2snr"]), 3)
+        self.assertTrue(result.message.startswith(
+            "rinex2snr failed: simulated rinex2snr failure"), result.message)
+        self.assertIn(f"(orbits tried: {DEFAULT}, rapid, nav)", result.message)
+        self.assertEqual(result.outcome, "no_snr")
+
+    def test_an_snr_file_left_by_a_raising_attempt_is_removed(self) -> None:
+        # e.g. the disk filled while gzipping: never gnssir's input, nor
+        # recover_missing_days.py's evidence that gnssir ran
+        _behavior["orbits_raising_after_snr"] = {None}
+        _behavior["orbits_without_snr"] = {"rapid", "nav"}
+
+        result = self.process(PAST_5_DAYS)
+
+        self.assertEqual(result.outcome, "no_snr")
+        self.assertFalse(_snr_path("usgs", 2026, 189).exists())
+        self.assertEqual(calls["gnssir"], [])
+        self.assertTrue(result.message.startswith("No results file produced: "), result.message)
+        self.assertIn(f"rinex2snr raised with {DEFAULT}: [Errno 28] No space left on device",
+                      result.message)
+
+    def test_no_arc_kept(self) -> None:
+        _behavior["gnssir"] = "no_arcs"
+
+        result = self.process(YOUNG)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.outcome, "no_arcs")
+        self.assertEqual(result.orbit_used, DEFAULT)
+        self.assertEqual(result.message, (
+            f"No results file produced: {self.R} (SNR file made with orbit {DEFAULT}, "
+            f"but gnssir kept no arc; see {self.F})"))
+
+    def test_no_arc_kept_with_a_gps_only_fallback_is_not_no_data(self) -> None:
+        _behavior["orbits_without_snr"] = {None, "rapid"}
+        _behavior["gnssir"] = "no_arcs"
+
+        result = self.process(PAST_5_DAYS)
+
+        self.assertEqual(result.outcome, "no_arcs_gps_only")
+        self.assertEqual(result.orbit_used, "nav")
+        self.assertIn("GPS-only fallback orbit nav", result.message)
+        self.assertTrue(result.message.startswith(f"No results file produced: {self.R} ("))
+
+        # the station's own choice of nav is a no-data day as any other
+        processor = self.fresh_processor(gnssrefl_orbit_source="nav")
+        result = self.process(PAST_5_DAYS, processor=processor)
+        self.assertEqual(result.outcome, "no_arcs")
+
+    def test_gnssir_stopping_before_its_quality_control_is_an_error(self) -> None:
+        _behavior["gnssir"] = "no_output"
+
+        result = self.process(YOUNG)
+
+        self.assertEqual(result.outcome, "error")
+        self.assertTrue(result.message.startswith(f"No results file produced: {self.R} ("))
+        self.assertIn("wrote no failQC/189.txt either", result.message)
+
+    def test_a_results_file_gnssir_did_not_replace_is_an_error(self) -> None:
+        self.R.parent.mkdir(parents=True, exist_ok=True)
+        self.R.write_text("% header\n2026 189 19.0 4 1.0 306.5 9.2 5.3 25.0 3131 1 1 0.7 3.1 52.2 61230.0 1\n")
+        hour_ago = time.time() - 3600
+        os.utime(self.R, (hour_ago, hour_ago))
+        _behavior["gnssir"] = "no_output"
+
+        result = self.process(YOUNG)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.outcome, "error")
+        self.assertTrue(result.message.startswith(
+            "gnssir did not replace the existing results file"), result.message)
+
+    def test_an_ordinary_day_names_its_orbit(self) -> None:
+        result = self.process(YOUNG)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.outcome, "ok")
+        self.assertEqual(result.orbit_used, DEFAULT)
+        self.assertEqual(result.orbits_tried, (DEFAULT,))
+        self.assertTrue(result.message.endswith(f"; orbit {DEFAULT}"), result.message)
+
+    def test_process_without_a_retry_count(self) -> None:
+        # recover_missing_days.py and ultra_rapid_check.py call it so
+        result = self.processor.process(self.observation_file, day=DAY)
+
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(len(calls["rinex2snr"]), 1)
+
+
+class TestOrbitHelpers(unittest.TestCase):
+
+    def test_gnssrefl_default_orbit_by_date(self) -> None:
+        # rinex2snr_cl.py:453-472, strictly after each date
+        doy = lambda y, d: date(y, 1, 1) + timedelta(days=d - 1)   # noqa: E731
+        self.assertEqual(gnssrefl_processor.gnssrefl_default_orbit(doy(2025, 168)), "rapid")
+        self.assertEqual(gnssrefl_processor.gnssrefl_default_orbit(doy(2025, 169)), "gnss")
+        self.assertEqual(gnssrefl_processor.gnssrefl_default_orbit(doy(2021, 137)), "nav")
+        self.assertEqual(gnssrefl_processor.gnssrefl_default_orbit(doy(2021, 138)), "rapid")
+
+    def test_no_data_marker_name_is_not_zero_padded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = gnssrefl_processor.write_no_data_marker(Path(tmp) / "results", date(2026, 1, 5))
+            self.assertEqual(marker, Path(tmp) / "results" / "5.no_data")
+            self.assertRegex(marker.read_text(),
+                             r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -- no usable retrievals\n$")
+        for empty in ("", "."):
+            with self.assertRaises(ValueError):
+                gnssrefl_processor.write_no_data_marker(empty, date(2026, 1, 5))
+
+
+# ------------------------------------------------------------
+# gnssrefl's copy of the RINEX in the working directory
+# ------------------------------------------------------------
+
+class TestWorkingDirectoryCopy(FallbackTestCase):
+    """rinex2snr copies the staged RINEX into the working directory and
+    never removes it: 29 GB of them in station/ and $HOME by Nov 2026."""
+
+    COPY = "USGS00USA_R_20261890000_01D_01S_MO.rnx"
+
+    def setUp(self) -> None:
+        super().setUp()
+        _behavior["cwd_copy"] = True
+
+    def test_the_copy_is_removed_after_a_success(self) -> None:
+        result = self.process(YOUNG)
+
+        self.assertTrue(result.success)
+        self.assertFalse(calls["rinex2snr"][0]["cwd_existed"])
+        self.assertEqual(calls["rinex2snr"][0]["cwd_content"], self.observation_file.read_text())
+        self.assertFalse((Path.cwd() / self.COPY).exists())
+
+    def test_the_copy_is_removed_when_rinex2snr_raises(self) -> None:
+        _behavior["rinex2snr"] = "raise"
+
+        self.process(YOUNG)
+
+        self.assertIsNotNone(calls["rinex2snr"][0]["cwd_content"])
+        self.assertFalse((Path.cwd() / self.COPY).exists())
+
+    def test_one_copy_serves_every_orbit_and_is_removed_once(self) -> None:
+        _behavior["orbits_without_snr"] = {None, "rapid"}
+
+        self.process(PAST_5_DAYS)
+
+        self.assertEqual([c["cwd_existed"] for c in calls["rinex2snr"]], [False, True, True])
+        self.assertFalse((Path.cwd() / self.COPY).exists())
+
+    def test_nothing_else_in_the_working_directory_is_touched(self) -> None:
+        other_day = Path.cwd() / "USGS00USA_R_20261880000_01D_01S_MO.rnx"
+        notes = Path.cwd() / "notes.txt"
+        other_day.write_text("another day")
+        notes.write_text("notes")
+
+        self.process(YOUNG)
+
+        self.assertEqual(other_day.read_text(), "another day")
+        self.assertEqual(notes.read_text(), "notes")
+
+    def test_an_observation_file_in_the_working_directory_is_kept(self) -> None:
+        # processed from the working directory under the staged name:
+        # neither before staging nor afterwards is it deleted
+        observation = Path.cwd() / self.COPY
+        observation.write_text("the day's own RINEX\n")
+        self.observation_file = observation
+
+        result = self.process(YOUNG)
+
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(observation.read_text(), "the day's own RINEX\n")
+
+    def test_a_working_directory_that_is_gone_is_not_an_error(self) -> None:
+        gone = self.root / "gone"
+        gone.mkdir()
+        os.chdir(gone)
+        gone.rmdir()
+
+        self.processor._remove_cwd_copy(self.staged, self.observation_file)   # no exception
 
 
 if __name__ == "__main__":
