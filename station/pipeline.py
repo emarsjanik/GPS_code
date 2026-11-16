@@ -128,17 +128,23 @@ until it was processed by hand. Now:
       ERROR row says so -- once is weather, day after day is a setting.
     * No SNR file with any orbit ("no_snr"; or "no_arcs_gps_only", only
       the GPS-only fallback made one and gnssir kept no arc from it),
-      for a station day file that ended more than HANDOFF_AGE_S ago, or
-      at least HANDOFF_RETRY_MIN_AGE_S ago and failed HANDOFF_RETRIES
-      times: the raw file is archived and the
-      entry finished, with one WARNING. The day is then
-      maintenance/recover_missing_days.py's, which process_and_plot.sh
-      Step 1 runs every night and which looks for exactly such days in
-      archive/.
+      for a day that ended more than HANDOFF_AGE_S ago, or at least
+      HANDOFF_RETRY_MIN_AGE_S ago and failed HANDOFF_RETRIES times: the
+      raw file is archived and the entry finished, with one WARNING. A
+      station day file is then maintenance/recover_missing_days.py's,
+      which process_and_plot.sh Step 1 runs every night and which looks
+      for exactly such days in archive/. Any other recording (an
+      overnight_ one of QUICKSTART Step 5) is retried by nobody: it is
+      only archived.
     * A queued file found in archive/ instead of raw/ (moved there by
       hand, or by a run stopped before it finished the entry) is
       finished, with one WARNING, instead of failing on every run with
       "Raw file does not exist".
+
+The WARNING of the last two goes to the station log and, as a WARNING
+row, to error_log: under process_and_plot.sh Step 2 the log is shown
+only when the step fails, and the row is the only lasting trace. The
+health mail counts only ERROR rows.
 
 None of these counts as a failed file (process_and_plot.sh Step 2 exits
 1 on files_failed). Every other failure ("error": a gnssrefl or setup
@@ -270,14 +276,16 @@ IN_PROGRESS_MTIME_S = 15 * 60
 # (maintenance/recover_missing_days.py, which retries it every night)
 # once it ended more than HANDOFF_AGE_S ago or has failed HANDOFF_RETRIES
 # times: its raw file is archived and its queue entry finished, so it
-# stops failing every run (_without_results_kind()). HANDOFF_AGE_S is the
-# processor's GPS_ONLY_FALLBACK_AGE_S, so the run that hands a day over
-# has tried every fallback, the GPS-only one included. HANDOFF_RETRIES
-# counts only once the day is HANDOFF_RETRY_MIN_AGE_S old (when every
-# multi-GNSS fallback is tried whatever the count): failures that never
-# reached gnssrefl (gnssrefl not initialized for a few days, a RINEX
-# conversion failure, reruns by hand) also raise the count, and must not
-# hand over a day whose orbit is only late.
+# stops failing every run (_without_results_kind()). Any other recording
+# in that state is archived the same way and retried by nobody: Step 1
+# knows station day files only. HANDOFF_AGE_S is the processor's
+# GPS_ONLY_FALLBACK_AGE_S, so the run that hands a day over has tried
+# every fallback, the GPS-only one included. HANDOFF_RETRIES counts only
+# once the day is HANDOFF_RETRY_MIN_AGE_S old (when every multi-GNSS
+# fallback is tried whatever the count): failures that never reached
+# gnssrefl (gnssrefl not initialized for a few days, a RINEX conversion
+# failure, reruns by hand) also raise the count, and must not hand over
+# a day whose orbit is only late.
 ORBIT_WAIT_S = 12 * 3600
 HANDOFF_AGE_S = GPS_ONLY_FALLBACK_AGE_S     # 5 days
 HANDOFF_RETRIES = 10                        # earlier failed attempts ...
@@ -501,10 +509,12 @@ class PipelineSummary:
     failed and will be retried on the next run (process_and_plot.sh
     Step 2 exits 1 when there are any). files_no_data: days processed
     with no usable retrievals, archived with their <doy>.no_data
-    marker. files_handed_off: days without an SNR file with any orbit
-    after HANDOFF_AGE_S (or HANDOFF_RETRIES), and files found already in
-    archive/, left to recover_missing_days.py (Step 1). The last two
-    are not failures and are never retried by the pipeline.
+    marker. files_handed_off: files archived without an SNR file with
+    any orbit after HANDOFF_AGE_S (or HANDOFF_RETRIES), and files found
+    already in archive/: a station day file is left to
+    recover_missing_days.py (Step 1), any other recording to nobody.
+    The last two are not failures and are never retried by the
+    pipeline.
     """
 
     files_found: int = 0
@@ -1305,16 +1315,18 @@ class Pipeline:
         "handed off"  no SNR file with any orbit tried (outcome
                       "no_snr", or "no_arcs_gps_only": a GPS-only
                       fallback kept no arc, while a multi-GNSS orbit
-                      still might), for station_manager's day file
-                      station_YYYYMMDD.um980, once the day ended more
-                      than HANDOFF_AGE_S ago, or at least
+                      still might), once the day ended more than
+                      HANDOFF_AGE_S ago, or at least
                       HANDOFF_RETRY_MIN_AGE_S ago and the file has
                       failed HANDOFF_RETRIES times (its 11th attempt:
-                      reruns by hand). Only that name:
-                      recover_missing_days.py, which
-                      takes the day over, knows no other, and an
-                      overnight_ recording handed to it would be
-                      retried by nobody.
+                      reruns by hand). Whatever the file's name: a
+                      station day file, station_YYYYMMDD.um980, goes
+                      to recover_missing_days.py, which takes the day
+                      over; any other recording (overnight_...,
+                      QUICKSTART Step 5) is only archived, since
+                      recover knows no other name, and nothing retries
+                      it. Retried here instead, it would fail every run
+                      for good.
 
         None for everything else -- a not yet late enough day, and
         every "error": a gnssrefl or setup problem is not a lack of
@@ -1325,9 +1337,7 @@ class Pipeline:
         outcome = getattr(result, "outcome", "")
         if outcome == OUTCOME_NO_ARCS:
             return self._NO_DATA
-        if outcome in (OUTCOME_NO_SNR, OUTCOME_NO_ARCS_GPS_ONLY) and _STATION_DAY_FILE.fullmatch(
-            job.filename
-        ):
+        if outcome in (OUTCOME_NO_SNR, OUTCOME_NO_ARCS_GPS_ONLY):
             age_s = _day_age_s(job.date)
             if age_s > HANDOFF_AGE_S or (
                 job.retries >= HANDOFF_RETRIES and age_s >= HANDOFF_RETRY_MIN_AGE_S
@@ -1335,7 +1345,9 @@ class Pipeline:
                 return self._HANDED_OFF
         return None
 
-    def _finish_without_results(self, raw_path: Path, job: ProcessingJob, result, kind: str) -> None:
+    def _finish_without_results(
+        self, raw_path: Path, job: ProcessingJob, result, kind: str
+    ) -> None:
         """
         Give a day up (_without_results_kind()): archive its raw file
         as a success does and finish its queue entry, with a note
@@ -1354,10 +1366,12 @@ class Pipeline:
         that makes gnssir keep nothing, e.g. nr1/nr2 or reqAmp) is a
         FAIL, as it was before days were given up.
 
-        "handed off": one WARNING in the station log, no error row.
-        The day's earlier ERROR rows stop counting in the health mail
-        once its raw file is in archive/ (station_health.py
-        _failure_since_resolved()).
+        "handed off": one WARNING, in the station log and as a WARNING
+        row in error_log (_warn_handed_off()). The day's earlier ERROR
+        rows stop counting in the health mail once its raw file is in
+        archive/ (station_health.py _failure_since_resolved()). The
+        note says who takes the file over: recover_missing_days.py for
+        a station day file, nobody for any other recording.
 
         Neither counts as a failed file. The entry is finished as
         completed (finish_processing(success=True), with the note in
@@ -1400,8 +1414,14 @@ class Pipeline:
             note = (
                 f"{what} after {job.retries + 1} attempt(s), "
                 f"{_day_age_s(job.date) / 86400:.1f} days after the day; "
-                f"handed to maintenance/recover_missing_days.py "
-                f"(process_and_plot.sh Step 1), which tries it every night"
+                + (
+                    "handed to maintenance/recover_missing_days.py "
+                    "(process_and_plot.sh Step 1), which tries it every night"
+                    if _STATION_DAY_FILE.fullmatch(job.filename) else
+                    "not retried: recover_missing_days.py (process_and_plot.sh "
+                    "Step 1) takes station day files only, so nothing retries "
+                    "this recording"
+                )
             )
 
         self._archive(raw_path, job, notes=f"archived without results: {note}")
@@ -1432,7 +1452,41 @@ class Pipeline:
             )
         else:
             self._run_stats["files_handed_off"] += 1
-            self._logger.warning("HANDED OFF %s (day %s): %s", job.filename, job.date, note)
+            self._warn_handed_off(job, note)
+
+    def _warn_handed_off(self, job: ProcessingJob, note: str) -> None:
+        """
+        The one WARNING for a file the pipeline stops retrying without
+        results (_finish_without_results(), _finish_already_archived()):
+        in the station log, and as a WARNING row in error_log. Under
+        process_and_plot.sh Step 2 the log line alone is lost -- the
+        step's output is shown only when it fails, and a hand-off no
+        longer fails it -- so the row is the lasting trace. The health
+        mail counts only ERROR rows, so it stays quiet.
+
+        A station day file is "HANDED OFF" (to recover_missing_days.py),
+        any other recording "GIVEN UP". The row is a trace only: a
+        database error writing it is logged, and does not make the
+        file count as failed.
+        """
+
+        assert self.db is not None
+
+        label = "HANDED OFF" if _STATION_DAY_FILE.fullmatch(job.filename) else "GIVEN UP"
+        message = f"{label} {job.filename} (day {job.date}): {note}"
+        self._logger.warning("%s", message)
+        try:
+            self.db.log_error(
+                "pipeline",
+                "WARNING",
+                exception="HandedOff",
+                description=message,
+                notes=f"day={job.date}",
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "Could not record the hand-off of %s in error_log: %s", job.filename, exc
+            )
 
     def _in_archive(self, filename: str) -> bool:
         archive_dir = getattr(self.cfg, "archive_dir", None)
@@ -1450,14 +1504,16 @@ class Pipeline:
             + (
                 "; recover_missing_days.py (process_and_plot.sh Step 1) "
                 "processes the day if it has no results"
-                if _STATION_DAY_FILE.fullmatch(job.filename) else ""
+                if _STATION_DAY_FILE.fullmatch(job.filename) else
+                "; nothing retries it (recover_missing_days.py takes station "
+                "day files only)"
             )
         )
         self.db.finish_processing(job.filename, success=True, note=note)
         job.status = JobState.FINISHED
         job.finished = datetime.now(timezone.utc).isoformat()
         self._run_stats["files_handed_off"] += 1
-        self._logger.warning("HANDED OFF %s (day %s): %s", job.filename, job.date, note)
+        self._warn_handed_off(job, note)
 
     def _cleanup(self, job: ProcessingJob) -> None:
         """
@@ -1527,7 +1583,7 @@ class Pipeline:
         print(f"Files Processed      : {summary.files_processed}")
         print(f"Files Failed         : {summary.files_failed}")
         print(f"No Usable Data       : {summary.files_no_data}")
-        print(f"Handed to Step 1     : {summary.files_handed_off}")
+        print(f"Handed Off           : {summary.files_handed_off}")
         print(f"RINEX Created        : {summary.rinex_created}")
         print(f"Products Created     : {summary.products_created}")
         print(f"Average Runtime      : {summary.average_runtime:.2f} sec")

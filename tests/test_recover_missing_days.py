@@ -392,7 +392,7 @@ class TestProcessorOutcomes(RecoverTestCase):
     decides "no data".
     """
 
-    def with_outcome(self, outcome: str, writes_snr: bool = True, **extra):
+    def with_outcome(self, outcome: str, writes_snr: bool = True, message: str = "", **extra):
         station = self.station
 
         class Reports(FakeGnssir):
@@ -402,7 +402,8 @@ class TestProcessorOutcomes(RecoverTestCase):
                     for snr in station.snr_files(day):
                         snr.unlink()
                 return SimpleNamespace(success=outcome == "ok", outcome=outcome,
-                                       message=f"processor said {outcome}", **extra)
+                                       message=message or f"processor said {outcome}",
+                                       **extra)
 
         self.gnssir = Reports(self.station, default="nodata")
 
@@ -426,6 +427,37 @@ class TestProcessorOutcomes(RecoverTestCase):
 
         self.assertFalse(self.station.no_data_marker(day).exists())
         self.assertIn("not yet: processor said no_arcs_gps_only", out)
+
+    def test_rinex2snr_raising_with_every_orbit_is_failed(self) -> None:
+        # The processor reports it as "no_snr" and removes any SNR file
+        # such an attempt left; still a gnssrefl error, not a missing orbit.
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome(
+            "no_snr", writes_snr=False,
+            message=("rinex2snr failed: simulated rinex2snr failure (orbits tried: "
+                     "gnss (gnssrefl default), rapid, nav)"))
+
+        _code, out = self.run_main()
+
+        self.assertFalse(self.station.no_data_marker(day).exists())
+        self.assertIn("failed: rinex2snr failed: simulated rinex2snr failure", out)
+        self.assertIn(f"Failed, tried again next run: {doy_of(day)}", out)
+        self.assertNotIn("not yet", out)
+
+    def test_one_orbit_raising_while_the_others_had_none_is_not_yet(self) -> None:
+        day = date(2026, 7, 1)
+        self.raw(self.external / "Raw", day)
+        self.with_outcome(
+            "no_snr", writes_snr=False,
+            message=("No results file produced: /x/2026/results/abcd/182.txt (no SNR "
+                     "file with orbits gnss (gnssrefl default), rapid, nav: no orbit for "
+                     "this day, or the RINEX has no usable data; rinex2snr raised with "
+                     "rapid: timed out; see /x/182_translation.txt.gen)"))
+
+        _code, out = self.run_main()
+
+        self.assertIn("not yet: No results file produced", out)
 
     def test_gnssir_stopping_before_its_quality_control_is_failed(self) -> None:
         day = date(2026, 7, 1)

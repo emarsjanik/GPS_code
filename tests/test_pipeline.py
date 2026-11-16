@@ -523,6 +523,11 @@ class PipelineRunTestCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        # Run from the temporary folder: a regression that writes a
+        # marker into the working directory must land here, not in the
+        # checkout, where it would fail every later run of these tests.
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.root)
         for sub in ("raw", "rinex", "archive", "products", "logs"):
             (self.root / sub).mkdir()
         self.cfg = SimpleNamespace(
@@ -648,7 +653,7 @@ class TestDayWithoutResults(PipelineRunTestCase):
         self.assertIn("GNSS-IR kept no arc for 2026-11-05", error.description)
         self.assertIn("309.no_data written", error.description)
         self.assertNotIn("No results file produced", error.description)
-        self.assertEqual(len(logs.records), 1)
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
         self.assertIn("NO DATA", logs.output[0])
 
         # never converted again
@@ -698,12 +703,17 @@ class TestDayWithoutResults(PipelineRunTestCase):
         self.assertIn("recover_missing_days", entry.error_message)
         self.assertIn("gnss (gnssrefl default), rapid, nav", entry.error_message)
         self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
-        self.assertEqual(self.errors(), [])
         self.assertEqual(list(self.results().glob("*.no_data")), [])
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("HANDED OFF", logs.output[0])
+        # ONE WARNING, not an ERROR: in the station log ...
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertTrue(logs.output[0].startswith(f"WARNING:station.pipeline:HANDED OFF {NAME}"))
         self.assertIn("recover_missing_days", logs.output[0])
-        self.assertIn("Handed to Step 1     : 1", self.out)
+        # ... and as a WARNING row, the only trace when Step 2 hands the
+        # day off (its output is shown only when the step fails)
+        (row,) = self.errors()
+        self.assertEqual(row.severity, "WARNING")
+        self.assertEqual(row.description, logs.records[0].getMessage())
+        self.assertIn("Handed Off           : 1", self.out)
         self.assertIn("No Usable Data       : 0", self.out)
 
         # the moved file is never converted, nor reported missing
@@ -721,14 +731,14 @@ class TestDayWithoutResults(PipelineRunTestCase):
 
     def test_a_day_is_handed_off_on_its_11th_attempt(self) -> None:
         # reruns by hand: from 72 h after the day, 10 failures are enough
-        nov8 = datetime(2026, 11, 9, 0, 0, 5, tzinfo=timezone.utc)
+        nov9 = datetime(2026, 11, 9, 0, 0, 5, tzinfo=timezone.utc)     # 72 h and 5 s after
         self.raw()
         self.gnssir.outcome = "no_snr"
         self.run_at(NOV7)                       # retry_count 1
         self.fail_times(8)                      # retry_count 9
-        summary = self.run_at(nov8)
+        summary = self.run_at(nov9)
         self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
-        summary = self.run_at(nov8)
+        summary = self.run_at(nov9)
         self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
         self.assertEqual([c[1] for c in self.gnssir.calls], [0, 9, 10])
         self.assertTrue((self.cfg.archive_dir / NAME).exists())
@@ -752,16 +762,65 @@ class TestDayWithoutResults(PipelineRunTestCase):
         self.assertEqual((summary.files_handed_off, summary.files_no_data), (1, 0))
         self.assertEqual(list(self.results().glob("*.no_data")), [])
 
-    def test_only_station_day_files_are_handed_off(self) -> None:
-        # recover_missing_days.py knows no other name: nobody would retry it
+    def test_any_other_recording_is_given_up_too_and_retried_by_nobody(self) -> None:
+        # recover_missing_days.py knows station day files only, so an
+        # overnight_ recording is not handed to it -- but retried here it
+        # would fail every run for good: archived, by the same rule
         name = "overnight_20261105_120000.um980"
-        self.raw(name, mtime=NOV11.timestamp() - 86400)
+        self.raw(name, mtime=NOV7.timestamp() - 86400)
         self.gnssir.outcome = "no_snr"
-        self.run_at(NOV11)
-        self.fail_times(10, name)
-        summary = self.run_at(NOV11)
+        summary = self.run_at(NOV7)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+
+        with self.assertLogs("station.pipeline", level="WARNING") as logs:
+            summary = self.run_at(NOV11)
+
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
+        self.assertTrue((self.cfg.archive_dir / name).exists())
+        self.assertFalse((self.cfg.raw_dir / name).exists())
+        entry = self.entry(name)
+        self.assertTrue(entry.completed)
+        self.assertIn("nothing retries this recording", entry.error_message)
+        self.assertNotIn("handed to", entry.error_message)
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertTrue(logs.records[0].getMessage().startswith(f"GIVEN UP {name}"))
+        warning, first = self.errors()                  # newest first
+        self.assertEqual((warning.severity, first.severity), ("WARNING", "ERROR"))
+        self.assertTrue(warning.description.startswith(f"GIVEN UP {name}"))
+        self.assertEqual(list(self.results().glob("*.no_data")), [])
+
+        summary = self.run_at(NOV11 + timedelta(days=1))
+        self.assertEqual(self.rinex.converted, [name, name])
+        self.assertEqual(summary.files_failed, 0)
+
+    def test_any_other_recording_waits_as_long_as_a_station_day(self) -> None:
+        name = "overnight_20261105_120000.um980"
+        self.raw(name, mtime=NOV7.timestamp() - 86400)
+        self.gnssir.outcome = "no_snr"
+        # exactly 5 days after the day, on its first attempt
+        summary = self.run_at(datetime(2026, 11, 11, tzinfo=timezone.utc))
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
+        # a raised count on a day not yet 72 h old
+        self.fail_times(HANDOFF_RETRIES + 5, name)
+        summary = self.run_at(NOV7)
         self.assertEqual((summary.files_failed, summary.files_handed_off), (1, 0))
         self.assertTrue((self.cfg.raw_dir / name).exists())
+
+    def test_a_handoff_whose_warning_row_cannot_be_written_is_still_no_failure(self) -> None:
+        self.raw()
+        self.gnssir.outcome = "no_snr"
+        real_log_error = self.db.log_error
+
+        def log_error(module, severity, *args, **kwargs):
+            if severity == "WARNING":
+                raise DatabaseError("Database operation failed: database is locked")
+            return real_log_error(module, severity, *args, **kwargs)
+
+        with unittest.mock.patch.object(self.db, "log_error", log_error):
+            summary = self.run_at(NOV11)
+        self.assertEqual((summary.files_failed, summary.files_handed_off), (0, 1))
+        self.assertTrue(self.entry().completed)
+        self.assertTrue((self.cfg.archive_dir / NAME).exists())
 
     def test_errors_are_never_handed_off(self) -> None:
         # a gnssrefl or setup problem is not a lack of data
@@ -811,8 +870,10 @@ class TestDayWithoutResults(PipelineRunTestCase):
         self.assertEqual(self.rinex.converted, [NAME])
         self.assertTrue(self.entry().completed)
         self.assertIn("already in archive/", self.entry().error_message)
-        self.assertEqual(len(self.errors()), 1)          # the first attempt's only
-        self.assertEqual(len(logs.records), 1)
+        # the first attempt's ERROR, then this run's one WARNING
+        self.assertEqual([e.severity for e in self.errors()], ["WARNING", "ERROR"])
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertIn("HANDED OFF", logs.output[0])
 
     def test_an_entry_removed_during_the_run_is_skipped(self) -> None:
         # clean_processing_queue.py --execute does not take the run lock

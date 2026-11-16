@@ -119,10 +119,15 @@ mail until it was processed by hand. Now this happens by itself:
 - **No SNR file with any orbit**, and the day ended more than 5 days ago (or
   72 h ago and failed 10 times, e.g. after reruns by hand): the raw file
   is moved to `archive/` and the queue entry finished, with one WARNING
-  ("HANDED OFF ... recover_missing_days"). From then on `maintenance/recover_missing_days.py` (`process_and_plot.sh`
-  Step 1) tries the day every night, fallbacks included, and writes the
-  marker if it turns out to have no data. The day's earlier errors stop
-  counting in the mail; it stays listed as a gap in the record.
+  ("HANDED OFF ... recover_missing_days"), in the station log and as a
+  WARNING row in the database's `error_log` (the mail counts only ERROR
+  rows). From then on `maintenance/recover_missing_days.py`
+  (`process_and_plot.sh` Step 1) tries the day every night, fallbacks
+  included, and writes the marker if it turns out to have no data. The
+  day's earlier errors stop counting in the mail; it stays listed as a gap
+  in the record. A one-off recording (`raw/overnight_*.um980`, QUICKSTART
+  Step 5) in the same state is archived the same way ("GIVEN UP"), but
+  nothing retries it: `recover_missing_days` takes station day files only.
 
 Neither of the last two counts as a failed file, so Step 2 no longer fails
 for them. Every other failure (a gnssrefl or setup error) is still retried
@@ -135,11 +140,10 @@ a day at once, or with a chosen orbit:
    `recover_missing_days` leaves days in `raw/` to the pipeline (which now
    finishes the queue entry of a file it finds in `archive/`).
 2. `maintenance/recover_missing_days.sh <doy>` (`RECOVER_YEAR=<year>` for
-   another year). A day over 72 h old gets `rapid` by itself, and `nav` once it
-   is over 5 days old. To force
-   one orbit, set `"gnssrefl_orbit_source"` to it and
-   `"gnssrefl_orbit_fallbacks": []` in `station.json` for that run only, and
-   set them back before the next cron run (station_manager reads
+   another year). A day over 72 h old gets `rapid` by itself, and `nav` once
+   it is over 5 days old. To force one orbit, set `"gnssrefl_orbit_source"`
+   to it and `"gnssrefl_orbit_fallbacks": []` in `station.json` for that run
+   only, and set them back before the next cron run (station_manager reads
    `station.json` only when it starts, so only the cron's runs see it).
 3. `maintenance/clean_processing_queue.py` (a dry run), then `--execute`, for
    a queue entry still left unfinished. A day the pipeline already handed off
@@ -218,7 +222,7 @@ Verifies every expected file is present and non-empty/non-stub — useful after 
 | `products/refl_code/` | `gnssrefl`'s entire working directory (`$REFL_CODE`) — analysis strategy JSON, staged RINEX, SNR files, results, logs |
 | `database/` | `station.db` (SQLite) |
 | `logs/` | `database.log`, `process_and_plot_status.json` (how each step of the last `process_and_plot.sh` run went), and (cron setup) `station_manager.pid`/`station_manager.out` |
-| `archive/` | Raw files moved here after successful processing — and days the pipeline gave up on (no usable retrievals, or no orbit after 5 days), which `maintenance/recover_missing_days.py` retries |
+| `archive/` | Raw files moved here after successful processing — and days the pipeline gave up on (no usable retrievals, or no orbit after 5 days), which `maintenance/recover_missing_days.py` retries (station day files only) |
 
 None of the above are tracked in git (see `.gitignore`) — they're all generated data, along with `gnssrefl_venv/`.
 

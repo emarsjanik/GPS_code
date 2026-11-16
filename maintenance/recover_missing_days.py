@@ -88,10 +88,12 @@ WHAT CAN HAPPEN TO A DAY
               only SNR file came from the GPS-only fallback and kept no
               arc: a multi-GNSS orbit may still give arcs. Tried again
               on the next run. No marker.
-  failed      convbin failed on the raw file, rinex2snr or gnssir raised
-              (a gnssrefl error is not a lack of data), gnssir stopped
-              before its quality control, or it did not replace an
-              existing results file. Tried again on the next run.
+  failed      convbin failed on the raw file, rinex2snr raised with
+              every orbit tried or gnssir raised (a gnssrefl error is not
+              a lack of data; one orbit raising while another simply had
+              none is "not yet"), gnssir stopped before its quality
+              control, or it did not replace an existing results file.
+              Tried again on the next run.
 
 The shell version wrote the marker whenever gnssir left no results
 file, whatever the reason, so a day whose orbit was not out yet could
@@ -186,8 +188,9 @@ LEGACY_RINEX = r"^{code9}_R_(\d{{4}})(\d{{3}})0000_01D_\d\dS_MO\.RNX$"
 # modification times to the second only.
 FRESH_SLACK_S = 2.0
 
-# gnssrefl_processor.py's messages when rinex2snr or gnssir raised
-# (_process_staged()): gnssir did not run to the end.
+# gnssrefl_processor.py's messages when rinex2snr raised with every
+# orbit tried, or gnssir raised (_process_staged(), _no_snr_message()):
+# a gnssrefl error, "failed" whatever else the day left.
 STAGE_FAILED = ("rinex2snr failed:", "gnssir failed:")
 
 # tempfile.mkdtemp() prefix of the scratch folder in the project root.
@@ -468,6 +471,15 @@ class Recovery:
                 marker.unlink()
             return "recovered", result.message
 
+        if str(result.message).startswith(STAGE_FAILED):
+            # rinex2snr raised with every orbit tried, or gnssir raised: a
+            # gnssrefl error, not a missing orbit. Checked before the SNR
+            # file, which a raising rinex2snr never leaves (the processor
+            # removes whatever such an attempt wrote), and before the
+            # outcome, which is "no_snr" for it (the pipeline's hand-off
+            # rule treats it as a day without an SNR file).
+            return "failed", result.message
+
         if any(_fresh(p, started) for p in self.station.snr_files(day)):
             # What the processor says it was, when it says (a stand-in
             # may not): a fresh SNR file alone is not enough, since one
@@ -475,8 +487,6 @@ class Recovery:
             outcome = getattr(result, "outcome", "")
             if outcome in (OUTCOME_NO_SNR, OUTCOME_NO_ARCS_GPS_ONLY):
                 return "not yet", result.message
-            if str(result.message).startswith(STAGE_FAILED):
-                return "failed", result.message
             if results.exists() and not _fresh(results, started):
                 return "failed", ("gnssir did not replace the existing "
                                   f"results file: {result.message}")

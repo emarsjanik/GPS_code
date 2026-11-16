@@ -229,6 +229,33 @@ def _failure_since_resolved(text: str) -> bool:
     return False
 
 
+# The example of an error group shown in the mail, in characters.
+# gnssrefl_processor.py says what happened to a day only after its
+# results path ("No results file produced: <path> (no SNR file with
+# ...)"), and on the station that path alone is 71 characters: cut at
+# 150, the mail showed the path and nothing of what happened, which was
+# left to the station log. So paths inside the project are shown
+# relative to it (_error_example()), and the example is allowed twice as
+# long.
+ERROR_EXAMPLE_CHARS = 300
+
+
+def _error_example(text: str) -> str:
+    """
+    The text the mail shows for an error group: paths inside the
+    project relative to it (/home/argus_user/GNSS/v4.1/products/... ->
+    products/...), and at most ERROR_EXAMPLE_CHARS characters, " ..."
+    marking a cut. Only for display: grouping (_normalize_message())
+    and the resolved checks read the full text.
+    """
+    t = text.strip()
+    if len(PROJECT_DIR.parts) > 1:
+        t = t.replace(str(PROJECT_DIR).rstrip("/") + "/", "")
+    if len(t) > ERROR_EXAMPLE_CHARS:
+        t = t[:ERROR_EXAMPLE_CHARS - 4].rstrip() + " ..."
+    return t
+
+
 def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
     cutoff = utcnow() - timedelta(days=days)
 
@@ -298,7 +325,7 @@ def check_recent_errors(db: sqlite3.Connection, days: int) -> None:
             status = WARN
 
         example = examples.get((module, severity, description), description)
-        record(status, f"errors/{module}", f"{example[:150]} [{detail}]")
+        record(status, f"errors/{module}", f"{_error_example(example)} [{detail}]")
 
 
 # ------------------------------------------------------------------

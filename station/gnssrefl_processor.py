@@ -878,8 +878,13 @@ class GnssIrProcessor:
         in order, when the configured or default orbit made no SNR
         file for a day (see the module docstring). Unset means
         DEFAULT_ORBIT_FALLBACKS, ["rapid", "nav"]; [] turns the
-        fallback off. Names are compared as gnssrefl 4.1.5 does, after
-        trimming and lower-casing.
+        fallback off. Each name is trimmed and lower-cased, then checked
+        against gnssrefl 4.1.5's names (GNSSREFL_ORBITS), so " Rapid "
+        is read as "rapid". gnssrefl itself compares exactly
+        (rinex2snr_cl.py: `orb not in orbit_list`), and
+        gnssrefl_orbit_source, passed to it as written, is not
+        lower-cased: "Rapid" there draws a warning in initialize() and
+        makes no SNR file.
 
         A wrong value is refused here, naming it, rather than left to
         fail every day: rinex2snr only prints "You picked an orbit
@@ -1905,7 +1910,9 @@ class GnssIrProcessor:
 
         if raised and len(raised) == len(tried):
             # Every attempt raised: the message rinex2snr failures have
-            # always had (recover_missing_days.py STAGE_FAILED).
+            # always had, which recover_missing_days.py (STAGE_FAILED)
+            # reports as "failed" -- a gnssrefl error -- although the
+            # outcome is "no_snr" for the pipeline's hand-off rule.
             message = f"rinex2snr failed: {raised[-1][1]}"
             if len(tried) > 1:
                 message += f" (orbits tried: {', '.join(tried)})"

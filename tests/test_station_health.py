@@ -631,6 +631,57 @@ class TestPipelineErrors(HealthTest):
         self.assertEqual(self.check(db), [("OK", "errors")])
         self.assertIn("none at ERROR level", sh.findings[0][2])
 
+    def test_the_mail_shows_what_happened_after_the_stations_long_path(self) -> None:
+        # On the station the results path alone is 71 characters: cut at
+        # 150, the example showed the path and none of the stage after it.
+        station = Path("/home/argus_user/GNSS/v4.1")
+        refl = station / "products" / "refl_code"
+        head = (f"GNSS-IR processing failed: No results file produced: "
+                f"{refl}/2026/results/{STA}/309.txt (")
+        gen = f"{refl}/logs/{STA}/2026/309_translation.txt.gen"
+        cases = {
+            "no orbit for this day": (
+                f"{head}no SNR file with orbits gnss (gnssrefl default), rapid, nav: no "
+                f"orbit for this day, or the RINEX has no usable data; see {gen}, which "
+                f"shows the last orbit tried only)"),
+            "fallback orbit(s) not tried yet": (
+                f"{head}no SNR file with orbit gnss (gnssrefl default): the orbit may not "
+                f"be published yet, or the RINEX has no usable data; fallback orbit(s) not "
+                f"tried yet: rapid (from the 3rd attempt at least 36 h after the day, or "
+                f"72 h after it), nav (GPS only: once the day is more than 5 days old); "
+                f"see {gen})"),
+            "gnssir kept no arc": (
+                f"{head}SNR file made with orbit gnss (gnssrefl default), but gnssir kept "
+                f"no arc; see {refl}/2026/results/{STA}/failQC/309.txt)"),
+            "gnssir wrote no failQC/309.txt either": (
+                f"{head}SNR file made with orbit gnss (gnssrefl default), but gnssir wrote "
+                f"no failQC/309.txt either: it stopped before its quality control; see the "
+                f"station log)"),
+        }
+        with unittest.mock.patch.object(sh, "PROJECT_DIR", station):
+            for stage, msg in cases.items():
+                with self.subTest(stage=stage):
+                    db = self.errors_db([(f"2026-11-{d:02d}T00:00:10.000Z", "ERROR", msg)
+                                         for d in (8, 9, 10)])
+                    self.assertEqual(self.check(db), [("FAIL", "errors/pipeline")])
+                    message = sh.findings[0][2]
+                    self.assertIn(stage, message)
+                    self.assertIn(f"No results file produced: products/refl_code/2026/"
+                                  f"results/{STA}/309.txt (", message)
+                    self.assertNotIn(str(station), message)
+                    self.assertIn("[3x since 2026-11-08", message)
+
+    def test_error_example_is_cut_with_a_mark(self) -> None:
+        # paths inside the project relative to it, others as they are
+        self.assertEqual(sh._error_example(f"  {self.proj}/raw/x.um980 missing "),
+                         "raw/x.um980 missing")
+        self.assertEqual(sh._error_example("/elsewhere/x.um980"), "/elsewhere/x.um980")
+        cut = sh._error_example("word " * 100)
+        self.assertLessEqual(len(cut), sh.ERROR_EXAMPLE_CHARS)
+        self.assertTrue(cut.endswith(" ..."), cut)
+        full = "x" * sh.ERROR_EXAMPLE_CHARS
+        self.assertEqual(sh._error_example(full), full)
+
     def test_no_arcs_kept_day_after_day_still_fails(self) -> None:
         rows = []
         for d, doy in ((8, 312), (9, 313), (10, 314)):

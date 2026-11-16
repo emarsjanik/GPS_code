@@ -694,7 +694,9 @@ class TestInitialize(GnssIrProcessorTestCase):
 
         self.assertEqual(self.processor._orbit_fallbacks, ("rapid", "nav"))
 
-    def test_orbit_fallbacks_are_read_as_gnssrefl_compares_them(self) -> None:
+    def test_orbit_fallbacks_are_trimmed_lowercased_and_deduplicated(self) -> None:
+        # more lenient than gnssrefl, which compares exactly: the names
+        # are normalized here, before rinex2snr ever sees them
         for value, want in ((["Rapid", " nav "], ("rapid", "nav")),
                             (["gfr", "gfr"], ("gfr",)),
                             ([], ())):
@@ -1085,6 +1087,10 @@ class TestProcessFailureModes(GnssIrProcessorTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("gnssir failed", result.message)
+        # an "error", not a lack of data: retried on every run and never
+        # handed to recover_missing_days.py, whose exit status would hide it
+        self.assertEqual(result.outcome, gnssrefl_processor.OUTCOME_ERROR)
+        self.assertEqual(result.orbit_used, "gnss (gnssrefl default)")
 
     def test_gnssir_sys_exit_never_crashes_process(self) -> None:
         _behavior["gnssir"] = "sys_exit"
@@ -1095,6 +1101,8 @@ class TestProcessFailureModes(GnssIrProcessorTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("gnssir failed", result.message)
+        self.assertEqual(result.outcome, gnssrefl_processor.OUTCOME_ERROR)
+        self.assertEqual(result.orbit_used, "gnss (gnssrefl default)")
 
     def test_staged_rinex_file_is_cleaned_up_even_when_gnssir_fails(self) -> None:
         _behavior["gnssir"] = "raise"
@@ -1434,6 +1442,22 @@ class TestOrbitFallback(FallbackTestCase):
         self.assertTrue(result.message.startswith(f"No results file produced: {self.R} ("))
         self.assertIn("wrote no failQC/189.txt either", result.message)
 
+    def test_a_failqc_file_left_by_an_earlier_run_is_not_no_arcs(self) -> None:
+        # gnssrefl writes failQC/<doy>.txt on every quality-control run,
+        # successful ones too. One from an earlier run must not turn this
+        # run's early stop (no failQC written now) into "no_arcs", which
+        # pipeline.py answers by marking the day as having no data for good.
+        self.F.parent.mkdir(parents=True, exist_ok=True)
+        self.F.write_text("% year, doy, RH, sat,UTCtime, Azim, Amp ...\n")
+        day_ago = time.time() - 86400
+        os.utime(self.F, (day_ago, day_ago))
+        _behavior["gnssir"] = "no_output"
+
+        result = self.process(YOUNG)
+
+        self.assertEqual(result.outcome, "error")
+        self.assertIn("wrote no failQC/189.txt either", result.message)
+
     def test_a_results_file_gnssir_did_not_replace_is_an_error(self) -> None:
         self.R.parent.mkdir(parents=True, exist_ok=True)
         self.R.write_text("% header\n2026 189 19.0 4 1.0 306.5 9.2 5.3 25.0 3131 1 1 0.7 3.1 52.2 61230.0 1\n")
@@ -1481,9 +1505,19 @@ class TestOrbitHelpers(unittest.TestCase):
             self.assertEqual(marker, Path(tmp) / "results" / "5.no_data")
             self.assertRegex(marker.read_text(),
                              r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ -- no usable retrievals\n$")
-        for empty in ("", "."):
-            with self.assertRaises(ValueError):
-                gnssrefl_processor.write_no_data_marker(empty, date(2026, 1, 5))
+        # "" and "." are the working directory: refused, and run from a
+        # temporary one, so that a regression writes nothing into the
+        # checkout (the test runner's working directory)
+        old_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                for empty in ("", "."):
+                    with self.assertRaises(ValueError):
+                        gnssrefl_processor.write_no_data_marker(empty, date(2026, 1, 5))
+                self.assertEqual(os.listdir(tmp), [])
+            finally:
+                os.chdir(old_cwd)
 
 
 # ------------------------------------------------------------
